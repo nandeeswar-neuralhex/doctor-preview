@@ -1,162 +1,188 @@
-# RunPod Deployment - Step-by-Step Guide
+# RunPod Deployment Guide - GitHub Method
 
-## GPU Recommendation: RTX 5090
+## ✅ Code is on GitHub!
 
-**Perfect choice!** RTX 5090 specs:
-- **Expected FPS**: 30-40 FPS (better than RTX 4090)
-- **VRAM**: 24GB (plenty for FaceFusion)
-- **Cost**: ~$0.50-0.60/hr
-
-### Recommended Settings
-- **Container Disk**: 25 GB (for Docker image + models)
-- **Volume Disk**: 10 GB (optional, for caching)
-- **Expose Ports**: 8765
+Repository: https://github.com/nandeeswar-neuralhex/doctor-preview
 
 ---
 
-## Deployment Steps
+## 🚀 Deploy to RunPod (Step-by-Step)
 
-### Option 1: Direct Docker Image (Recommended)
+### Step 1: Go to RunPod Console
 
-RunPod can pull directly from Docker Hub, so you need to:
+Open: https://www.runpod.io/console/pods
 
-#### Step 1: Build & Push Docker Image
+### Step 2: Create New GPU Pod
 
-```bash
-cd /Users/nandeeswar/Desktop/Doctor-preview-main/runpod_service
+1. Click **"+ GPU Pod"** or **"Deploy"**
+2. Select GPU: **RTX 5090** (or RTX 4090 if 5090 unavailable)
+   - RTX 5090: ~$0.50-0.60/hr, 30-40 FPS
+   - RTX 4090: ~$0.44/hr, 24-30 FPS
 
-# Login to Docker Hub (create account at hub.docker.com if needed)
-docker login
+### Step 3: Configure Template
 
-# Build the image
-docker build -t YOUR_DOCKERHUB_USERNAME/doctor-preview:latest .
+Click **"Customize Deployment"** or **"Edit Template"**
 
-# Push to Docker Hub
-docker push YOUR_DOCKERHUB_USERNAME/doctor-preview:latest
+#### Container Configuration
+
+**Option A: Use Pre-built Base Image (Faster)**
+
+```
+Container Image: nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04
+Docker Command: /bin/bash -c "cd /workspace && bash runpod_service/scripts/start.sh"
 ```
 
-**Replace `YOUR_DOCKERHUB_USERNAME`** with your actual Docker Hub username.
+Then in **Volume** section:
+- Click "Add Volume"
+- Mount GitHub repo or use RunPod's GitHub integration
 
----
+**Option B: Build from GitHub (Recommended)**
 
-#### Step 2: Create RunPod Pod
+If RunPod supports GitHub builds:
+1. Click **"Build from GitHub"**
+2. Repository URL: `https://github.com/nandeeswar-neuralhex/doctor-preview`
+3. Branch: `main`
+4. Dockerfile path: `runpod_service/Dockerfile`
+5. Build context: `runpod_service/`
 
-1. **Go to RunPod Console**: https://www.runpod.io/console/pods
-2. **Click "Deploy"** or "+ GPU Pod"
-3. **Select GPU**: Choose **RTX 5090**
-4. **Select Template**: Click "New Template" or use custom
+**Option C: Manual Template**
 
-**Template Configuration:**
+```
+Container Image: nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04
+```
+
+In **Container Start Command**:
+```bash
+apt-get update && \
+apt-get install -y git python3.10 python3-pip curl && \
+git clone https://github.com/nandeeswar-neuralhex/doctor-preview.git /app && \
+cd /app/runpod_service && \
+pip install --no-cache-dir -r requirements.txt && \
+python src/models/download_models.py && \
+python src/server.py
+```
+
+### Step 4: Pod Settings
 
 | Setting | Value |
 |---------|-------|
-| **Template Name** | `doctor-preview-faceswap` |
-| **Container Image** | `YOUR_DOCKERHUB_USERNAME/doctor-preview:latest` |
-| **Docker Command** | Leave empty (uses CMD from Dockerfile) |
-| **Container Disk** | `25 GB` |
-| **Volume Disk** | `10 GB` (optional) |
+| **Container Disk** | 25 GB |
+| **Volume Disk** | 10 GB (optional) |
 | **Expose HTTP Ports** | `8765` |
 | **Expose TCP Ports** | Leave empty |
 
-**Environment Variables** (click "Add Environment Variable"):
+### Step 5: Environment Variables
+
+Click **"+ Add Environment Variable"** for each:
+
 ```
 HOST=0.0.0.0
 PORT=8765
 JPEG_QUALITY=85
 MAX_SESSIONS=10
+EXECUTION_PROVIDER=CUDAExecutionProvider
 ```
 
-5. **Click "Deploy"**
+### Step 6: Deploy!
+
+1. Review settings
+2. Click **"Deploy"** or **"Continue"**
+3. Wait for pod to start (2-3 minutes)
+4. Wait for build/setup (10-15 minutes first time)
 
 ---
 
-#### Step 3: Wait for Deployment
+## 📊 Monitor Deployment
 
-- Pod will start (takes 2-5 minutes)
-- Models will download automatically
-- Check logs for "Server ready!"
+### Check Logs
 
----
+1. Click on your pod
+2. Click **"Logs"** tab
+3. Look for:
+   ```
+   Downloading models...
+   Models downloaded successfully
+   Server ready!
+   Uvicorn running on http://0.0.0.0:8765
+   ```
 
-#### Step 4: Get Your Endpoint URL
+### Get Your Endpoint URL
 
 After deployment, you'll see:
 ```
 https://YOUR_POD_ID-8765.proxy.runpod.net
 ```
 
-**Test it:**
+**Copy this URL** - you'll need it for the desktop app!
+
+---
+
+## ✅ Test Your Deployment
+
+### Test 1: Health Check
+
 ```bash
 curl https://YOUR_POD_ID-8765.proxy.runpod.net/health
 ```
 
-Should return:
+Expected response:
 ```json
 {
   "status": "healthy",
-  "model_loaded": true
+  "model_loaded": true,
+  "gpu_available": true
 }
 ```
 
----
+### Test 2: Desktop App
 
-### Option 2: RunPod Template (If You Don't Have Docker Hub)
-
-If you don't want to use Docker Hub, you can use RunPod's built-in registry:
-
-1. **Zip your project:**
-```bash
-cd /Users/nandeeswar/Desktop/Doctor-preview-main
-tar -czf runpod_service.tar.gz runpod_service/
-```
-
-2. **Upload to RunPod** via their template builder
-3. **Build on RunPod** (slower, but no Docker Hub needed)
-
----
-
-## After Deployment
-
-### Test with Desktop App
-
-1. **Open Desktop App:**
 ```bash
 cd /Users/nandeeswar/Desktop/Doctor-preview-main/desktop_app
+
+# Install dependencies (first time only)
+npm install
+
+# Start app
 npm start
 ```
 
-2. **Configure Server:**
-   - Click "Settings"
-   - Enter: `https://YOUR_POD_ID-8765.proxy.runpod.net`
-   - Click "Save"
-
-3. **Upload & Test:**
-   - Upload a target image
-   - Click "Start Preview"
-   - Should see 24-40 FPS!
+1. Click **Settings** (top right)
+2. Enter your RunPod URL: `https://YOUR_POD_ID-8765.proxy.runpod.net`
+3. Click **Save**
+4. Upload a target image
+5. Click **Start Preview**
+6. Check FPS (should be 24-40)
 
 ---
 
-## Troubleshooting
+## 🐛 Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
-| Pod won't start | Check Docker image name is correct |
-| Models not loading | Increase Container Disk to 30 GB |
-| Port not accessible | Verify port 8765 is exposed |
-| Low FPS | Check GPU utilization in RunPod logs |
-| Connection timeout | Verify firewall/proxy settings |
+| Pod won't start | Check GPU availability, try different region |
+| Build fails | Use Option C (manual install) instead |
+| Port not accessible | Verify port 8765 is exposed in HTTP Ports |
+| Models not downloading | Increase Container Disk to 30 GB |
+| Low FPS | Check GPU utilization in logs |
+| Connection timeout | Check firewall, verify URL is correct |
 
 ---
 
-## Cost Optimization
+## 💰 Cost Management
 
 - **Stop pod when not in use** (RunPod charges per hour)
-- **Use Community Cloud** for development (cheaper)
-- **Use Secure Cloud** for production (more reliable)
+- **Use Community Cloud** for development (cheaper, less reliable)
+- **Use Secure Cloud** for production (more expensive, more reliable)
+- **Expected cost**: $0.50-0.60/hr for RTX 5090
 
 ---
 
-## Next: Desktop App Configuration
+## 🎯 Next Steps
 
-Once your pod is running, copy the URL and use it in the desktop app settings!
+1. ✅ Code pushed to GitHub
+2. ⏳ Deploy to RunPod (follow steps above)
+3. ⏳ Get endpoint URL
+4. ⏳ Test with desktop app
+5. ⏳ Show patient real-time preview!
+
+**Ready to deploy!** Follow the steps above and let me know when your pod is running.
