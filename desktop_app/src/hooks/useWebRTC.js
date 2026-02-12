@@ -43,8 +43,14 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream) {
                 if (pc.iceGatheringState === 'complete') {
                     resolve();
                 } else {
+                    // Timeout after 5 seconds to avoid hanging on poor network
+                    const timer = setTimeout(() => {
+                        pc.removeEventListener('icegatheringstatechange', checkState);
+                        resolve();
+                    }, 5000);
                     const checkState = () => {
                         if (pc.iceGatheringState === 'complete') {
+                            clearTimeout(timer);
                             pc.removeEventListener('icegatheringstatechange', checkState);
                             resolve();
                         }

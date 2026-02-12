@@ -54,28 +54,47 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
         }
     }, [stream]);
 
-    // FPS from processed video
+    // FPS from processed video – count actual decoded frames
     useEffect(() => {
         if (!isStreaming || !processedVideoRef.current) return;
 
+        const video = processedVideoRef.current;
         let frameCount = 0;
         let lastTime = performance.now();
-        let rafId;
+        let active = true;
 
-        const tick = (now) => {
-            frameCount++;
-            if (now - lastTime >= 1000) {
-                setFps(frameCount);
-                frameCount = 0;
-                lastTime = now;
-            }
-            rafId = requestAnimationFrame(tick);
-        };
+        // Preferred: requestVideoFrameCallback (counts real decoded frames)
+        if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+            const tick = (now) => {
+                if (!active) return;
+                frameCount++;
+                if (now - lastTime >= 1000) {
+                    setFps(frameCount);
+                    frameCount = 0;
+                    lastTime = now;
+                }
+                video.requestVideoFrameCallback(tick);
+            };
+            video.requestVideoFrameCallback(tick);
+        } else {
+            // Fallback: use timeupdate events (~4/sec) scaled to estimate
+            const onTimeUpdate = () => {
+                frameCount++;
+                const now = performance.now();
+                if (now - lastTime >= 1000) {
+                    setFps(frameCount);
+                    frameCount = 0;
+                    lastTime = now;
+                }
+            };
+            video.addEventListener('timeupdate', onTimeUpdate);
+            return () => {
+                active = false;
+                video.removeEventListener('timeupdate', onTimeUpdate);
+            };
+        }
 
-        rafId = requestAnimationFrame(tick);
-        return () => {
-            if (rafId) cancelAnimationFrame(rafId);
-        };
+        return () => { active = false; };
     }, [isStreaming]);
 
     const handleStart = async () => {

@@ -77,6 +77,8 @@ class FaceSwapper:
         # Session storage for target faces and smoothing state
         self.target_faces: Dict[str, Any] = {}
         self._smooth_kps: Dict[str, np.ndarray] = {}
+        self._smooth_bbox: Dict[str, np.ndarray] = {}
+        self._last_result: Dict[str, np.ndarray] = {}
         self._ready = True
         
         print("FaceSwapper initialized successfully!")
@@ -166,6 +168,9 @@ class FaceSwapper:
         source_faces = self._detect_faces_with_fallback(frame)
 
         if len(source_faces) == 0:
+            # Return last good result to avoid flashing raw frame
+            if session_id in self._last_result:
+                return self._last_result[session_id], []
             return frame, []
 
         # Sort faces by size (largest first)
@@ -181,6 +186,8 @@ class FaceSwapper:
         for source_face in source_faces[:max(1, MAX_FACES)]:
             result = self._swap_single_face(result, source_face, target_face, session_id)
 
+        # Cache last good result to avoid flashing on face-lost frames
+        self._last_result[session_id] = result
         return result, source_faces
 
     def _swap_single_face(
@@ -195,12 +202,14 @@ class FaceSwapper:
         Uses InsightFace's inswapper model for high-quality swapping.
         """
         # Get face bounding box and landmarks
-        bbox = source_face.bbox.astype(int)
+        bbox = source_face.bbox.astype(np.float32)
         
-        # Optionally smooth landmarks for stability
+        # Optionally smooth landmarks AND bbox for stability
         kps = source_face.kps
         if ENABLE_TEMPORAL_SMOOTHING:
             kps = self._smooth_landmarks(session_id, kps)
+            bbox = self._smooth_bounding_box(session_id, bbox)
+        bbox = bbox.astype(int)
 
         # Prepare input for the swapper model
         # The inswapper expects aligned face crops
@@ -342,13 +351,17 @@ class FaceSwapper:
             h, w = frame.shape[:2]
             warped = cv2.warpAffine(swapped, tform, (w, h), borderValue=0.0)
 
-            # Create mask from facial landmarks (convex hull)
+            # Build mask from the WARPED template points (not raw kps)
+            # This ensures mask aligns perfectly with the warped face
             mask = np.zeros((h, w), dtype=np.uint8)
             x1, y1, x2, y2 = bbox
-            cx = int((x1 + x2) / 2)
-            cy = int((y1 + y2) / 2)
+
+            # Transform alignment template to frame space using the same tform
+            template_h = np.hstack([self._ALIGN_TEMPLATE, np.ones((5, 1), dtype=np.float32)])
+            warped_pts = (tform @ template_h.T).T.astype(np.int32)
+
             try:
-                hull = cv2.convexHull(kps.astype(np.int32))
+                hull = cv2.convexHull(warped_pts)
                 cv2.fillConvexPoly(mask, hull, 255)
             except Exception:
                 mask = np.zeros((h, w), dtype=np.uint8)
@@ -358,6 +371,13 @@ class FaceSwapper:
                 x1c, y1c = max(0, x1), max(0, y1)
                 x2c, y2c = min(w, x2), min(h, y2)
                 cv2.rectangle(mask, (x1c, y1c), (x2c, y2c), 255, thickness=-1)
+
+            # Compute center from warped points (more accurate than bbox)
+            cx = int(warped_pts[:, 0].mean())
+            cy = int(warped_pts[:, 1].mean())
+            # Clamp center so seamlessClone won't crash near edges
+            cx = max(1, min(w - 2, cx))
+            cy = max(1, min(h - 2, cy))
 
             # Optional dilation (scale)
             if FACE_MASK_SCALE > 1.0:
@@ -375,12 +395,11 @@ class FaceSwapper:
             warped = self._color_match(warped, frame, mask)
 
             if ENABLE_SEAMLESS_CLONE:
-                center = (cx, cy)
                 try:
-                    blended = cv2.seamlessClone(warped, frame, mask, center, cv2.NORMAL_CLONE)
+                    blended = cv2.seamlessClone(warped, frame, mask, (cx, cy), cv2.NORMAL_CLONE)
                     return blended
                 except Exception as e:
-                    print(f"Seamless clone failed: {e}")
+                    print(f"Seamless clone failed (center={cx},{cy}): {e}")
 
             # Fallback alpha blend
             alpha = (mask.astype(np.float32) / 255.0)[..., None]
@@ -399,6 +418,17 @@ class FaceSwapper:
         prev = self._smooth_kps[session_id]
         smoothed = SMOOTHING_ALPHA * prev + (1.0 - SMOOTHING_ALPHA) * kps
         self._smooth_kps[session_id] = smoothed
+        return smoothed
+
+    def _smooth_bounding_box(self, session_id: str, bbox: np.ndarray) -> np.ndarray:
+        """Exponential smoothing of bounding box to prevent mask jitter."""
+        key = f"{session_id}_bbox"
+        if key not in self._smooth_bbox:
+            self._smooth_bbox[key] = bbox.copy()
+            return bbox
+        prev = self._smooth_bbox[key]
+        smoothed = SMOOTHING_ALPHA * prev + (1.0 - SMOOTHING_ALPHA) * bbox
+        self._smooth_bbox[key] = smoothed
         return smoothed
 
     def _color_match(self, source: np.ndarray, target: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -433,4 +463,9 @@ class FaceSwapper:
             del self.target_faces[session_id]
         if session_id in self._smooth_kps:
             del self._smooth_kps[session_id]
-            print(f"Cleaned up session {session_id}")
+        bbox_key = f"{session_id}_bbox"
+        if bbox_key in self._smooth_bbox:
+            del self._smooth_bbox[bbox_key]
+        if session_id in self._last_result:
+            del self._last_result[session_id]
+        print(f"Cleaned up session {session_id}")
