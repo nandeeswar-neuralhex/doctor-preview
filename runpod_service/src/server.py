@@ -284,7 +284,7 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
             
             # FPS tracking
             frame_count += 1
-            if frame_count % 100 == 0:
+            if frame_count % 10 == 0:
                 elapsed = time.time() - start_time
                 fps = frame_count / elapsed
                 print(f"Session {session_id}: {fps:.1f} FPS")
