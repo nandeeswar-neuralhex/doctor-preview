@@ -8,9 +8,9 @@ function createWindow() {
         width: 1400,
         height: 900,
         webPreferences: {
-            nodeIntegration: true,
-            contextIsolation: false,
-            enableRemoteModule: true
+            nodeIntegration: false,
+            contextIsolation: true,
+            sandbox: false
         },
         title: 'Doctor Preview - Surgery Preview System',
         backgroundColor: '#1a1a1a'

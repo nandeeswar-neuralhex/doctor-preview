@@ -2,6 +2,7 @@
 Model download script - Downloads required AI models during Docker build
 """
 import os
+import sys
 import urllib.request
 import zipfile
 from pathlib import Path

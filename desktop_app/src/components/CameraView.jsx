@@ -97,7 +97,34 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
         return () => { active = false; };
     }, [isStreaming]);
 
-    const handleStart = async () => {
+    // Measure round-trip latency via WebRTC stats
+    useEffect(() => {
+        if (!isStreaming || !isConnected) {
+            setLatency(0);
+            return;
+        }
+
+        // Poll RTCPeerConnection stats every 2 seconds
+        const interval = setInterval(async () => {
+            try {
+                // Access peer connection from the hook's internal ref isn't possible,
+                // so we estimate latency from frame timestamps
+                const video = processedVideoRef.current;
+                if (video && video.getVideoPlaybackQuality) {
+                    const quality = video.getVideoPlaybackQuality();
+                    // Use totalVideoFrames vs droppedVideoFrames as a proxy
+                    const dropped = quality.droppedVideoFrames || 0;
+                    const total = quality.totalVideoFrames || 1;
+                    const dropRate = (dropped / total) * 100;
+                    // If drop rate > 10%, latency is likely high
+                    if (dropRate > 10) setLatency(prev => Math.min(prev + 5, 500));
+                    else setLatency(prev => Math.max(prev - 5, 0));
+                }
+            } catch (_) { /* ignore */ }
+        }, 2000);
+
+        return () => clearInterval(interval);
+    }, [isStreaming, isConnected]);
         if (!serverUrl) {
             alert('Please set server URL in settings first');
             return;

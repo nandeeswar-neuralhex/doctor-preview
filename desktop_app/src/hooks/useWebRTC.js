@@ -88,9 +88,13 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream) {
             pcRef.current.close();
             pcRef.current = null;
         }
+        // Notify server to clean up session resources
+        if (serverUrl && sessionId) {
+            fetch(`${serverUrl}/session/${sessionId}`, { method: 'DELETE' }).catch(() => {});
+        }
         setIsConnected(false);
         setConnectionState('closed');
-    }, []);
+    }, [serverUrl, sessionId]);
 
     return { connect, disconnect, isConnected, error, connectionState };
 }

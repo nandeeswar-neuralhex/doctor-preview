@@ -298,7 +298,8 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
     finally:
         if session_id in active_connections:
             del active_connections[session_id]
-        # Don't cleanup session automatically - user might reconnect
+        # Cleanup session resources on disconnect
+        swapper.cleanup_session(session_id)
 
 
 @app.get("/debug/status")
