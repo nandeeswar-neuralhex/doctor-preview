@@ -457,45 +457,41 @@ class FaceSwapper:
                 cv2.rectangle(mask, (x1c, y1c), (x2c, y2c), 255, thickness=-1)
 
             # Compute center for seamlessClone
-            # Use strict bounding rect center to avoid shifting which causes out-of-bounds errors
+            # Compute bounding box of the mask for efficient/safe cloning
             if mask.sum() > 0:
                 y_indices, x_indices = np.nonzero(mask)
-                if len(y_indices) > 0:
-                    min_y, max_y = np.min(y_indices), np.max(y_indices)
-                    min_x, max_x = np.min(x_indices), np.max(x_indices)
-                    cx = int((min_x + max_x) // 2)
-                    cy = int((min_y + max_y) // 2)
-                else:
-                    cx, cy = w // 2, h // 2
-            else:
-                 cx, cy = w // 2, h // 2
+                min_y, max_y = np.min(y_indices), np.max(y_indices)
+                min_x, max_x = np.min(x_indices), np.max(x_indices)
+                
+                # Add a small padding
+                pad = 10
+                min_y = max(0, min_y - pad)
+                max_y = min(h, max_y + pad)
+                min_x = max(0, min_x - pad)
+                max_x = min(w, max_x + pad)
+                
+                sub_h = max_y - min_y
+                sub_w = max_x - min_x
+                
+                if sub_h > 0 and sub_w > 0:
+                    # Crop to ROI
+                    sub_warped = warped[min_y:max_y, min_x:max_x]
+                    sub_mask = mask[min_y:max_y, min_x:max_x]
+                    
+                    # Center of the ROI in the destination image
+                    cx = min_x + sub_w // 2
+                    cy = min_y + sub_h // 2
+                    
+                    if ENABLE_SEAMLESS_CLONE:
+                        try:
+                            blended = cv2.seamlessClone(sub_warped, frame, sub_mask, (cx, cy), cv2.NORMAL_CLONE)
+                            return blended
+                        except Exception as e:
+                            print(f"Seamless clone failed (center={cx},{cy}): {e}")
             
-            # Clamp center
-            cx = max(1, min(w - 2, cx))
-            cy = max(1, min(h - 2, cy))
-
-            # Dilation — expand mask to cover hairline/chin edges
-            if FACE_MASK_SCALE > 1.0:
-                scale = FACE_MASK_SCALE
-                kx = max(3, int((x2 - x1) * (scale - 1.0)) | 1)
-                ky = max(3, int((y2 - y1) * (scale - 1.0)) | 1)
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kx, ky))
-                mask = cv2.dilate(mask, kernel, iterations=1)
-
-            # Feather edges with Gaussian blur
-            if FACE_MASK_BLUR > 0:
-                k = FACE_MASK_BLUR if FACE_MASK_BLUR % 2 == 1 else FACE_MASK_BLUR + 1
-                mask = cv2.GaussianBlur(mask, (k, k), 0)
-
-            # Color match (histogram-based) for natural blending
-            warped = self._color_match(warped, frame, mask)
-
+            # Fallback if mask is empty or clone failed
             if ENABLE_SEAMLESS_CLONE:
-                try:
-                    blended = cv2.seamlessClone(warped, frame, mask, (cx, cy), cv2.NORMAL_CLONE)
-                    return blended
-                except Exception as e:
-                    print(f"Seamless clone failed (center={cx},{cy}): {e}")
+                 pass # Already fell through or failed
 
             # Fallback alpha blend
             alpha = (mask.astype(np.float32) / 255.0)[..., None]
