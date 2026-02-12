@@ -90,7 +90,7 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream) {
         }
         // Notify server to clean up session resources
         if (serverUrl && sessionId) {
-            fetch(`${serverUrl}/session/${sessionId}`, { method: 'DELETE' }).catch(() => {});
+            fetch(`${serverUrl}/session/${sessionId}`, { method: 'DELETE' }).catch(() => { });
         }
         setIsConnected(false);
         setConnectionState('closed');
