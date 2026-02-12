@@ -1,35 +1,27 @@
 import React, { useRef, useEffect, useState } from 'react';
 import useWebcam from '../hooks/useWebcam';
-import useWebSocket from '../hooks/useWebSocket';
+import useWebRTC from '../hooks/useWebRTC';
 
 function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
     const originalVideoRef = useRef(null);
-    const processedCanvasRef = useRef(null);
+    const processedVideoRef = useRef(null);
 
     const [fps, setFps] = useState(0);
     const [latency, setLatency] = useState(0);
     const [sessionId] = useState(() => `session-${Date.now()}`);
+    const [lipSyncEnabled, setLipSyncEnabled] = useState(true);
 
     // Custom hooks for webcam and WebSocket
-    const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam();
+    const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true);
     const {
         isConnected,
-        error: wsError,
-        sendFrame,
+        error: rtcError,
         connect,
         disconnect
-    } = useWebSocket(serverUrl, sessionId, (processedFrame, latencyMs) => {
-        // Draw processed frame to canvas
-        const canvas = processedCanvasRef.current;
-        if (canvas) {
-            const ctx = canvas.getContext('2d');
-            const img = new Image();
-            img.onload = () => {
-                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-            };
-            img.src = `data:image/jpeg;base64,${processedFrame}`;
+    } = useWebRTC(serverUrl, sessionId, (remoteStream) => {
+        if (processedVideoRef.current) {
+            processedVideoRef.current.srcObject = remoteStream;
         }
-        setLatency(latencyMs);
     });
 
     // Display webcam stream in video element
@@ -39,59 +31,29 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
         }
     }, [stream]);
 
-    // Streaming loop
+    // FPS from processed video
     useEffect(() => {
-        if (!isStreaming || !stream) return;
-
-        const video = originalVideoRef.current;
-        const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d');
+        if (!isStreaming || !processedVideoRef.current) return;
 
         let frameCount = 0;
-        let lastTime = Date.now();
-        let animationId;
+        let lastTime = performance.now();
+        let rafId;
 
-        const captureAndSend = () => {
-            if (!video || video.readyState !== video.HAVE_ENOUGH_DATA) {
-                animationId = requestAnimationFrame(captureAndSend);
-                return;
-            }
-
-            // Capture frame
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-            ctx.drawImage(video, 0, 0);
-
-            // Convert to JPEG and send
-            canvas.toBlob((blob) => {
-                if (blob) {
-                    const reader = new FileReader();
-                    reader.onload = () => {
-                        const base64 = reader.result.split(',')[1];
-                        sendFrame(base64);
-                    };
-                    reader.readAsDataURL(blob);
-                }
-            }, 'image/jpeg', 0.85);
-
-            // Calculate FPS
+        const tick = (now) => {
             frameCount++;
-            const now = Date.now();
             if (now - lastTime >= 1000) {
                 setFps(frameCount);
                 frameCount = 0;
                 lastTime = now;
             }
-
-            animationId = requestAnimationFrame(captureAndSend);
+            rafId = requestAnimationFrame(tick);
         };
 
-        captureAndSend();
-
+        rafId = requestAnimationFrame(tick);
         return () => {
-            if (animationId) cancelAnimationFrame(animationId);
+            if (rafId) cancelAnimationFrame(rafId);
         };
-    }, [isStreaming, stream, sendFrame]);
+    }, [isStreaming]);
 
     const handleStart = async () => {
         if (!serverUrl) {
@@ -114,13 +76,25 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
                 body: formData
             });
 
+            const responseBody = await response.json().catch(() => null);
             if (!response.ok) {
-                throw new Error('Failed to upload target image');
+                const errorMessage = responseBody?.error || 'Failed to upload target image';
+                throw new Error(errorMessage);
             }
 
+            // Apply session settings
+            await fetch(`${serverUrl}/session/settings?session_id=${sessionId}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enable_lipsync: lipSyncEnabled })
+            });
+
             // Start webcam and WebSocket
-            await startWebcam();
-            await connect();
+            const mediaStream = await startWebcam();
+            if (!mediaStream) {
+                throw new Error('Unable to access webcam/microphone');
+            }
+            await connect(mediaStream);
             setIsStreaming(true);
         } catch (error) {
             alert(`Error: ${error.message}`);
@@ -164,6 +138,19 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
                     )}
                 </div>
 
+                {/* Settings quick toggles */}
+                <div className="flex items-center gap-4">
+                    <label className="flex items-center gap-2 text-sm text-gray-300">
+                        <input
+                            type="checkbox"
+                            checked={lipSyncEnabled}
+                            onChange={(e) => setLipSyncEnabled(e.target.checked)}
+                            disabled={isStreaming}
+                        />
+                        Lip Sync
+                    </label>
+                </div>
+
                 {/* Stats */}
                 {isStreaming && (
                     <div className="flex gap-6 text-sm">
@@ -181,6 +168,20 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
                         </div>
                     </div>
                 )}
+            </div>
+
+            {/* Session Info */}
+            <div className="mb-4 grid grid-cols-2 gap-4 text-sm">
+                <div className="bg-gray-800 border border-gray-700 rounded-lg p-3">
+                    <div className="text-gray-400">Session ID</div>
+                    <div className="text-white font-mono break-all">{sessionId}</div>
+                </div>
+                <div className="bg-gray-800 border border-gray-700 rounded-lg p-3">
+                    <div className="text-gray-400">MJPEG URL (Virtual Camera)</div>
+                    <div className="text-white font-mono break-all">
+                        {serverUrl ? `${serverUrl}/mjpeg/${sessionId}` : 'Set server URL'}
+                    </div>
+                </div>
             </div>
 
             {/* Video Display */}
@@ -217,10 +218,11 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
                     </div>
                     <div className="aspect-video bg-black flex items-center justify-center">
                         {isStreaming ? (
-                            <canvas
-                                ref={processedCanvasRef}
-                                width={640}
-                                height={480}
+                            <video
+                                ref={processedVideoRef}
+                                autoPlay
+                                playsInline
+                                muted
                                 className="w-full h-full object-contain"
                             />
                         ) : (
@@ -236,10 +238,10 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
             </div>
 
             {/* Errors */}
-            {(webcamError || wsError) && (
+            {(webcamError || rtcError) && (
                 <div className="mt-4 p-4 bg-red-900/50 border border-red-700 rounded-lg">
                     <p className="text-red-200">
-                        {webcamError || wsError}
+                        {webcamError || rtcError}
                     </p>
                 </div>
             )}

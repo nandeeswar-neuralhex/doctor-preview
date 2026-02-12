@@ -8,7 +8,19 @@ from typing import Dict, Optional, Any
 import onnxruntime as ort
 from insightface.app import FaceAnalysis
 
-from config import MODELS_DIR, INSWAPPER_MODEL, EXECUTION_PROVIDER
+from config import (
+    MODELS_DIR,
+    INSWAPPER_MODEL,
+    EXECUTION_PROVIDER,
+    ENABLE_SEAMLESS_CLONE,
+    FACE_MASK_BLUR,
+    FACE_MASK_SCALE,
+    ENABLE_GFPGAN,
+    GFPGAN_MODEL_PATH,
+    ENABLE_TEMPORAL_SMOOTHING,
+    SMOOTHING_ALPHA,
+    MAX_FACES,
+)
 
 
 class FaceSwapper:
@@ -42,8 +54,28 @@ class FaceSwapper:
         self.input_name = self.swapper.get_inputs()[0].name
         self.input_shape = self.swapper.get_inputs()[0].shape
         
-        # Session storage for target faces
+        # Optional face enhancer (GFPGAN)
+        self.enhancer = None
+        if ENABLE_GFPGAN:
+            try:
+                from gfpgan import GFPGANer
+
+                model_path = GFPGAN_MODEL_PATH or None
+                self.enhancer = GFPGANer(
+                    model_path=model_path,
+                    upscale=1,
+                    arch="clean",
+                    channel_multiplier=2,
+                    bg_upsampler=None
+                )
+                print("GFPGAN enhancer enabled")
+            except Exception as e:
+                print(f"GFPGAN not available: {e}")
+                self.enhancer = None
+
+        # Session storage for target faces and smoothing state
         self.target_faces: Dict[str, Any] = {}
+        self._smooth_kps: Dict[str, np.ndarray] = {}
         self._ready = True
         
         print("FaceSwapper initialized successfully!")
@@ -112,21 +144,37 @@ class FaceSwapper:
         
         if len(source_faces) == 0:
             return frame
-        
-        result = frame.copy()
-        
-        # Swap each detected face with the target
-        for source_face in source_faces:
-            result = self._swap_single_face(result, source_face, target_face)
-        
-        return result
-    
-    def _swap_single_face(
-        self, 
-        frame: np.ndarray, 
-        source_face: Any, 
-        target_face: Any
-    ) -> np.ndarray:
+                result, _ = self.swap_face_with_faces(session_id, frame)
+                return result
+
+            def swap_face_with_faces(self, session_id: str, frame: np.ndarray):
+                """Swap face and also return detected source faces for downstream processing."""
+                if session_id not in self.target_faces:
+                    return frame, []
+
+                target_data = self.target_faces[session_id]
+                target_face = target_data["face"]
+
+                # Detect faces in the input frame
+                source_faces = self.face_analyzer.get(frame)
+
+                if len(source_faces) == 0:
+                    return frame, []
+
+                # Sort faces by size (largest first)
+                source_faces = sorted(
+                    source_faces,
+                    key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]),
+                    reverse=True
+                )
+
+                result = frame.copy()
+
+                # Swap up to MAX_FACES for stability (default 1)
+                for source_face in source_faces[:max(1, MAX_FACES)]:
+                    result = self._swap_single_face(result, source_face, target_face, session_id)
+
+                return result, source_faces
         """
         Swap a single face in the frame.
         Uses InsightFace's inswapper model for high-quality swapping.
@@ -134,9 +182,14 @@ class FaceSwapper:
         # Get face bounding box and landmarks
         bbox = source_face.bbox.astype(int)
         
+        # Optionally smooth landmarks for stability
+        kps = source_face.kps
+        if ENABLE_TEMPORAL_SMOOTHING:
+            kps = self._smooth_landmarks(session_id, kps)
+
         # Prepare input for the swapper model
         # The inswapper expects aligned face crops
-        aimg = self._align_face(frame, source_face.kps)
+        aimg = self._align_face(frame, kps)
         
         if aimg is None:
             return frame
@@ -167,9 +220,16 @@ class FaceSwapper:
             pred = pred.squeeze().transpose(1, 2, 0)
             pred = (pred * 255).clip(0, 255).astype(np.uint8)
             pred = cv2.cvtColor(pred, cv2.COLOR_RGB2BGR)
+
+            # Optional enhancement
+            if self.enhancer is not None:
+                try:
+                    _, _, pred = self.enhancer.enhance(pred, has_aligned=True, only_center_face=True, paste_back=False)
+                except Exception as e:
+                    print(f"Enhancer error: {e}")
             
             # Paste back to original frame
-            result = self._paste_back(frame, pred, source_face.kps)
+            result = self._paste_back(frame, pred, kps, bbox)
             return result
             
         except Exception as e:
@@ -198,7 +258,8 @@ class FaceSwapper:
         self, 
         frame: np.ndarray, 
         swapped: np.ndarray, 
-        kps: np.ndarray
+        kps: np.ndarray,
+        bbox: np.ndarray
     ) -> np.ndarray:
         """Paste the swapped face back onto the original frame"""
         # Inverse alignment
@@ -212,27 +273,91 @@ class FaceSwapper:
         
         try:
             tform = cv2.estimateAffinePartial2D(src_pts, kps)[0]
-            
+
             # Warp swapped face to original position
             h, w = frame.shape[:2]
             warped = cv2.warpAffine(swapped, tform, (w, h), borderValue=0.0)
-            
-            # Create mask for blending
-            mask = np.ones((128, 128), dtype=np.float32)
-            mask = cv2.GaussianBlur(mask, (15, 15), 5)
-            mask = cv2.warpAffine(mask, tform, (w, h), borderValue=0.0)
-            mask = np.expand_dims(mask, axis=2)
-            
-            # Blend
-            result = frame * (1 - mask) + warped * mask
+
+            # Create mask from facial landmarks (convex hull)
+            mask = np.zeros((h, w), dtype=np.uint8)
+            x1, y1, x2, y2 = bbox
+            cx = int((x1 + x2) / 2)
+            cy = int((y1 + y2) / 2)
+            hull = cv2.convexHull(kps.astype(np.int32))
+            cv2.fillConvexPoly(mask, hull, 255)
+
+            # Optional dilation (scale)
+            if FACE_MASK_SCALE > 1.0:
+                scale = FACE_MASK_SCALE
+                kx = max(3, int((x2 - x1) * (scale - 1.0)) | 1)
+                ky = max(3, int((y2 - y1) * (scale - 1.0)) | 1)
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kx, ky))
+                mask = cv2.dilate(mask, kernel, iterations=1)
+
+            if FACE_MASK_BLUR > 0:
+                k = FACE_MASK_BLUR if FACE_MASK_BLUR % 2 == 1 else FACE_MASK_BLUR + 1
+                mask = cv2.GaussianBlur(mask, (k, k), 0)
+
+            # Color match for more natural blending
+            warped = self._color_match(warped, frame, mask)
+
+            if ENABLE_SEAMLESS_CLONE:
+                center = (cx, cy)
+                try:
+                    blended = cv2.seamlessClone(warped, frame, mask, center, cv2.NORMAL_CLONE)
+                    return blended
+                except Exception as e:
+                    print(f"Seamless clone failed: {e}")
+
+            # Fallback alpha blend
+            alpha = (mask.astype(np.float32) / 255.0)[..., None]
+            result = frame * (1 - alpha) + warped * alpha
             return result.astype(np.uint8)
-            
+
         except Exception as e:
             print(f"Paste back error: {e}")
             return frame
+
+    def _smooth_landmarks(self, session_id: str, kps: np.ndarray) -> np.ndarray:
+        """Exponential smoothing of landmarks per session for stability."""
+        if session_id not in self._smooth_kps:
+            self._smooth_kps[session_id] = kps.copy()
+            return kps
+        prev = self._smooth_kps[session_id]
+        smoothed = SMOOTHING_ALPHA * prev + (1.0 - SMOOTHING_ALPHA) * kps
+        self._smooth_kps[session_id] = smoothed
+        return smoothed
+
+    def _color_match(self, source: np.ndarray, target: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Match color statistics of source to target within mask region."""
+        try:
+            if mask is None:
+                return source
+            mask_bool = mask > 0
+            if mask_bool.sum() < 10:
+                return source
+            src_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype(np.float32)
+            tgt_lab = cv2.cvtColor(target, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+            matched = src_lab.copy()
+            for c in range(3):
+                src_vals = src_lab[..., c][mask_bool]
+                tgt_vals = tgt_lab[..., c][mask_bool]
+                src_mean, src_std = src_vals.mean(), src_vals.std()
+                tgt_mean, tgt_std = tgt_vals.mean(), tgt_vals.std()
+                if src_std < 1e-6:
+                    continue
+                matched[..., c] = (matched[..., c] - src_mean) * (tgt_std / src_std) + tgt_mean
+            matched = np.clip(matched, 0, 255).astype(np.uint8)
+            return cv2.cvtColor(matched, cv2.COLOR_LAB2BGR)
+        except Exception as e:
+            print(f"Color match error: {e}")
+            return source
     
     def cleanup_session(self, session_id: str):
         """Clean up session data to free memory"""
         if session_id in self.target_faces:
             del self.target_faces[session_id]
+        if session_id in self._smooth_kps:
+            del self._smooth_kps[session_id]
             print(f"Cleaned up session {session_id}")

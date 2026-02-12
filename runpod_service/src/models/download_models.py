@@ -13,6 +13,8 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 MODELS = {
     "inswapper_128.onnx": "https://github.com/facefusion/facefusion-assets/releases/download/models/inswapper_128.onnx",
     "buffalo_l.zip": "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip",
+    "GFPGANv1.4.pth": "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.8/GFPGANv1.4.pth",
+    "wav2lip.onnx": "https://github.com/numz/wav2lip-onnx/releases/download/v1.0/wav2lip_gan.onnx",
 }
 
 def download_file(url: str, destination: Path):

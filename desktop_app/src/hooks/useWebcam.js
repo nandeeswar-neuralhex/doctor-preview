@@ -1,6 +1,6 @@
 import { useState, useCallback } from 'react';
 
-function useWebcam() {
+function useWebcam(withAudio = false) {
     const [stream, setStream] = useState(null);
     const [error, setError] = useState(null);
 
@@ -12,15 +12,17 @@ function useWebcam() {
                     height: { ideal: 720 },
                     facingMode: 'user'
                 },
-                audio: false
+                audio: withAudio
             });
             setStream(mediaStream);
             setError(null);
+            return mediaStream;
         } catch (err) {
             setError(`Failed to access webcam: ${err.message}`);
             console.error('Webcam error:', err);
+            return null;
         }
-    }, []);
+    }, [withAudio]);
 
     const stopWebcam = useCallback(() => {
         if (stream) {

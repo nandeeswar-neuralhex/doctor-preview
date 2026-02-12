@@ -29,10 +29,24 @@ function useWebSocket(serverUrl, sessionId, onFrameReceived) {
             ws.onmessage = (event) => {
                 const receiveTime = Date.now();
                 const latency = sendTimeRef.current ? receiveTime - sendTimeRef.current : 0;
+                const message = event.data;
+
+                // Handle JSON error payloads from server
+                if (typeof message === 'string' && message.trim().startsWith('{')) {
+                    try {
+                        const payload = JSON.parse(message);
+                        if (payload && payload.error) {
+                            setError(payload.error);
+                            return;
+                        }
+                    } catch (e) {
+                        // Not JSON, fall through to frame handling
+                    }
+                }
 
                 // Call callback with processed frame and latency
                 if (onFrameReceived) {
-                    onFrameReceived(event.data, latency);
+                    onFrameReceived(message, latency);
                 }
             };
 
