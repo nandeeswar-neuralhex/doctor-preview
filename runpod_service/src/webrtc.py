@@ -155,6 +155,13 @@ class WebRTCManager:
         await pc.setLocalDescription(answer)
         return pc.localDescription
 
+    def set_session_settings(self, session_id: str, settings: dict):
+        """Store per-session settings (e.g. enable_lipsync)."""
+        self.session_settings[session_id] = {
+            **self.session_settings.get(session_id, {}),
+            **settings
+        }
+
     def get_latest_frame_queue(self, session_id: str) -> Optional[asyncio.Queue]:
         return self.frame_queues.get(session_id)
 

@@ -38,6 +38,9 @@ function ImageUpload({ targetImages, setTargetImages, selectedImageIndex, setSel
                 <p className="text-sm text-gray-400 mb-4">
                     Upload 1-10 post-surgery preview images
                 </p>
+                <p className="text-xs text-yellow-400 mb-4">
+                    Use a clear frontal target photo (full face, no extreme crop).
+                </p>
             </div>
 
             {/* Upload Button */}

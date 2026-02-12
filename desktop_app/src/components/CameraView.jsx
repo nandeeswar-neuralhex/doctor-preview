@@ -6,6 +6,9 @@ import useWebSocket from '../hooks/useWebSocket';
 function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
     const originalVideoRef = useRef(null);
     const processedVideoRef = useRef(null);
+    const wsImgRef = useRef(null);
+    const wsFrameCountRef = useRef(0);
+    const wsLastFpsTimeRef = useRef(performance.now());
 
     const [fps, setFps] = useState(0);
     const [latency, setLatency] = useState(0);
@@ -22,10 +25,18 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
 
     // Custom hooks for webcam and WebSocket
     const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true);
-    // WebSocket hook
+    // WebSocket hook – render into the dedicated <img> ref
     const handleWsFrame = useCallback((base64Frame) => {
-        if (processedVideoRef.current) {
-            processedVideoRef.current.src = `data:image/jpeg;base64,${base64Frame}`;
+        if (wsImgRef.current) {
+            wsImgRef.current.src = `data:image/jpeg;base64,${base64Frame}`;
+        }
+        // FPS counter for WS mode
+        wsFrameCountRef.current++;
+        const now = performance.now();
+        if (now - wsLastFpsTimeRef.current >= 1000) {
+            setFps(wsFrameCountRef.current);
+            wsFrameCountRef.current = 0;
+            wsLastFpsTimeRef.current = now;
         }
     }, []);
 
@@ -65,13 +76,14 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
         }
     }, [isStreaming, isConnected, connectionState, isWsConnected, connectWs]);
 
-    // Send frames via WebSocket if connected
+    // Send frames via WebSocket if connected – throttled to ~24 FPS
     useEffect(() => {
         if (!isStreaming || !isWsConnected || !originalVideoRef.current) return;
 
         const canvas = document.createElement('canvas');
         const ctx = canvas.getContext('2d');
         const video = originalVideoRef.current;
+        const FRAME_INTERVAL = 1000 / 24; // 24 FPS
 
         let active = true;
         const sendLoop = () => {
@@ -83,12 +95,41 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
                 const base64 = canvas.toDataURL('image/jpeg', 0.8).split(',')[1];
                 sendWsFrame(base64);
             }
-            requestAnimationFrame(sendLoop);
+            setTimeout(sendLoop, FRAME_INTERVAL);
         };
         sendLoop();
 
         return () => { active = false; };
     }, [isStreaming, isWsConnected, sendWsFrame]);
+
+    // Auto re-upload target image when the user switches images mid-stream
+    useEffect(() => {
+        if (!isStreaming || !serverUrl || !targetImage) return;
+
+        const reupload = async () => {
+            try {
+                setDiagnostics(prev => ({ ...prev, upload: 'Re-uploading target image...' }));
+                const formData = new FormData();
+                formData.append('file', targetImage.file);
+                const resp = await fetch(
+                    `${serverUrl}/upload-target?session_id=${sessionId}`,
+                    { method: 'POST', body: formData }
+                );
+                const body = await resp.json().catch(() => null);
+                if (!resp.ok) {
+                    setDiagnostics(prev => ({
+                        ...prev,
+                        upload: `Re-upload failed: ${body?.error || resp.status}`
+                    }));
+                    return;
+                }
+                setDiagnostics(prev => ({ ...prev, upload: `Re-upload ok: ${body?.message || 'success'}` }));
+            } catch (err) {
+                setDiagnostics(prev => ({ ...prev, upload: `Re-upload error: ${err.message}` }));
+            }
+        };
+        reupload();
+    }, [targetImage, isStreaming, serverUrl, sessionId]);
 
     // Display webcam stream in video element
     useEffect(() => {
@@ -205,6 +246,9 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
                     ...prev,
                     upload: `Upload failed: ${errorMessage} (HTTP ${response.status})`
                 }));
+                if ((responseBody?.error || '').toLowerCase().includes('no face detected')) {
+                    throw new Error('No face detected. Use a clear frontal target photo (full face, no extreme crop).');
+                }
                 throw new Error(errorMessage);
             }
             setDiagnostics(prev => ({
@@ -399,7 +443,7 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
                         {isStreaming ? (
                             isWsConnected ? (
                                 <img
-                                    ref={processedVideoRef}
+                                    ref={wsImgRef}
                                     className="w-full h-full object-contain"
                                     alt="Live Feed"
                                 />
