@@ -125,6 +125,8 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
 
         return () => clearInterval(interval);
     }, [isStreaming, isConnected]);
+
+    const handleStart = async () => {
         if (!serverUrl) {
             alert('Please set server URL in settings first');
             return;
