@@ -106,21 +106,49 @@ class FaceSwapper:
         faces = self.face_analyzer.get(image)
 
         if len(faces) == 0:
-            # Retry with resized image for small faces
+            # Retry with resized image for small/large faces and low-contrast images
             height, width = image.shape[:2]
-            resized = None
             min_dim = min(height, width)
-            if min_dim < 320:
-                scale = 640 / max(1, min_dim)
-                resized = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            else:
-                scale = 1.5
-                max_dim = max(height, width)
-                if max_dim * scale <= 1600:
-                    resized = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            max_dim = max(height, width)
 
-            if resized is not None:
-                faces = self.face_analyzer.get(resized)
+            # Contrast enhancement (helps low-light/flat images)
+            def _enhance_contrast(img: np.ndarray) -> np.ndarray:
+                try:
+                    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+                    l, a, b = cv2.split(lab)
+                    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                    l2 = clahe.apply(l)
+                    return cv2.cvtColor(cv2.merge((l2, a, b)), cv2.COLOR_LAB2BGR)
+                except Exception:
+                    return img
+
+            scale_candidates = []
+            if max_dim > 1200:
+                scale_candidates.extend([1200 / max_dim, 960 / max_dim])
+            if min_dim < 320:
+                scale_candidates.append(640 / max(1, min_dim))
+            elif min_dim < 480:
+                scale_candidates.append(1.5)
+            else:
+                scale_candidates.append(1.25)
+
+            # Try original and contrast-enhanced images at multiple scales
+            tried = []
+            for base_img in (image, _enhance_contrast(image)):
+                for scale in scale_candidates:
+                    if scale <= 0:
+                        continue
+                    if not (0.3 <= scale <= 2.5):
+                        continue
+                    if max_dim * scale > 2000:
+                        continue
+                    resized = cv2.resize(base_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                    tried.append(scale)
+                    faces = self.face_analyzer.get(resized)
+                    if len(faces) > 0:
+                        break
+                if len(faces) > 0:
+                    break
 
         if len(faces) == 0:
             print(f"No face detected in target image for session {session_id} (size={image.shape[1]}x{image.shape[0]})")
