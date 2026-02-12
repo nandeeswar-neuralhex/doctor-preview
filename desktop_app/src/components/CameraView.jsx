@@ -10,24 +10,47 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
     const [latency, setLatency] = useState(0);
     const [sessionId] = useState(() => `session-${Date.now()}`);
     const [lipSyncEnabled, setLipSyncEnabled] = useState(true);
+    const [diagnostics, setDiagnostics] = useState({
+        health: null,
+        upload: null,
+        settings: null,
+        webrtc: null,
+        localMedia: null,
+        remoteMedia: null
+    });
 
     // Custom hooks for webcam and WebSocket
     const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true);
     const {
         isConnected,
         error: rtcError,
+        connectionState,
         connect,
         disconnect
     } = useWebRTC(serverUrl, sessionId, (remoteStream) => {
         if (processedVideoRef.current) {
             processedVideoRef.current.srcObject = remoteStream;
         }
+        setDiagnostics(prev => ({
+            ...prev,
+            remoteMedia: {
+                videoTracks: remoteStream.getVideoTracks().length,
+                audioTracks: remoteStream.getAudioTracks().length
+            }
+        }));
     });
 
     // Display webcam stream in video element
     useEffect(() => {
         if (stream && originalVideoRef.current) {
             originalVideoRef.current.srcObject = stream;
+            setDiagnostics(prev => ({
+                ...prev,
+                localMedia: {
+                    videoTracks: stream.getVideoTracks().length,
+                    audioTracks: stream.getAudioTracks().length
+                }
+            }));
         }
     }, [stream]);
 
@@ -67,6 +90,7 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
         }
 
         try {
+            setDiagnostics(prev => ({ ...prev, upload: 'Uploading target image...' }));
             // Upload target image to server
             const formData = new FormData();
             formData.append('file', targetImage.file);
@@ -79,24 +103,46 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
             const responseBody = await response.json().catch(() => null);
             if (!response.ok) {
                 const errorMessage = responseBody?.error || 'Failed to upload target image';
+                setDiagnostics(prev => ({
+                    ...prev,
+                    upload: `Upload failed: ${errorMessage} (HTTP ${response.status})`
+                }));
                 throw new Error(errorMessage);
             }
+            setDiagnostics(prev => ({
+                ...prev,
+                upload: `Upload ok: ${responseBody?.message || 'success'}`
+            }));
 
             // Apply session settings
-            await fetch(`${serverUrl}/session/settings?session_id=${sessionId}`, {
+            setDiagnostics(prev => ({ ...prev, settings: 'Applying session settings...' }));
+            const settingsResponse = await fetch(`${serverUrl}/session/settings?session_id=${sessionId}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ enable_lipsync: lipSyncEnabled })
             });
+            if (!settingsResponse.ok) {
+                const settingsBody = await settingsResponse.json().catch(() => null);
+                const message = settingsBody?.error || 'Failed to apply session settings';
+                setDiagnostics(prev => ({
+                    ...prev,
+                    settings: `Settings failed: ${message} (HTTP ${settingsResponse.status})`
+                }));
+                throw new Error(message);
+            }
+            setDiagnostics(prev => ({ ...prev, settings: 'Settings applied' }));
 
             // Start webcam and WebSocket
             const mediaStream = await startWebcam();
             if (!mediaStream) {
                 throw new Error('Unable to access webcam/microphone');
             }
+            setDiagnostics(prev => ({ ...prev, webrtc: 'Connecting (offer)...' }));
             await connect(mediaStream);
+            setDiagnostics(prev => ({ ...prev, webrtc: 'WebRTC connected' }));
             setIsStreaming(true);
         } catch (error) {
+            setDiagnostics(prev => ({ ...prev, webrtc: `WebRTC error: ${error.message}` }));
             alert(`Error: ${error.message}`);
         }
     };
@@ -107,6 +153,31 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
         setIsStreaming(false);
         setFps(0);
         setLatency(0);
+    };
+
+    const handleHealthCheck = async () => {
+        if (!serverUrl) {
+            setDiagnostics(prev => ({ ...prev, health: 'Server URL not set' }));
+            return;
+        }
+        try {
+            setDiagnostics(prev => ({ ...prev, health: 'Checking /health...' }));
+            const response = await fetch(`${serverUrl}/health`);
+            const body = await response.json().catch(() => null);
+            if (!response.ok) {
+                setDiagnostics(prev => ({
+                    ...prev,
+                    health: `Health failed: ${body?.error || 'error'} (HTTP ${response.status})`
+                }));
+                return;
+            }
+            setDiagnostics(prev => ({
+                ...prev,
+                health: `Health ok: model_loaded=${body?.model_loaded}, active_sessions=${body?.active_sessions}`
+            }));
+        } catch (err) {
+            setDiagnostics(prev => ({ ...prev, health: `Health error: ${err.message}` }));
+        }
     };
 
     return (
@@ -149,6 +220,12 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
                         />
                         Lip Sync
                     </label>
+                    <button
+                        onClick={handleHealthCheck}
+                        className="px-3 py-2 text-xs bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors"
+                    >
+                        Check /health
+                    </button>
                 </div>
 
                 {/* Stats */}
@@ -164,7 +241,7 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
                         </div>
                         <div className="flex items-center gap-2">
                             <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></span>
-                            <span className="text-gray-400">{isConnected ? 'Connected' : 'Disconnected'}</span>
+                            <span className="text-gray-400">{isConnected ? 'Connected' : 'Disconnected'} ({connectionState})</span>
                         </div>
                     </div>
                 )}
@@ -245,6 +322,26 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
                     </p>
                 </div>
             )}
+
+            {/* Diagnostics */}
+            <div className="mt-4 p-4 bg-gray-800 border border-gray-700 rounded-lg text-xs text-gray-300 space-y-1">
+                <div><span className="text-gray-400">Health:</span> {diagnostics.health || '—'}</div>
+                <div><span className="text-gray-400">Upload:</span> {diagnostics.upload || '—'}</div>
+                <div><span className="text-gray-400">Settings:</span> {diagnostics.settings || '—'}</div>
+                <div><span className="text-gray-400">WebRTC:</span> {diagnostics.webrtc || '—'}</div>
+                <div>
+                    <span className="text-gray-400">Local media:</span>{' '}
+                    {diagnostics.localMedia
+                        ? `video=${diagnostics.localMedia.videoTracks}, audio=${diagnostics.localMedia.audioTracks}`
+                        : '—'}
+                </div>
+                <div>
+                    <span className="text-gray-400">Remote media:</span>{' '}
+                    {diagnostics.remoteMedia
+                        ? `video=${diagnostics.remoteMedia.videoTracks}, audio=${diagnostics.remoteMedia.audioTracks}`
+                        : '—'}
+                </div>
+            </div>
         </div>
     );
 }

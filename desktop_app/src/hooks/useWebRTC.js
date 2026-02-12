@@ -4,6 +4,7 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream) {
     const pcRef = useRef(null);
     const [error, setError] = useState(null);
     const [isConnected, setIsConnected] = useState(false);
+    const [connectionState, setConnectionState] = useState('new');
 
     const connect = useCallback(async (localStream) => {
         try {
@@ -26,6 +27,7 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream) {
             };
 
             pc.onconnectionstatechange = () => {
+                setConnectionState(pc.connectionState);
                 if (pc.connectionState === 'connected') {
                     setIsConnected(true);
                 }
@@ -59,7 +61,8 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream) {
 
             if (!response.ok) {
                 const body = await response.json().catch(() => null);
-                throw new Error(body?.error || 'WebRTC offer failed');
+                const message = body?.error || 'WebRTC offer failed';
+                throw new Error(`${message} (HTTP ${response.status})`);
             }
 
             const answer = await response.json();
@@ -69,6 +72,8 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream) {
             setError(null);
         } catch (e) {
             setError(e.message || 'WebRTC error');
+            setIsConnected(false);
+            setConnectionState('failed');
         }
     }, [serverUrl, sessionId, onRemoteStream]);
 
@@ -78,9 +83,10 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream) {
             pcRef.current = null;
         }
         setIsConnected(false);
+        setConnectionState('closed');
     }, []);
 
-    return { connect, disconnect, isConnected, error };
+    return { connect, disconnect, isConnected, error, connectionState };
 }
 
 export default useWebRTC;

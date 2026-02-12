@@ -6,10 +6,13 @@ import asyncio
 import base64
 import time
 import uuid
-from typing import Dict
+from typing import Dict, Deque
+from collections import deque
 
 import cv2
 import numpy as np
+from PIL import Image, ImageOps
+import io
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -42,6 +45,16 @@ swapper: FaceSwapper = None
 lip_syncer: LipSyncer = None
 webrtc_manager: WebRTCManager = None
 active_connections: Dict[str, WebSocket] = {}
+diagnostic_events: Deque[dict] = deque(maxlen=200)
+
+
+def log_event(event: str, session_id: str | None = None, detail: str | None = None):
+    diagnostic_events.append({
+        "ts": time.time(),
+        "event": event,
+        "session_id": session_id,
+        "detail": detail
+    })
 
 
 @app.on_event("startup")
@@ -55,6 +68,7 @@ async def startup_event():
     providers = [EXECUTION_PROVIDER, "CPUExecutionProvider"]
     lip_syncer = LipSyncer(providers)
     webrtc_manager = WebRTCManager(swapper, lip_syncer)
+    log_event("startup", detail=f"provider={EXECUTION_PROVIDER}, webrtc={ENABLE_WEBRTC}")
     print("Server ready!")
 
 
@@ -76,7 +90,8 @@ async def health_check():
         "status": "healthy",
         "model_loaded": swapper.is_ready() if swapper else False,
         "active_sessions": swapper.get_session_count() if swapper else 0,
-        "max_sessions": MAX_SESSIONS
+        "max_sessions": MAX_SESSIONS,
+        "webrtc_sessions": len(webrtc_manager.pcs) if webrtc_manager else 0
     }
 
 
@@ -90,17 +105,26 @@ async def upload_target_face(
     This image's face will be swapped onto the webcam feed.
     """
     if swapper.get_session_count() >= MAX_SESSIONS:
+        log_event("upload_rejected", session_id=session_id, detail="max_sessions")
         return JSONResponse(
             status_code=503,
             content={"error": "Max sessions reached", "max": MAX_SESSIONS}
         )
     
-    # Read and decode image
+    # Read and decode image (handle EXIF orientation if present)
     contents = await file.read()
-    nparr = np.frombuffer(contents, np.uint8)
-    image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    image = None
+    try:
+        pil_image = Image.open(io.BytesIO(contents))
+        pil_image = ImageOps.exif_transpose(pil_image)
+        pil_image = pil_image.convert("RGB")
+        image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+    except Exception:
+        nparr = np.frombuffer(contents, np.uint8)
+        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     
     if image is None:
+        log_event("upload_failed", session_id=session_id, detail="invalid_image")
         return JSONResponse(
             status_code=400,
             content={"error": "Invalid image format"}
@@ -110,10 +134,13 @@ async def upload_target_face(
     success = swapper.set_target_face(session_id, image)
     
     if not success:
+        log_event("upload_failed", session_id=session_id, detail="no_face_detected")
         return JSONResponse(
             status_code=400,
             content={"error": "No face detected in image"}
         )
+
+    log_event("upload_success", session_id=session_id)
     
     return {
         "status": "success",
@@ -144,28 +171,36 @@ class SessionSettings(BaseModel):
 @app.post("/webrtc/offer")
 async def webrtc_offer(session_id: str = Query(...), offer: WebRTCOffer = None):
     if not ENABLE_WEBRTC:
+        log_event("webrtc_offer_rejected", session_id=session_id, detail="disabled")
         return JSONResponse(status_code=400, content={"error": "WebRTC is disabled"})
     if not offer:
+        log_event("webrtc_offer_failed", session_id=session_id, detail="missing_offer")
         return JSONResponse(status_code=400, content={"error": "Missing offer"})
+    log_event("webrtc_offer_received", session_id=session_id)
     answer = await webrtc_manager.handle_offer(session_id, offer.sdp, offer.type)
+    log_event("webrtc_offer_answered", session_id=session_id)
     return {"sdp": answer.sdp, "type": answer.type}
 
 
 @app.post("/session/settings")
 async def update_session_settings(session_id: str = Query(...), settings: SessionSettings = None):
     if not settings:
+        log_event("settings_failed", session_id=session_id, detail="missing_settings")
         return JSONResponse(status_code=400, content={"error": "Missing settings"})
     webrtc_manager.set_session_settings(session_id, settings.dict(exclude_none=True))
+    log_event("settings_updated", session_id=session_id, detail=str(settings.dict(exclude_none=True)))
     return {"status": "success", "session_id": session_id, "settings": settings.dict(exclude_none=True)}
 
 
 @app.get("/mjpeg/{session_id}")
 async def mjpeg_stream(session_id: str):
     if not ENABLE_WEBRTC:
+        log_event("mjpeg_rejected", session_id=session_id, detail="disabled")
         return JSONResponse(status_code=400, content={"error": "WebRTC is disabled"})
 
     queue = webrtc_manager.get_latest_frame_queue(session_id)
     if queue is None:
+        log_event("mjpeg_failed", session_id=session_id, detail="no_active_stream")
         return JSONResponse(status_code=404, content={"error": "No active stream for session"})
 
     async def generator():
@@ -184,6 +219,7 @@ async def mjpeg_stream(session_id: str):
 async def delete_session(session_id: str):
     """Clean up a session and free resources"""
     swapper.cleanup_session(session_id)
+    log_event("session_deleted", session_id=session_id)
     return {"status": "success", "message": f"Session {session_id} cleaned up"}
 
 
@@ -199,6 +235,7 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
     Expected throughput: 24+ FPS on RTX 4090/A100
     """
     await websocket.accept()
+    log_event("ws_connected", session_id=session_id)
     active_connections[session_id] = websocket
     
     frame_count = 0
@@ -253,13 +290,27 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
                 print(f"Session {session_id}: {fps:.1f} FPS")
                 
     except WebSocketDisconnect:
+        log_event("ws_disconnected", session_id=session_id)
         print(f"WebSocket disconnected: {session_id}")
     except Exception as e:
+        log_event("ws_error", session_id=session_id, detail=str(e))
         print(f"WebSocket error for {session_id}: {e}")
     finally:
         if session_id in active_connections:
             del active_connections[session_id]
         # Don't cleanup session automatically - user might reconnect
+
+
+@app.get("/debug/status")
+async def debug_status():
+    """Lightweight diagnostics endpoint for end-to-end verification."""
+    return {
+        "status": "ok",
+        "model_loaded": swapper.is_ready() if swapper else False,
+        "active_sessions": swapper.get_session_count() if swapper else 0,
+        "webrtc_sessions": len(webrtc_manager.pcs) if webrtc_manager else 0,
+        "events": list(diagnostic_events)
+    }
 
 
 if __name__ == "__main__":

@@ -101,9 +101,26 @@ class FaceSwapper:
         """
         # Detect faces in the target image
         faces = self.face_analyzer.get(image)
-        
+
         if len(faces) == 0:
-            print(f"No face detected in target image for session {session_id}")
+            # Retry with resized image for small faces
+            height, width = image.shape[:2]
+            resized = None
+            min_dim = min(height, width)
+            if min_dim < 320:
+                scale = 640 / max(1, min_dim)
+                resized = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            else:
+                scale = 1.5
+                max_dim = max(height, width)
+                if max_dim * scale <= 1600:
+                    resized = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+            if resized is not None:
+                faces = self.face_analyzer.get(resized)
+
+        if len(faces) == 0:
+            print(f"No face detected in target image for session {session_id} (size={image.shape[1]}x{image.shape[0]})")
             return False
         
         # Use the largest face (most prominent)
@@ -133,48 +150,45 @@ class FaceSwapper:
         Returns:
             Processed frame with face swapped (or original if no swap possible)
         """
+        result, _ = self.swap_face_with_faces(session_id, frame)
+        return result
+
+    def swap_face_with_faces(self, session_id: str, frame: np.ndarray):
+        """Swap face and also return detected source faces for downstream processing."""
         if session_id not in self.target_faces:
-            return frame
-        
+            return frame, []
+
         target_data = self.target_faces[session_id]
         target_face = target_data["face"]
-        
+
         # Detect faces in the input frame
         source_faces = self.face_analyzer.get(frame)
-        
+
         if len(source_faces) == 0:
-            return frame
-                result, _ = self.swap_face_with_faces(session_id, frame)
-                return result
+            return frame, []
 
-            def swap_face_with_faces(self, session_id: str, frame: np.ndarray):
-                """Swap face and also return detected source faces for downstream processing."""
-                if session_id not in self.target_faces:
-                    return frame, []
+        # Sort faces by size (largest first)
+        source_faces = sorted(
+            source_faces,
+            key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]),
+            reverse=True
+        )
 
-                target_data = self.target_faces[session_id]
-                target_face = target_data["face"]
+        result = frame.copy()
 
-                # Detect faces in the input frame
-                source_faces = self.face_analyzer.get(frame)
+        # Swap up to MAX_FACES for stability (default 1)
+        for source_face in source_faces[:max(1, MAX_FACES)]:
+            result = self._swap_single_face(result, source_face, target_face, session_id)
 
-                if len(source_faces) == 0:
-                    return frame, []
+        return result, source_faces
 
-                # Sort faces by size (largest first)
-                source_faces = sorted(
-                    source_faces,
-                    key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]),
-                    reverse=True
-                )
-
-                result = frame.copy()
-
-                # Swap up to MAX_FACES for stability (default 1)
-                for source_face in source_faces[:max(1, MAX_FACES)]:
-                    result = self._swap_single_face(result, source_face, target_face, session_id)
-
-                return result, source_faces
+    def _swap_single_face(
+        self,
+        frame: np.ndarray,
+        source_face: Any,
+        target_face: Any,
+        session_id: str
+    ) -> np.ndarray:
         """
         Swap a single face in the frame.
         Uses InsightFace's inswapper model for high-quality swapping.
