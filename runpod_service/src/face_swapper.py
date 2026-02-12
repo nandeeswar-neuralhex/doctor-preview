@@ -122,15 +122,19 @@ class FaceSwapper:
                 except Exception:
                     return img
 
-            scale_candidates = []
+            scale_candidates = [1.0]
             if max_dim > 1200:
-                scale_candidates.extend([1200 / max_dim, 960 / max_dim])
+                scale_candidates.extend([1200 / max_dim, 960 / max_dim, 720 / max_dim, 640 / max_dim])
+            elif max_dim > 900:
+                scale_candidates.extend([960 / max_dim, 720 / max_dim])
             if min_dim < 320:
                 scale_candidates.append(640 / max(1, min_dim))
             elif min_dim < 480:
                 scale_candidates.append(1.5)
             else:
                 scale_candidates.append(1.25)
+            # De-duplicate while preserving order
+            scale_candidates = list(dict.fromkeys(scale_candidates))
 
             # Try original and contrast-enhanced images at multiple scales
             tried = []
