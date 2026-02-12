@@ -457,13 +457,20 @@ class FaceSwapper:
                 cv2.rectangle(mask, (x1c, y1c), (x2c, y2c), 255, thickness=-1)
 
             # Compute center for seamlessClone
-            if used_68 and lm68 is not None:
-                cx = int(lm68[:, 0].mean())
-                cy = int(lm68[:, 1].mean())
+            # Use strict bounding rect center to avoid shifting which causes out-of-bounds errors
+            if mask.sum() > 0:
+                y_indices, x_indices = np.nonzero(mask)
+                if len(y_indices) > 0:
+                    min_y, max_y = np.min(y_indices), np.max(y_indices)
+                    min_x, max_x = np.min(x_indices), np.max(x_indices)
+                    cx = int((min_x + max_x) // 2)
+                    cy = int((min_y + max_y) // 2)
+                else:
+                    cx, cy = w // 2, h // 2
             else:
-                cx = int(warped_pts[:, 0].mean())
-                cy = int(warped_pts[:, 1].mean())
-            # Clamp center so seamlessClone won't crash near edges
+                 cx, cy = w // 2, h // 2
+            
+            # Clamp center
             cx = max(1, min(w - 2, cx))
             cy = max(1, min(h - 2, cy))
 

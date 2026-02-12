@@ -4,7 +4,7 @@ import CameraView from './components/CameraView';
 import Settings from './components/Settings';
 
 function App() {
-    const [serverUrl, setServerUrl] = useState('https://l3wwt7eix3lplr-8765.proxy.runpod.net');
+    const [serverUrl, setServerUrl] = useState('https://u4ln48a51ahjsh-8765.proxy.runpod.net');
     const [targetImages, setTargetImages] = useState([]);
     const [selectedImageIndex, setSelectedImageIndex] = useState(0);
     const [isStreaming, setIsStreaming] = useState(false);
