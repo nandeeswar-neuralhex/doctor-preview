@@ -1,88 +1,93 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 
-function useWebSocket(serverUrl, sessionId, onFrameReceived) {
+const useWebSocket = (serverUrl, sessionId, onFrame) => {
+    const wsRef = useRef(null);
     const [isConnected, setIsConnected] = useState(false);
     const [error, setError] = useState(null);
-    const wsRef = useRef(null);
-    const sendTimeRef = useRef(null);
 
-    const connect = useCallback(async () => {
-        if (!serverUrl) {
-            setError('Server URL not set');
-            return;
+    const connect = useCallback(() => {
+        if (!serverUrl || !sessionId) return;
+
+        // Convert http/https to ws/wss
+        const wsUrl = serverUrl.replace(/^http/, 'ws').replace(/\/$/, '') + `/ws/${sessionId}`;
+
+        // Prevent multiple connections
+        if (wsRef.current) {
+            if (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING) {
+                return;
+            }
+            wsRef.current.close();
         }
 
         try {
-            // Convert HTTP URL to WebSocket URL
-            const wsUrl = serverUrl
-                .replace('https://', 'wss://')
-                .replace('http://', 'ws://');
-
-            const ws = new WebSocket(`${wsUrl}/ws/${sessionId}`);
+            console.log('Connecting to WebSocket:', wsUrl);
+            const ws = new WebSocket(wsUrl);
+            wsRef.current = ws;
 
             ws.onopen = () => {
-                console.log('WebSocket connected');
+                console.log('WebSocket Connected');
                 setIsConnected(true);
                 setError(null);
             };
 
             ws.onmessage = (event) => {
-                const receiveTime = Date.now();
-                const latency = sendTimeRef.current ? receiveTime - sendTimeRef.current : 0;
-                const message = event.data;
-
-                // Handle JSON error payloads from server
-                if (typeof message === 'string' && message.trim().startsWith('{')) {
+                // If it's a JSON message (error/info)
+                if (event.data.startsWith('{') && event.data.endsWith('}')) {
                     try {
-                        const payload = JSON.parse(message);
-                        if (payload && payload.error) {
-                            setError(payload.error);
-                            return;
+                        const data = JSON.parse(event.data);
+                        if (data.error) {
+                            setError(data.error);
                         }
                     } catch (e) {
-                        // Not JSON, fall through to frame handling
+                        // ignore JSON parse error, treat as frame data if needed, 
+                        // but usually JSON is for control messages.
+                    }
+                } else {
+                    // It's a base64 frame (or raw string)
+                    if (onFrame) {
+                        onFrame(event.data);
                     }
                 }
-
-                // Call callback with processed frame and latency
-                if (onFrameReceived) {
-                    onFrameReceived(message, latency);
-                }
-            };
-
-            ws.onerror = (err) => {
-                console.error('WebSocket error:', err);
-                setError('WebSocket connection error');
             };
 
             ws.onclose = () => {
-                console.log('WebSocket disconnected');
+                console.log('WebSocket Disconnected');
                 setIsConnected(false);
             };
 
-            wsRef.current = ws;
-        } catch (err) {
-            setError(`Failed to connect: ${err.message}`);
-            console.error('WebSocket connection error:', err);
+            ws.onerror = (e) => {
+                console.error('WebSocket Error:', e);
+                setError('WebSocket connection failed');
+                setIsConnected(false);
+            };
+
+        } catch (e) {
+            setError(e.message);
         }
-    }, [serverUrl, sessionId, onFrameReceived]);
+    }, [serverUrl, sessionId, onFrame]);
+
+    const sendFrame = useCallback((base64Frame) => {
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            wsRef.current.send(base64Frame);
+        }
+    }, []);
 
     const disconnect = useCallback(() => {
         if (wsRef.current) {
             wsRef.current.close();
             wsRef.current = null;
-            setIsConnected(false);
         }
+        setIsConnected(false);
     }, []);
 
-    const sendFrame = useCallback((base64Frame) => {
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            sendTimeRef.current = Date.now();
-            wsRef.current.send(base64Frame);
-        }
-    }, []);
+    // Cleanup on unmount
+    useEffect(() => {
+        return () => {
+            disconnect();
+        };
+    }, []); // Removed connect/disconnect from dependency array to avoid loop
 
-    return { isConnected, error, sendFrame, connect, disconnect };
-}
+    return { connect, disconnect, sendFrame, isConnected, error };
+};
 
 export default useWebSocket;

@@ -1,6 +1,7 @@
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
 import useWebcam from '../hooks/useWebcam';
 import useWebRTC from '../hooks/useWebRTC';
+import useWebSocket from '../hooks/useWebSocket';
 
 function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
     const originalVideoRef = useRef(null);
@@ -21,6 +22,21 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
 
     // Custom hooks for webcam and WebSocket
     const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true);
+    // WebSocket hook
+    const handleWsFrame = useCallback((base64Frame) => {
+        if (processedVideoRef.current) {
+            processedVideoRef.current.src = `data:image/jpeg;base64,${base64Frame}`;
+        }
+    }, []);
+
+    const {
+        connect: connectWs,
+        disconnect: disconnectWs,
+        sendFrame: sendWsFrame,
+        isConnected: isWsConnected,
+        error: wsError
+    } = useWebSocket(serverUrl, sessionId, handleWsFrame);
+
     const {
         isConnected,
         error: rtcError,
@@ -39,6 +55,40 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
             }
         }));
     });
+
+    // Fallback logic: If WebRTC fails or disconnects, try WebSocket
+    useEffect(() => {
+        if (isStreaming && !isConnected && connectionState === 'failed' && !isWsConnected) {
+            console.log('WebRTC failed, falling back to WebSocket...');
+            setDiagnostics(prev => ({ ...prev, webrtc: 'WebRTC failed, trying WebSocket...' }));
+            connectWs();
+        }
+    }, [isStreaming, isConnected, connectionState, isWsConnected, connectWs]);
+
+    // Send frames via WebSocket if connected
+    useEffect(() => {
+        if (!isStreaming || !isWsConnected || !originalVideoRef.current) return;
+
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        const video = originalVideoRef.current;
+
+        let active = true;
+        const sendLoop = () => {
+            if (!active) return;
+            if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                ctx.drawImage(video, 0, 0);
+                const base64 = canvas.toDataURL('image/jpeg', 0.8).split(',')[1];
+                sendWsFrame(base64);
+            }
+            requestAnimationFrame(sendLoop);
+        };
+        sendLoop();
+
+        return () => { active = false; };
+    }, [isStreaming, isWsConnected, sendWsFrame]);
 
     // Display webcam stream in video element
     useEffect(() => {
@@ -64,7 +114,7 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
         let active = true;
 
         // Preferred: requestVideoFrameCallback (counts real decoded frames)
-        if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+        if (video instanceof HTMLVideoElement && 'requestVideoFrameCallback' in HTMLVideoElement.prototype) {
             const tick = (now) => {
                 if (!active) return;
                 frameCount++;
@@ -198,6 +248,7 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
     const handleStop = () => {
         stopWebcam();
         disconnect();
+        disconnectWs();
         setIsStreaming(false);
         setFps(0);
         setLatency(0);
@@ -288,8 +339,11 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
                             <span className="font-mono text-blue-400 font-semibold">{latency}ms</span>
                         </div>
                         <div className="flex items-center gap-2">
-                            <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></span>
-                            <span className="text-gray-400">{isConnected ? 'Connected' : 'Disconnected'} ({connectionState})</span>
+                            <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500 animate-pulse' : isWsConnected ? 'bg-blue-500 animate-pulse' : 'bg-red-500'}`}></span>
+                            <span className="text-gray-400">
+                                {isConnected ? 'WebRTC' : isWsConnected ? 'WebSocket' : 'Disconnected'}
+                                ({isConnected ? connectionState : isWsConnected ? 'connected' : 'failed'})
+                            </span>
                         </div>
                     </div>
                 )}
@@ -343,13 +397,21 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
                     </div>
                     <div className="aspect-video bg-black flex items-center justify-center">
                         {isStreaming ? (
-                            <video
-                                ref={processedVideoRef}
-                                autoPlay
-                                playsInline
-                                muted
-                                className="w-full h-full object-contain"
-                            />
+                            isWsConnected ? (
+                                <img
+                                    ref={processedVideoRef}
+                                    className="w-full h-full object-contain"
+                                    alt="Live Feed"
+                                />
+                            ) : (
+                                <video
+                                    ref={processedVideoRef}
+                                    autoPlay
+                                    playsInline
+                                    muted
+                                    className="w-full h-full object-contain"
+                                />
+                            )
                         ) : (
                             <div className="text-center text-gray-500">
                                 <svg className="w-16 h-16 mx-auto mb-4 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
