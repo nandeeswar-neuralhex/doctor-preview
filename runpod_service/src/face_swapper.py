@@ -5,6 +5,7 @@ Optimized for 24+ FPS real-time processing
 import cv2
 import numpy as np
 from typing import Dict, Optional, Any
+from types import SimpleNamespace
 import onnxruntime as ort
 from insightface.app import FaceAnalysis
 
@@ -161,8 +162,8 @@ class FaceSwapper:
         target_data = self.target_faces[session_id]
         target_face = target_data["face"]
 
-        # Detect faces in the input frame
-        source_faces = self.face_analyzer.get(frame)
+        # Detect faces in the input frame (with fallback for small/low-res faces)
+        source_faces = self._detect_faces_with_fallback(frame)
 
         if len(source_faces) == 0:
             return frame, []
@@ -249,6 +250,45 @@ class FaceSwapper:
         except Exception as e:
             print(f"Swap error: {e}")
             return frame
+
+    def _detect_faces_with_fallback(self, frame: np.ndarray):
+        """Detect faces with a fallback upscaling pass for small/low-res faces."""
+        faces = self.face_analyzer.get(frame)
+        if len(faces) > 0:
+            return faces
+
+        height, width = frame.shape[:2]
+        min_dim = min(height, width)
+        scale = 1.0
+        resized = None
+
+        # Upscale if face likely too small
+        if min_dim < 360:
+            scale = 720 / max(1, min_dim)
+        elif min_dim < 480:
+            scale = 640 / max(1, min_dim)
+        elif min_dim < 640:
+            scale = 1.25
+
+        if scale > 1.0:
+            resized = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            faces_resized = self.face_analyzer.get(resized)
+            if len(faces_resized) == 0:
+                return []
+
+            # Map detections back to original coordinates
+            mapped = []
+            inv_scale = 1.0 / scale
+            for f in faces_resized:
+                try:
+                    bbox = (f.bbox.astype(np.float32) * inv_scale).astype(np.float32)
+                    kps = (f.kps.astype(np.float32) * inv_scale).astype(np.float32)
+                    mapped.append(SimpleNamespace(bbox=bbox, kps=kps))
+                except Exception:
+                    continue
+            return mapped
+
+        return []
     
     def _align_face(self, frame: np.ndarray, kps: np.ndarray) -> Optional[np.ndarray]:
         """Align face for model input using landmarks"""
@@ -297,8 +337,17 @@ class FaceSwapper:
             x1, y1, x2, y2 = bbox
             cx = int((x1 + x2) / 2)
             cy = int((y1 + y2) / 2)
-            hull = cv2.convexHull(kps.astype(np.int32))
-            cv2.fillConvexPoly(mask, hull, 255)
+            try:
+                hull = cv2.convexHull(kps.astype(np.int32))
+                cv2.fillConvexPoly(mask, hull, 255)
+            except Exception:
+                mask = np.zeros((h, w), dtype=np.uint8)
+
+            # Fallback: if mask is empty, use bbox rectangle
+            if mask.sum() < 10:
+                x1c, y1c = max(0, x1), max(0, y1)
+                x2c, y2c = min(w, x2), min(h, y2)
+                cv2.rectangle(mask, (x1c, y1c), (x2c, y2c), 255, thickness=-1)
 
             # Optional dilation (scale)
             if FACE_MASK_SCALE > 1.0:
