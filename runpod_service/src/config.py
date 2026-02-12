@@ -31,7 +31,7 @@ GFPGAN_MODEL_PATH = _GFPGAN_PATH_ENV or os.path.join(MODELS_DIR, "GFPGANv1.4.pth
 
 # Smoothing / tracking
 ENABLE_TEMPORAL_SMOOTHING = os.getenv("ENABLE_TEMPORAL_SMOOTHING", "true").lower() == "true"
-SMOOTHING_ALPHA = float(os.getenv("SMOOTHING_ALPHA", "0.7"))
+SMOOTHING_ALPHA = float(os.getenv("SMOOTHING_ALPHA", "0.4"))
 MAX_FACES = int(os.getenv("MAX_FACES", "1"))
 
 # WebRTC / Lip sync

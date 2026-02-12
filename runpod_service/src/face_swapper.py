@@ -290,22 +290,32 @@ class FaceSwapper:
 
         return []
     
+    # Standard 5-point alignment template for 128x128 crop
+    _ALIGN_TEMPLATE = np.array([
+        [38.2946, 51.6963],
+        [73.5318, 51.5014],
+        [56.0252, 71.7366],
+        [41.5493, 92.3655],
+        [70.7299, 92.2041]
+    ], dtype=np.float32)
+
     def _align_face(self, frame: np.ndarray, kps: np.ndarray) -> Optional[np.ndarray]:
-        """Align face for model input using landmarks"""
-        # Standard face alignment for 128x128 input
-        src_pts = np.array([
-            [38.2946, 51.6963],
-            [73.5318, 51.5014],
-            [56.0252, 71.7366],
-            [41.5493, 92.3655],
-            [70.7299, 92.2041]
-        ], dtype=np.float32)
-        
+        """Align face for model input using landmarks (full affine)."""
         try:
-            tform = cv2.estimateAffinePartial2D(kps, src_pts)[0]
+            # Use full 6-DOF affine for better expression/pose tracking
+            tform, _ = cv2.estimateAffine2D(
+                kps.astype(np.float32),
+                self._ALIGN_TEMPLATE,
+                method=cv2.LMEDS
+            )
+            if tform is None:
+                # Fallback to partial affine
+                tform = cv2.estimateAffinePartial2D(kps, self._ALIGN_TEMPLATE)[0]
+            if tform is None:
+                return None
             aimg = cv2.warpAffine(frame, tform, (128, 128), borderValue=0.0)
             return aimg
-        except:
+        except Exception:
             return None
     
     def _paste_back(
@@ -316,17 +326,17 @@ class FaceSwapper:
         bbox: np.ndarray
     ) -> np.ndarray:
         """Paste the swapped face back onto the original frame"""
-        # Inverse alignment
-        src_pts = np.array([
-            [38.2946, 51.6963],
-            [73.5318, 51.5014],
-            [56.0252, 71.7366],
-            [41.5493, 92.3655],
-            [70.7299, 92.2041]
-        ], dtype=np.float32)
-        
         try:
-            tform = cv2.estimateAffinePartial2D(src_pts, kps)[0]
+            # Use full 6-DOF affine for accurate inverse mapping
+            tform, _ = cv2.estimateAffine2D(
+                self._ALIGN_TEMPLATE,
+                kps.astype(np.float32),
+                method=cv2.LMEDS
+            )
+            if tform is None:
+                tform = cv2.estimateAffinePartial2D(self._ALIGN_TEMPLATE, kps)[0]
+            if tform is None:
+                return frame
 
             # Warp swapped face to original position
             h, w = frame.shape[:2]
