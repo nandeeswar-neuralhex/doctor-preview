@@ -108,5 +108,10 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
     except Exception as e:
         print(f"WebSocket error: {e}")
 
+@app.delete("/session/{session_id}")
+async def delete_session(session_id: str):
+    print(f"Session {session_id} cleaned up")
+    return {"status": "success", "message": "Session cleaned up"}
+
 if __name__ == "__main__":
     uvicorn.run(app, host=HOST, port=PORT)
