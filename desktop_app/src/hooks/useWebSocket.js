@@ -1,26 +1,30 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 
 /**
- * Binary WebSocket protocol for low-latency face swap streaming.
- * 
- * Send: [8 bytes float64 timestamp] + [raw JPEG bytes]
- * Recv: [8 bytes float64 timestamp] + [raw JPEG bytes]
- * 
- * Eliminates base64 encoding (33% bandwidth saving) and JSON parse overhead (~6ms).
- * Falls back to text/JSON mode if binary send fails.
+ * High-performance binary WebSocket for real-time face swap streaming.
+ *
+ * Protocol (binary):
+ *   Send: [4 bytes uint32 frame_id] + [raw JPEG bytes]
+ *   Recv: [4 bytes uint32 frame_id] + [raw JPEG bytes]
+ *
+ * Key design: PIPELINED sending — we do NOT wait for a response before sending
+ * the next frame. This hides the network latency completely. The server processes
+ * frames in order and we display responses as they arrive (latest wins).
+ *
+ * With ~300ms round-trip and pipelined sending at 20fps, there are always
+ * ~6 frames "in flight". The user sees smooth 20fps output despite high RTT.
  */
 const useWebSocket = (serverUrl, sessionId, onFrame) => {
     const wsRef = useRef(null);
+    const frameIdRef = useRef(0);
     const [isConnected, setIsConnected] = useState(false);
     const [error, setError] = useState(null);
 
     const connect = useCallback(() => {
         if (!serverUrl || !sessionId) return;
 
-        // Convert http/https to ws/wss
         const wsUrl = serverUrl.replace(/^http/, 'ws').replace(/\/$/, '') + `/ws/${sessionId}`;
 
-        // Prevent multiple connections
         if (wsRef.current) {
             if (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING) {
                 return;
@@ -31,33 +35,33 @@ const useWebSocket = (serverUrl, sessionId, onFrame) => {
         try {
             console.log('Connecting to WebSocket:', wsUrl);
             const ws = new WebSocket(wsUrl);
-            ws.binaryType = 'arraybuffer'; // Receive binary responses as ArrayBuffer
+            ws.binaryType = 'arraybuffer';
             wsRef.current = ws;
 
             ws.onopen = () => {
-                console.log('WebSocket Connected (binary mode)');
+                console.log('WebSocket Connected (binary pipeline mode)');
                 setIsConnected(true);
                 setError(null);
+                frameIdRef.current = 0;
             };
 
             ws.onmessage = (event) => {
                 if (event.data instanceof ArrayBuffer) {
-                    // Binary mode: first 8 bytes = float64 timestamp, rest = JPEG
                     const buf = event.data;
-                    if (buf.byteLength < 16) return;
+                    if (buf.byteLength < 12) return;
 
+                    // Header: 4 bytes frameId + 8 bytes float64 timestamp
                     const view = new DataView(buf);
-                    const sentTs = view.getFloat64(0, true); // little-endian
+                    const sentTs = view.getFloat64(4, true);
                     const latency = Date.now() - sentTs;
 
-                    // Create blob URL from raw JPEG (zero-copy, no base64)
-                    const jpegBlob = new Blob([buf.slice(8)], { type: 'image/jpeg' });
+                    // Create blob URL from raw JPEG (zero-copy render)
+                    const jpegBlob = new Blob([buf.slice(12)], { type: 'image/jpeg' });
                     const url = URL.createObjectURL(jpegBlob);
-
-                    if (onFrame) onFrame(url, latency, true); // true = isObjectURL
+                    if (onFrame) onFrame(url, latency, true);
                 } else if (typeof event.data === 'string') {
-                    // Legacy text/JSON fallback
-                    if (event.data.startsWith('{') && event.data.endsWith('}')) {
+                    // Legacy text fallback
+                    if (event.data.startsWith('{')) {
                         try {
                             const data = JSON.parse(event.data);
                             if (data.error) setError(data.error);
@@ -89,32 +93,37 @@ const useWebSocket = (serverUrl, sessionId, onFrame) => {
     }, [serverUrl, sessionId, onFrame]);
 
     /**
-     * Send a frame as raw binary: [8-byte float64 timestamp] + [JPEG bytes]
-     * Accepts either a Blob or a base64 string.
+     * Send frame as binary: [4-byte frameId] + [8-byte timestamp] + [JPEG bytes]
+     * PIPELINED: does NOT wait for previous response — fires immediately.
      */
     const sendFrame = useCallback((frameData) => {
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
+        // Check bufferedAmount — if too much is queued, skip this frame
+        // This prevents memory buildup if network is slower than capture rate
+        if (wsRef.current.bufferedAmount > 200_000) {
+            return; // Skip frame, ~200KB already queued
+        }
+
+        const fid = frameIdRef.current++;
+
         if (frameData instanceof Blob) {
-            // Fast path: binary blob from canvas.toBlob()
             frameData.arrayBuffer().then((jpegBuf) => {
-                const header = new ArrayBuffer(8);
-                new DataView(header).setFloat64(0, Date.now(), true);
-                // Concat header + JPEG into single send
-                const combined = new Uint8Array(8 + jpegBuf.byteLength);
+                if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+                // Header: 4 bytes frameId (uint32) + 8 bytes timestamp (float64)
+                const header = new ArrayBuffer(12);
+                const hView = new DataView(header);
+                hView.setUint32(0, fid, true);
+                hView.setFloat64(4, Date.now(), true);
+
+                const combined = new Uint8Array(12 + jpegBuf.byteLength);
                 combined.set(new Uint8Array(header), 0);
-                combined.set(new Uint8Array(jpegBuf), 8);
-                if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-                    wsRef.current.send(combined.buffer);
-                }
+                combined.set(new Uint8Array(jpegBuf), 12);
+                wsRef.current.send(combined.buffer);
             });
         } else if (typeof frameData === 'string') {
-            // Legacy fallback: base64 string
-            const payload = JSON.stringify({
-                image: frameData,
-                ts: Date.now()
-            });
-            wsRef.current.send(payload);
+            // Legacy text fallback
+            wsRef.current.send(JSON.stringify({ image: frameData, ts: Date.now() }));
         }
     }, []);
 
@@ -126,11 +135,8 @@ const useWebSocket = (serverUrl, sessionId, onFrame) => {
         setIsConnected(false);
     }, []);
 
-    // Cleanup on unmount
     useEffect(() => {
-        return () => {
-            disconnect();
-        };
+        return () => { disconnect(); };
     }, []);
 
     return { connect, disconnect, sendFrame, isConnected, error };

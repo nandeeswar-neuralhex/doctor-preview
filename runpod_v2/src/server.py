@@ -234,13 +234,88 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
     loop = asyncio.get_running_loop()
     frame_count = 0
     last_log_time = time.time()
+    last_timing = None
 
-    # Detect mode from first message: binary (fast) or text (legacy)
-    binary_mode = None  # Will be set on first message
+    # Pipelined processing with bounded concurrency:
+    # - We receive frames continuously (client sends at 20fps)
+    # - Process up to 3 concurrently (matches thread pool + GPU)
+    # - Drop frames if we fall behind (latest-frame-wins)
+    # - This hides the RTT latency: output FPS ≈ server throughput
+    _sem = asyncio.Semaphore(3)  # Max 3 frames in-flight
+    _latest_frame_id = 0         # Track latest to drop stale frames
+
+    async def process_and_respond_binary(raw_data: bytes):
+        """Process a binary frame and send result back."""
+        nonlocal last_timing, _latest_frame_id
+        if len(raw_data) < 13:  # 12-byte header + at least 1 byte JPEG
+            return
+        # Header: 4 bytes frameId + 8 bytes timestamp + JPEG
+        frame_id_bytes = raw_data[:4]
+        ts_bytes = raw_data[4:12]
+        jpeg_bytes = raw_data[12:]
+
+        frame_id = struct.unpack('<I', frame_id_bytes)[0]
+
+        # Drop if a newer frame is already queued
+        if frame_id < _latest_frame_id:
+            return
+        _latest_frame_id = frame_id
+
+        # Bounded concurrency — if all slots full, skip this frame
+        if _sem.locked():
+            return
+
+        async with _sem:
+            out_bytes, timing = await loop.run_in_executor(
+                _frame_pool,
+                _process_frame_binary,
+                jpeg_bytes,
+                session_id,
+                swapper
+            )
+            if out_bytes is None:
+                return
+            last_timing = timing
+
+            # Response: [4 bytes frameId] + [8 bytes timestamp] + JPEG
+            try:
+                await websocket.send_bytes(frame_id_bytes + ts_bytes + out_bytes)
+            except Exception:
+                pass  # WebSocket may have closed
+
+    async def process_and_respond_text(data: str, client_ts):
+        """Process a text/JSON frame and send result back."""
+        nonlocal last_timing
+        # Parse frame data
+        frame_data = data
+        if data[0] == '{':
+            try:
+                payload = json.loads(data)
+                frame_data = payload.get("image", data)
+                client_ts = payload.get("ts", client_ts)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        result_b64, timing = await loop.run_in_executor(
+            _frame_pool,
+            _process_frame_text,
+            frame_data,
+            session_id,
+            swapper
+        )
+        if result_b64 is None:
+            return
+        last_timing = timing
+
+        if client_ts is not None:
+            await websocket.send_text(
+                '{"image":"' + result_b64 + '","ts":' + str(client_ts) + '}'
+            )
+        else:
+            await websocket.send_text(result_b64)
 
     try:
         while True:
-            # ── Receive next frame (accept both binary and text) ──
             try:
                 msg = await websocket.receive()
             except WebSocketDisconnect:
@@ -248,93 +323,28 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
                 break
 
             if "bytes" in msg and msg["bytes"]:
-                raw = msg["bytes"]
-                if binary_mode is None:
-                    binary_mode = True
-                    print(f"[{session_id}] Binary mode activated — low-latency path")
-                # Binary protocol: first 8 bytes = float64 timestamp, rest = JPEG
-                if len(raw) < 16:
-                    continue
-                client_ts = struct.unpack('<d', raw[:8])[0]
-                jpeg_bytes = raw[8:]
-
-                # Process in thread pool
-                try:
-                    out_bytes, timing = await loop.run_in_executor(
-                        _frame_pool,
-                        _process_frame_binary,
-                        jpeg_bytes,
-                        session_id,
-                        swapper
-                    )
-                    if out_bytes is None:
-                        continue
-
-                    # Response: 8 bytes timestamp + JPEG
-                    header = struct.pack('<d', client_ts)
-                    await websocket.send_bytes(header + out_bytes)
-
-                except Exception as e:
-                    print(f"Binary frame error: {e}")
-                    continue
+                # Fire-and-forget: start processing, don't await before receiving next
+                asyncio.ensure_future(process_and_respond_binary(msg["bytes"]))
 
             elif "text" in msg and msg["text"]:
-                data = msg["text"]
-                if binary_mode is None:
-                    binary_mode = False
-                    print(f"[{session_id}] Text/JSON mode (legacy) — consider upgrading client for lower latency")
-
-                # Parse JSON wrapper
-                client_ts = None
-                if data[0] == '{':
-                    try:
-                        payload = json.loads(data)
-                        frame_data = payload.get("image", data)
-                        client_ts = payload.get("ts")
-                    except (json.JSONDecodeError, TypeError):
-                        frame_data = data
-                else:
-                    frame_data = data
-
-                # Process in thread pool
-                try:
-                    result_b64, timing = await loop.run_in_executor(
-                        _frame_pool,
-                        _process_frame_text,
-                        frame_data,
-                        session_id,
-                        swapper
-                    )
-                    if result_b64 is None:
-                        continue
-
-                    if client_ts is not None:
-                        await websocket.send_text(
-                            '{"image":"' + result_b64 + '","ts":' + str(client_ts) + '}'
-                        )
-                    else:
-                        await websocket.send_text(result_b64)
-
-                except Exception as e:
-                    print(f"Text frame error: {e}")
-                    continue
+                asyncio.ensure_future(process_and_respond_text(msg["text"], None))
             else:
                 continue
 
-            # ── Periodic logging (every 3 seconds) ──
+            # Periodic logging
             frame_count += 1
             now = time.time()
             elapsed = now - last_log_time
-            if elapsed >= 3.0 and timing:
+            if elapsed >= 3.0:
                 fps_val = frame_count / elapsed
-                mode_str = "BIN" if binary_mode else "TXT"
                 print(
-                    f"[{session_id}] {mode_str} FPS: {fps_val:.1f} | "
-                    f"decode={timing['decode_ms']:.1f}ms "
-                    f"swap={timing['swap_ms']:.1f}ms "
-                    f"encode={timing['encode_ms']:.1f}ms "
-                    f"total={timing['total_ms']:.1f}ms | "
-                    f"Res: {timing['w']}x{timing['h']}"
+                    f"[{session_id}] FPS: {fps_val:.1f} | "
+                    + (f"decode={last_timing['decode_ms']:.1f}ms "
+                       f"swap={last_timing['swap_ms']:.1f}ms "
+                       f"encode={last_timing['encode_ms']:.1f}ms "
+                       f"total={last_timing['total_ms']:.1f}ms | "
+                       f"Res: {last_timing['w']}x{last_timing['h']}"
+                       if last_timing else "no timing yet")
                 )
                 frame_count = 0
                 last_log_time = now

@@ -7,9 +7,10 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
     const originalVideoRef = useRef(null);
     const processedVideoRef = useRef(null);
     const wsImgRef = useRef(null);
+    const wsImgBackRef = useRef(null); // Double-buffer for smooth crossfade
     const wsFrameCountRef = useRef(0);
     const wsLastFpsTimeRef = useRef(performance.now());
-    const pendingFrameRef = useRef(false); // Back-pressure: true while waiting for server response
+    const frontBufRef = useRef(0); // 0 = wsImgRef is front, 1 = wsImgBackRef is front
 
     const [fps, setFps] = useState(0);
     const [latency, setLatency] = useState(0);
@@ -28,16 +29,30 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
     const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true);
     // WebSocket hook – render into the dedicated <img> ref
     const handleWsFrame = useCallback((frameUrl, wsLatency, isObjectURL) => {
-        // Clear back-pressure flag — server has responded, we can send next frame
-        pendingFrameRef.current = false;
-        if (wsImgRef.current) {
-            // Revoke previous object URL to prevent memory leak
-            const prevSrc = wsImgRef.current.src;
+        // Double-buffer crossfade: load new frame into the BACK buffer,
+        // then swap front/back. This eliminates flicker/flash between frames.
+        const frontImg = frontBufRef.current === 0 ? wsImgRef.current : wsImgBackRef.current;
+        const backImg = frontBufRef.current === 0 ? wsImgBackRef.current : wsImgRef.current;
+
+        if (backImg) {
+            // Revoke previous blob URL on the back buffer
+            const prevSrc = backImg.src;
             if (prevSrc && prevSrc.startsWith('blob:')) {
                 URL.revokeObjectURL(prevSrc);
             }
-            // Set new frame (either blob: URL from binary mode or data: URI from text mode)
-            wsImgRef.current.src = frameUrl;
+            // Load new frame into back buffer
+            backImg.onload = () => {
+                // Swap: bring back buffer to front
+                if (backImg) backImg.style.opacity = '1';
+                if (frontImg) frontImg.style.opacity = '0';
+                frontBufRef.current = frontBufRef.current === 0 ? 1 : 0;
+            };
+            backImg.src = frameUrl;
+        } else if (frontImg) {
+            // Fallback: single buffer
+            const prevSrc = frontImg.src;
+            if (prevSrc && prevSrc.startsWith('blob:')) URL.revokeObjectURL(prevSrc);
+            frontImg.src = frameUrl;
         }
         // FPS counter for WS mode
         wsFrameCountRef.current++;
@@ -97,41 +112,36 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
         const ctx = canvas.getContext('2d');
         const video = originalVideoRef.current;
 
-        // Adaptive frame sending with binary WebSocket:
-        // - canvas.toBlob() is async and non-blocking (unlike toDataURL which blocks main thread)
-        // - Sends raw JPEG bytes (no base64 = 33% smaller, no JSON parse)
-        // - Back-pressure: waits for server response before sending next
+        // PIPELINED frame sending: send at fixed rate, don't wait for responses.
+        // With ~300ms RTT, back-pressure limits us to ~3 FPS.
+        // Pipelining: we send 20 FPS continuously, ~6 frames are "in flight"
+        // at any time, and the server processes them concurrently.
+        // Result: smooth 20 FPS output regardless of network latency.
         let active = true;
-        const MAX_WIDTH = 480;       // 480px is enough for face detection + swap
-        const JPEG_QUALITY = 0.5;    // Lower = smaller payload = faster network
-        const MIN_INTERVAL = 16;     // ~60 FPS cap (actual rate limited by back-pressure)
+        const MAX_WIDTH = 320;       // 320px = small payload, fast transfer
+        const JPEG_QUALITY = 0.45;   // Aggressive compression for speed
+        const SEND_FPS = 20;         // Fixed send rate
+        const INTERVAL = 1000 / SEND_FPS;
 
         const sendLoop = () => {
             if (!active) return;
-            if (pendingFrameRef.current) {
-                // Server hasn't responded yet — skip this frame
-                requestAnimationFrame(sendLoop);
-                return;
-            }
             if (video.readyState === video.HAVE_ENOUGH_DATA) {
                 const scale = Math.min(1, MAX_WIDTH / video.videoWidth);
-                canvas.width = video.videoWidth * scale;
-                canvas.height = video.videoHeight * scale;
+                canvas.width = Math.round(video.videoWidth * scale);
+                canvas.height = Math.round(video.videoHeight * scale);
 
                 ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-                // toBlob is async & non-blocking (vs toDataURL which blocks main thread)
                 canvas.toBlob((blob) => {
                     if (!active || !blob) return;
-                    pendingFrameRef.current = true;
-                    sendWsFrame(blob); // Sends as binary: [timestamp header] + [JPEG bytes]
+                    sendWsFrame(blob);
                 }, 'image/jpeg', JPEG_QUALITY);
             }
-            setTimeout(sendLoop, MIN_INTERVAL);
+            setTimeout(sendLoop, INTERVAL);
         };
         sendLoop();
 
-        return () => { active = false; pendingFrameRef.current = false; };
+        return () => { active = false; };
     }, [isStreaming, isWsConnected, sendWsFrame]);
 
     // Auto re-upload target image when the user switches images mid-stream
@@ -474,11 +484,20 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
                     <div className="aspect-video bg-black flex items-center justify-center">
                         {isStreaming ? (
                             isWsConnected ? (
-                                <img
-                                    ref={wsImgRef}
-                                    className="w-full h-full object-contain"
-                                    alt="Live Feed"
-                                />
+                                <div className="relative w-full h-full">
+                                    <img
+                                        ref={wsImgRef}
+                                        className="absolute inset-0 w-full h-full object-contain"
+                                        style={{ transition: 'opacity 40ms ease', opacity: 1 }}
+                                        alt="Live Feed A"
+                                    />
+                                    <img
+                                        ref={wsImgBackRef}
+                                        className="absolute inset-0 w-full h-full object-contain"
+                                        style={{ transition: 'opacity 40ms ease', opacity: 0 }}
+                                        alt="Live Feed B"
+                                    />
+                                </div>
                             ) : (
                                 <video
                                     ref={processedVideoRef}
