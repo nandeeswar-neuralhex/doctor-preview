@@ -53,11 +53,19 @@ async def startup_event():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "mode": "simple-flip"}
+    gpu = swapper.gpu_status() if swapper else {}
+    return {"status": "healthy", "mode": "simple-flip", "gpu_active": gpu.get("gpu_active", False)}
 
 @app.get("/")
 async def root():
     return {"service": "Simple Flip Server", "status": "running"}
+
+@app.get("/debug/gpu")
+async def debug_gpu():
+    """Runtime GPU diagnostics — call this to verify GPU is being used."""
+    if swapper is None:
+        return {"error": "FaceSwapper not initialized"}
+    return swapper.gpu_status()
 
 @app.post("/create-session")
 async def create_session():

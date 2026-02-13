@@ -33,10 +33,46 @@ class FaceSwapper:
     def __init__(self):
         print("Initializing FaceSwapper...")
         
-        # Configure ONNX for GPU
-        providers = [EXECUTION_PROVIDER, "CPUExecutionProvider"]
+        # ── Step 1: Verify GPU availability ──
+        available = ort.get_available_providers()
+        print(f"ONNX Runtime version: {ort.__version__}")
+        print(f"Available providers: {available}")
         
-        # Initialize face analyzer (detection + landmarks)
+        self.gpu_active = "CUDAExecutionProvider" in available
+        if self.gpu_active:
+            print("✅ GPU (CUDA) is available")
+        else:
+            print("⚠️  WARNING: CUDAExecutionProvider NOT available — running on CPU!")
+            print("   This will be very slow (3-5 FPS instead of 24+ FPS)")
+        
+        # ── Step 2: Configure ONNX session options for max GPU throughput ──
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.enable_mem_pattern = True
+        sess_options.enable_cpu_mem_arena = True
+        # Use all available threads for any CPU fallback ops
+        sess_options.intra_op_num_threads = 0  # 0 = use all cores
+        sess_options.inter_op_num_threads = 0
+        
+        # ── Step 3: Build provider list with CUDA options ──
+        if self.gpu_active:
+            providers = [
+                ("CUDAExecutionProvider", {
+                    "device_id": 0,
+                    "arena_extend_strategy": "kSameAsRequested",
+                    "gpu_mem_limit": 4 * 1024 * 1024 * 1024,  # 4 GB
+                    "cudnn_conv_algo_search": "EXHAUSTIVE",
+                    "do_copy_in_default_stream": True,
+                }),
+                "CPUExecutionProvider",
+            ]
+        else:
+            providers = ["CPUExecutionProvider"]
+        
+        self._providers = providers
+        self._sess_options = sess_options
+        
+        # ── Step 4: Initialize face analyzer (detection + landmarks) on GPU ──
         self.face_analyzer = FaceAnalysis(
             name="buffalo_l",
             root=MODELS_DIR,
@@ -44,18 +80,45 @@ class FaceSwapper:
         )
         self.face_analyzer.prepare(ctx_id=0, det_size=(640, 640))
         
-        # Load face swapper model using insightface's built-in INSwapper
-        # This handles emap extraction, alignment, and inference correctly
+        # Verify which provider the detection model actually uses
+        for model in self.face_analyzer.models:
+            try:
+                session = getattr(model, 'session', None)
+                if session:
+                    active_providers = session.get_providers()
+                    print(f"  Face analyzer model → {active_providers[0]}")
+            except Exception:
+                pass
+        
+        # ── Step 5: Load face swapper model with GPU session options ──
         print(f"Loading swapper model: {INSWAPPER_MODEL}")
         try:
             from insightface.model_zoo import get_model
             self.swapper = get_model(INSWAPPER_MODEL, providers=providers)
-            print(f"Loaded INSwapper model via insightface (providers: {providers})")
+            # Verify swapper is on GPU
+            try:
+                swapper_session = getattr(self.swapper, 'session', None)
+                if swapper_session:
+                    active = swapper_session.get_providers()
+                    print(f"  INSwapper model → {active[0]}")
+                    if active[0] != "CUDAExecutionProvider" and self.gpu_active:
+                        print("  ⚠️  Swapper fell back to CPU! Retrying with explicit session...")
+                        swapper_session_gpu = ort.InferenceSession(
+                            INSWAPPER_MODEL,
+                            sess_options=sess_options,
+                            providers=providers
+                        )
+                        self.swapper.session = swapper_session_gpu
+                        print(f"  ✅ Swapper forced to GPU: {swapper_session_gpu.get_providers()[0]}")
+            except Exception as verify_err:
+                print(f"  Provider verification info: {verify_err}")
+            print(f"Loaded INSwapper model via insightface")
         except Exception as e:
-            print(f"Failed to load swapper with {providers}: {e}")
+            print(f"Failed to load swapper with GPU: {e}")
             print("Falling back to CPUExecutionProvider...")
             from insightface.model_zoo import get_model
             self.swapper = get_model(INSWAPPER_MODEL, providers=["CPUExecutionProvider"])
+            self.gpu_active = False
         
         # Optional face enhancer (GFPGAN)
         self.enhancer = None
@@ -88,6 +151,32 @@ class FaceSwapper:
     def is_ready(self) -> bool:
         """Check if the swapper is ready for processing"""
         return self._ready
+    
+    def gpu_status(self) -> dict:
+        """Return GPU usage diagnostics for debugging."""
+        info = {
+            "onnxruntime_version": ort.__version__,
+            "available_providers": ort.get_available_providers(),
+            "gpu_active": self.gpu_active,
+            "analyzer_providers": [],
+            "swapper_provider": "unknown",
+        }
+        # Check what each analyzer sub-model is using
+        for model in self.face_analyzer.models:
+            try:
+                session = getattr(model, 'session', None)
+                if session:
+                    info["analyzer_providers"].append(session.get_providers()[0])
+            except Exception:
+                info["analyzer_providers"].append("unknown")
+        # Check swapper
+        try:
+            swapper_session = getattr(self.swapper, 'session', None)
+            if swapper_session:
+                info["swapper_provider"] = swapper_session.get_providers()[0]
+        except Exception:
+            pass
+        return info
     
     def get_session_count(self) -> int:
         """Get number of active sessions"""
