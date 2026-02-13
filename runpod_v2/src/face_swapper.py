@@ -193,60 +193,91 @@ class FaceSwapper:
         Returns:
             True if face was successfully extracted and stored
         """
-        # Detect faces in the target image
-        faces = self.face_analyzer.get(image)
+        height, width = image.shape[:2]
+        min_dim = min(height, width)
+        max_dim = max(height, width)
+        print(f"[set_target_face] session={session_id}, input size={width}x{height}")
 
-        if len(faces) == 0:
-            # Retry with resized image for small/large faces and low-contrast images
-            height, width = image.shape[:2]
-            min_dim = min(height, width)
-            max_dim = max(height, width)
+        # Contrast enhancement helper
+        def _enhance_contrast(img: np.ndarray) -> np.ndarray:
+            try:
+                lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+                l, a, b = cv2.split(lab)
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                l2 = clahe.apply(l)
+                return cv2.cvtColor(cv2.merge((l2, a, b)), cv2.COLOR_LAB2BGR)
+            except Exception:
+                return img
 
-            # Contrast enhancement (helps low-light/flat images)
-            def _enhance_contrast(img: np.ndarray) -> np.ndarray:
-                try:
-                    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-                    l, a, b = cv2.split(lab)
-                    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-                    l2 = clahe.apply(l)
-                    return cv2.cvtColor(cv2.merge((l2, a, b)), cv2.COLOR_LAB2BGR)
-                except Exception:
-                    return img
+        # Pad image helper — adds background so face isn't touching edges
+        # Critical for close-up selfies where face fills 80%+ of the frame
+        def _pad_image(img: np.ndarray, pad_pct: float = 0.4) -> np.ndarray:
+            h, w = img.shape[:2]
+            pad_y = int(h * pad_pct)
+            pad_x = int(w * pad_pct)
+            # Use border replication (or solid color) to create context around face
+            padded = cv2.copyMakeBorder(
+                img, pad_y, pad_y, pad_x, pad_x,
+                cv2.BORDER_CONSTANT, value=(128, 128, 128)
+            )
+            return padded
 
-            scale_candidates = [1.0]
-            if max_dim > 1200:
-                scale_candidates.extend([1200 / max_dim, 960 / max_dim, 720 / max_dim, 640 / max_dim])
-            elif max_dim > 900:
-                scale_candidates.extend([960 / max_dim, 720 / max_dim])
-            if min_dim < 320:
-                scale_candidates.append(640 / max(1, min_dim))
-            elif min_dim < 480:
-                scale_candidates.append(1.5)
-            else:
-                scale_candidates.append(1.25)
-            # De-duplicate while preserving order
-            scale_candidates = list(dict.fromkeys(scale_candidates))
+        # Build list of images to try: original, padded, contrast-enhanced, padded+enhanced
+        base_images = [
+            ("original", image),
+            ("padded_40pct", _pad_image(image, 0.4)),
+            ("padded_70pct", _pad_image(image, 0.7)),
+            ("contrast", _enhance_contrast(image)),
+            ("contrast_padded", _pad_image(_enhance_contrast(image), 0.5)),
+        ]
 
-            # Try original and contrast-enhanced images at multiple scales
-            tried = []
-            for base_img in (image, _enhance_contrast(image)):
-                for scale in scale_candidates:
-                    if scale <= 0:
-                        continue
-                    if not (0.3 <= scale <= 2.5):
-                        continue
-                    if max_dim * scale > 2000:
-                        continue
+        # Build scale candidates based on image dimensions
+        scale_candidates = [1.0]
+        if max_dim > 1200:
+            scale_candidates.extend([
+                1200 / max_dim,
+                960 / max_dim,
+                720 / max_dim,
+                640 / max_dim,
+                480 / max_dim,  # aggressive downscale for very close selfies
+            ])
+        elif max_dim > 900:
+            scale_candidates.extend([960 / max_dim, 720 / max_dim, 640 / max_dim])
+        elif max_dim > 640:
+            scale_candidates.extend([640 / max_dim])
+        # Upscale for small images
+        if min_dim < 320:
+            scale_candidates.append(640 / max(1, min_dim))
+        elif min_dim < 480:
+            scale_candidates.append(1.5)
+        # De-duplicate while preserving order
+        scale_candidates = list(dict.fromkeys(scale_candidates))
+
+        faces = []
+        # Try each base image variant at each scale
+        for variant_name, base_img in base_images:
+            bh, bw = base_img.shape[:2]
+            b_max = max(bh, bw)
+            for scale in scale_candidates:
+                if scale <= 0 or not (0.15 <= scale <= 3.0):
+                    continue
+                target_max = b_max * scale
+                if target_max > 2500 or target_max < 200:
+                    continue
+                if abs(scale - 1.0) < 0.01:
+                    resized = base_img
+                else:
                     resized = cv2.resize(base_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-                    tried.append(scale)
-                    faces = self.face_analyzer.get(resized)
-                    if len(faces) > 0:
-                        break
+                
+                faces = self.face_analyzer.get(resized)
                 if len(faces) > 0:
+                    print(f"  ✅ Face detected via variant='{variant_name}' scale={scale:.2f} (resized={resized.shape[1]}x{resized.shape[0]})")
                     break
+            if len(faces) > 0:
+                break
 
         if len(faces) == 0:
-            print(f"No face detected in target image for session {session_id} (size={image.shape[1]}x{image.shape[0]})")
+            print(f"  ❌ No face detected in target image for session {session_id} after all attempts")
             return False
         
         # Use the largest face (most prominent)
