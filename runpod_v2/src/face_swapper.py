@@ -501,7 +501,12 @@ class FaceSwapper:
             if ENABLE_SEAMLESS_CLONE:
                  pass # Already fell through or failed
 
-            # Fallback alpha blend
+            # Fallback alpha blend with mask blur for smooth edges
+            blur_amount = FACE_MASK_BLUR
+            if blur_amount > 0:
+                if blur_amount % 2 == 0:
+                    blur_amount += 1
+                mask = cv2.GaussianBlur(mask, (blur_amount, blur_amount), 0)
             alpha = (mask.astype(np.float32) / 255.0)[..., None]
             result = frame * (1 - alpha) + warped * alpha
             return result.astype(np.uint8)

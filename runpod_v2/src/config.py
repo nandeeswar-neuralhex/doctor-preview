@@ -23,7 +23,7 @@ BUFFALO_MODEL_DIR = os.path.join(MODELS_DIR, "buffalo_l")
 EXECUTION_PROVIDER = os.getenv("EXECUTION_PROVIDER", "CUDAExecutionProvider")
 
 # Quality/Blending settings
-ENABLE_SEAMLESS_CLONE = os.getenv("ENABLE_SEAMLESS_CLONE", "false").lower() == "true"
+ENABLE_SEAMLESS_CLONE = os.getenv("ENABLE_SEAMLESS_CLONE", "true").lower() == "true"
 FACE_MASK_BLUR = int(os.getenv("FACE_MASK_BLUR", "25"))
 FACE_MASK_SCALE = float(os.getenv("FACE_MASK_SCALE", "1.1"))
 
