@@ -16,7 +16,7 @@ This guide explains how to deploy the simplified `runpod_v2` service by cloning 
    - Ensure **HTTP Proxy** (or "Expose Public API") is enabled for this port.
 5. **Start Pod**.
 
-## Step 2: Clone & Run
+## Step 2: Clone & Run (GPU Integration)
 
 Once the Pod is **Running**:
 
@@ -33,10 +33,16 @@ cd doctor-preview/runpod_v2
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Start the server
+# 4. [CRITICAL] Install proper ONNX Runtime for CUDA 12
+# RunPod usually has CUDA 12, but default pip installs CUDA 11 version.
+pip uninstall -y onnxruntime onnxruntime-gpu
+pip install onnxruntime-gpu --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
+
+# 5. Start the server
+# (This will automatically download the 500MB+ models on first run)
 python src/server.py
 ```
-*You should see "Uvicorn running on http://0.0.0.0:8765"*
+*You should see "FaceSwapper ready" and "Uvicorn running on http://0.0.0.0:8765"*
 
 ## Step 3: Connect Desktop App
 
@@ -49,6 +55,15 @@ python src/server.py
 6. Click **Start Preview**.
 
 ## Troubleshooting
+
+- **`libcublasLt.so.11: cannot open shared object file`**: 
+  - This means you have the wrong `onnxruntime-gpu` version. 
+  - Run Step 4 in "Clone & Run" to install the CUDA 12 compatible version.
+
+- **`INVALID_PROTOBUF` or "File doesn't exist"**:
+  - The model file is corrupted (likely a partial download).
+  - Restart the server (`python src/server.py`). The script is designed to auto-detect corrupted files, delete them, and re-download them.
+
 - **Git not found**: Run `apt-get update && apt-get install -y git`.
 - **Repo not found**: Ensure `https://github.com/nandeeswar-neuralhex/doctor-preview.git` is accessible.
 - **Port not reachable**: Double check you added port `8765` in the Pod configuration.
