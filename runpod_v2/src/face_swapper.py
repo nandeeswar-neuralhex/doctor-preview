@@ -270,6 +270,10 @@ class FaceSwapper:
         # Get target embedding
         target_emb = target_face.embedding.reshape(1, -1).astype(np.float32)
         
+        # Debug: log input details
+        print(f"[SWAP DEBUG] blob shape: {blob.shape}, target_emb shape: {target_emb.shape}")
+        print(f"[SWAP DEBUG] input names: {[inp.name for inp in self.swapper.get_inputs()]}")
+        
         # Run inference
         try:
             pred = self.swapper.run(
@@ -281,9 +285,11 @@ class FaceSwapper:
             )[0]
             
             # Post-process output
+            print(f"[SWAP DEBUG] raw pred shape: {pred.shape}, min: {pred.min():.3f}, max: {pred.max():.3f}")
             pred = pred.squeeze().transpose(1, 2, 0)
             pred = (pred * 255).clip(0, 255).astype(np.uint8)
             pred = cv2.cvtColor(pred, cv2.COLOR_RGB2BGR)
+            print(f"[SWAP DEBUG] final pred shape: {pred.shape}, dtype: {pred.dtype}")
 
             # Optional enhancement
             if self.enhancer is not None:
@@ -297,7 +303,9 @@ class FaceSwapper:
             return result
             
         except Exception as e:
+            import traceback
             print(f"Swap error: {e}")
+            traceback.print_exc()
             return frame
 
     def _detect_faces_with_fallback(self, frame: np.ndarray):
