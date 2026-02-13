@@ -55,6 +55,11 @@ async def upload_target(
         "message": "Target received (ignored in simple mode)"
     }
 
+@app.post("/session/settings")
+async def update_settings(session_id: str = Query(...)):
+    # Dummy endpoint to satisfy client
+    return {"status": "success", "message": "Settings ignored"}
+
 @app.post("/webrtc/offer")
 async def webrtc_offer(session_id: str = Query(...)):
     # Force fallback to WebSocket by rejecting WebRTC
