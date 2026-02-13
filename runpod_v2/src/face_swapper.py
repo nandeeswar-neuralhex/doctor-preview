@@ -72,23 +72,37 @@ class FaceSwapper:
         self._providers = providers
         self._sess_options = sess_options
         
-        # ── Step 4: Initialize face analyzer (detection + landmarks) on GPU ──
+        # ── Step 4a: FULL face analyzer for target image upload (640×640, all models) ──
         self.face_analyzer = FaceAnalysis(
             name="buffalo_l",
             root=MODELS_DIR,
             providers=providers
         )
         self.face_analyzer.prepare(ctx_id=0, det_size=(640, 640))
+        print(f"  Full analyzer: {len(self.face_analyzer.models)} models at 640×640 (for target upload)")
         
-        # Verify which provider the detection model actually uses
-        for model in self.face_analyzer.models:
-            try:
-                session = getattr(model, 'session', None)
-                if session:
-                    active_providers = session.get_providers()
-                    print(f"  Face analyzer model → {active_providers[0]}")
-            except Exception:
-                pass
+        # ── Step 4b: FAST face analyzer for real-time webcam (320×320, det + landmarks only) ──
+        # This is the key CPU optimization: skip genderage + recognition per frame
+        self.face_analyzer_fast = FaceAnalysis(
+            name="buffalo_l",
+            root=MODELS_DIR,
+            providers=providers,
+            allowed_modules=["detection", "landmark_3d_68", "landmark_2d_106"]
+        )
+        self.face_analyzer_fast.prepare(ctx_id=0, det_size=(320, 320))
+        print(f"  Fast analyzer: {len(self.face_analyzer_fast.models)} models at 320×320 (for real-time)")
+        
+        # Verify which provider the models actually use
+        for analyzer_name, analyzer in [("full", self.face_analyzer), ("fast", self.face_analyzer_fast)]:
+            for model in analyzer.models:
+                try:
+                    session = getattr(model, 'session', None)
+                    if session:
+                        active_providers = session.get_providers()
+                        model_name = getattr(model, 'taskname', 'unknown')
+                        print(f"  {analyzer_name}/{model_name} → {active_providers[0]}")
+                except Exception:
+                    pass
         
         # ── Step 5: Load face swapper model with GPU session options ──
         print(f"Loading swapper model: {INSWAPPER_MODEL}")
@@ -158,7 +172,10 @@ class FaceSwapper:
             "onnxruntime_version": ort.__version__,
             "available_providers": ort.get_available_providers(),
             "gpu_active": self.gpu_active,
+            "full_analyzer_models": len(self.face_analyzer.models),
+            "fast_analyzer_models": len(self.face_analyzer_fast.models),
             "analyzer_providers": [],
+            "fast_analyzer_providers": [],
             "swapper_provider": "unknown",
         }
         # Check what each analyzer sub-model is using
@@ -169,6 +186,13 @@ class FaceSwapper:
                     info["analyzer_providers"].append(session.get_providers()[0])
             except Exception:
                 info["analyzer_providers"].append("unknown")
+        for model in self.face_analyzer_fast.models:
+            try:
+                session = getattr(model, 'session', None)
+                if session:
+                    info["fast_analyzer_providers"].append(session.get_providers()[0])
+            except Exception:
+                info["fast_analyzer_providers"].append("unknown")
         # Check swapper
         try:
             swapper_session = getattr(self.swapper, 'session', None)
@@ -334,7 +358,7 @@ class FaceSwapper:
             reverse=True
         )
 
-        result = frame.copy()
+        result = frame
 
         # Swap up to MAX_FACES for stability (default 1)
         for source_face in source_faces[:max(1, MAX_FACES)]:
@@ -380,8 +404,8 @@ class FaceSwapper:
             return frame
 
     def _detect_faces_with_fallback(self, frame: np.ndarray):
-        """Detect faces with a fallback upscaling pass for small/low-res faces."""
-        faces = self.face_analyzer.get(frame)
+        """Detect faces using fast analyzer (det-only, 320×320) for real-time."""
+        faces = self.face_analyzer_fast.get(frame)
         if len(faces) > 0:
             return faces
 
@@ -400,7 +424,7 @@ class FaceSwapper:
 
         if scale > 1.0:
             resized = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            faces_resized = self.face_analyzer.get(resized)
+            faces_resized = self.face_analyzer_fast.get(resized)
             if len(faces_resized) == 0:
                 return []
 
