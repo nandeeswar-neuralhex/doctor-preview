@@ -35,11 +35,24 @@ function ImageUpload({ targetImages, setTargetImages, selectedImageIndex, setSel
         <div className="space-y-4">
             <div>
                 <h2 className="text-lg font-semibold text-white mb-2">Target Images</h2>
+
+                {/* Tips Box */}
+                <div className="bg-blue-900/20 border border-blue-500/30 rounded-lg p-3 mb-4">
+                    <div className="flex items-center gap-2 mb-2 text-blue-400 font-medium text-sm">
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                        Tips for best results
+                    </div>
+                    <ul className="text-xs text-blue-200/80 space-y-1 list-disc list-inside">
+                        <li>Use clear frontal photos (full face)</li>
+                        <li>Upload varying angles and expressions</li>
+                        <li>Ensure good lighting conditions</li>
+                    </ul>
+                </div>
+
                 <p className="text-sm text-gray-400 mb-4">
                     Upload 1-10 post-surgery preview images
-                </p>
-                <p className="text-xs text-yellow-400 mb-4">
-                    Use a clear frontal target photo (full face, no extreme crop).
                 </p>
             </div>
 
@@ -75,8 +88,8 @@ function ImageUpload({ targetImages, setTargetImages, selectedImageIndex, setSel
                         key={index}
                         onClick={() => setSelectedImageIndex(index)}
                         className={`relative group cursor-pointer rounded-lg overflow-hidden border-2 transition-all ${selectedImageIndex === index
-                                ? 'border-blue-500 ring-2 ring-blue-500/50'
-                                : 'border-gray-700 hover:border-gray-600'
+                            ? 'border-blue-500 ring-2 ring-blue-500/50'
+                            : 'border-gray-700 hover:border-gray-600'
                             }`}
                     >
                         <img

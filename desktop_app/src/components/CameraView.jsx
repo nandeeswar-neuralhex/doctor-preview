@@ -22,6 +22,11 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
         localMedia: null,
         remoteMedia: null
     });
+    const [fullScreenView, setFullScreenView] = useState(null); // 'original' | 'processed' | null
+
+    const toggleFullScreen = (view) => {
+        setFullScreenView(prev => prev === view ? null : view);
+    };
 
     // Custom hooks for webcam and WebSocket
     const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true);
@@ -45,7 +50,7 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
                     ctx.drawImage(bitmap, 0, 0);
                     bitmap.close();
                 })
-                .catch(() => {});
+                .catch(() => { });
         } else if (typeof frameData === 'string') {
             // Legacy text mode: data: URI
             const img = new Image();
@@ -457,11 +462,25 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
             {/* Video Display */}
             <div className="flex-1 grid grid-cols-2 gap-4">
                 {/* Original Feed */}
-                <div className="bg-gray-800 rounded-lg overflow-hidden border border-gray-700">
-                    <div className="bg-gray-700 px-4 py-2 border-b border-gray-600">
-                        <h3 className="font-semibold text-white">Original Feed</h3>
+                <div
+                    className={`bg-gray-800 rounded-lg overflow-hidden border border-gray-700 transition-all duration-300 ${fullScreenView === 'original' ? 'fixed inset-0 z-50 !rounded-none m-0' : ''} ${fullScreenView === 'processed' ? 'hidden' : ''}`}
+                    onDoubleClick={() => fullScreenView === 'original' && setFullScreenView(null)}
+                >
+                    <div className="bg-gray-700 px-4 py-2 border-b border-gray-600 flex justifying-between items-center">
+                        <h3 className="font-semibold text-white flex-1">Original Feed</h3>
+                        <button
+                            onClick={() => toggleFullScreen('original')}
+                            className="p-1 hover:bg-gray-600 rounded text-gray-300 hover:text-white transition-colors"
+                            title={fullScreenView === 'original' ? "Minimize" : "Maximize"}
+                        >
+                            {fullScreenView === 'original' ? (
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                            ) : (
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" /></svg>
+                            )}
+                        </button>
                     </div>
-                    <div className="aspect-video bg-black flex items-center justify-center">
+                    <div className={`aspect-video bg-black flex items-center justify-center ${fullScreenView === 'original' ? 'h-[calc(100%-40px)] w-full' : ''}`}>
                         {stream ? (
                             <video
                                 ref={originalVideoRef}
@@ -482,11 +501,25 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
                 </div>
 
                 {/* Processed Feed */}
-                <div className="bg-gray-800 rounded-lg overflow-hidden border border-gray-700">
-                    <div className="bg-gray-700 px-4 py-2 border-b border-gray-600">
-                        <h3 className="font-semibold text-white">AI Preview (Post-Surgery)</h3>
+                <div
+                    className={`bg-gray-800 rounded-lg overflow-hidden border border-gray-700 transition-all duration-300 ${fullScreenView === 'processed' ? 'fixed inset-0 z-50 !rounded-none m-0' : ''} ${fullScreenView === 'original' ? 'hidden' : ''}`}
+                    onDoubleClick={() => fullScreenView === 'processed' && setFullScreenView(null)}
+                >
+                    <div className="bg-gray-700 px-4 py-2 border-b border-gray-600 flex justify-between items-center">
+                        <h3 className="font-semibold text-white flex-1">AI Preview (Post-Surgery)</h3>
+                        <button
+                            onClick={() => toggleFullScreen('processed')}
+                            className="p-1 hover:bg-gray-600 rounded text-gray-300 hover:text-white transition-colors"
+                            title={fullScreenView === 'processed' ? "Minimize" : "Maximize"}
+                        >
+                            {fullScreenView === 'processed' ? (
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                            ) : (
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" /></svg>
+                            )}
+                        </button>
                     </div>
-                    <div className="aspect-video bg-black flex items-center justify-center">
+                    <div className={`aspect-video bg-black flex items-center justify-center ${fullScreenView === 'processed' ? 'h-[calc(100%-40px)] w-full' : ''}`}>
                         {isStreaming ? (
                             isWsConnected ? (
                                 <canvas

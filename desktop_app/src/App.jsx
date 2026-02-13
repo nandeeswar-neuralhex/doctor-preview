@@ -2,12 +2,27 @@ import React, { useState } from 'react';
 import ImageUpload from './components/ImageUpload';
 import CameraView from './components/CameraView';
 import Settings from './components/Settings';
+import Login from './components/Login';
 
 function App() {
     const [serverUrl, setServerUrl] = useState('https://u4ln48a51ahjsh-8765.proxy.runpod.net');
     const [targetImages, setTargetImages] = useState([]);
     const [selectedImageIndex, setSelectedImageIndex] = useState(0);
     const [isStreaming, setIsStreaming] = useState(false);
+    const [isLoggedIn, setIsLoggedIn] = useState(false);
+
+    const handleLogin = () => {
+        setIsLoggedIn(true);
+    };
+
+    const handleLogout = () => {
+        setIsLoggedIn(false);
+        // Optional: clear any other state if needed
+    };
+
+    if (!isLoggedIn) {
+        return <Login onLogin={handleLogin} />;
+    }
 
     return (
         <div className="h-screen flex flex-col bg-gray-900">
@@ -18,7 +33,15 @@ function App() {
                         <h1 className="text-2xl font-bold text-white">Doctor Preview</h1>
                         <p className="text-sm text-gray-400">Real-time Surgery Preview System</p>
                     </div>
-                    <Settings serverUrl={serverUrl} setServerUrl={setServerUrl} />
+                    <div className="flex items-center gap-4">
+                        <Settings serverUrl={serverUrl} setServerUrl={setServerUrl} />
+                        <button
+                            onClick={handleLogout}
+                            className="text-sm text-gray-400 hover:text-white transition-colors border border-gray-600 px-3 py-1 rounded hover:bg-gray-700"
+                        >
+                            Logout
+                        </button>
+                    </div>
                 </div>
             </header>
 
