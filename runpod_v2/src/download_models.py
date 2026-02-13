@@ -10,17 +10,25 @@ def download_file(url, path):
     
     print(f"Downloading {url} to {path}...")
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    urllib.request.urlretrieve(url, path)
+    
+    # Add User-Agent to avoid 403/401 errors from some servers
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+    req = urllib.request.Request(url, headers=headers)
+    
+    with urllib.request.urlopen(req) as response, open(path, 'wb') as out_file:
+        data = response.read()
+        out_file.write(data)
+        
     print("Download complete.")
 
 def download_models():
-    # 1. Inswapper (Face Fusion)
+    # 1. Inswapper (Face Fusion) - Using reliable GitHub release mirror
     download_file(
-        "https://huggingface.co/eziorry/inswapper_128.onnx/resolve/main/inswapper_128.onnx",
+        "https://github.com/facefusion/facefusion-assets/releases/download/models/inswapper_128.onnx",
         INSWAPPER_MODEL
     )
     
-    # 2. GFPGAN (Face Enhancer) - Optional but good to have
+    # 2. GFPGAN (Face Enhancer)
     download_file(
         "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth",
         GFPGAN_MODEL_PATH
