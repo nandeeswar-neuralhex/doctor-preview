@@ -30,19 +30,15 @@ git clone https://github.com/nandeeswar-neuralhex/doctor-preview.git
 # 2. Enter the simple service directory
 cd doctor-preview/runpod_v2
 
-# 3. Install dependencies
+# 3. Install dependencies (now includes CUDA 12 support)
 pip install -r requirements.txt
 
-# 4. [CRITICAL] Install proper ONNX Runtime for CUDA 12
-# RunPod usually has CUDA 12, but default pip installs CUDA 11 version.
-pip uninstall -y onnxruntime onnxruntime-gpu
-pip install onnxruntime-gpu --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
-
-# 5. Start the server
+# 4. Start the server
 # (This will automatically download the 500MB+ models on first run)
 python src/server.py
 ```
 *You should see "FaceSwapper ready" and "Uvicorn running on http://0.0.0.0:8765"*
+
 
 ## Step 3: Connect Desktop App
 
