@@ -44,51 +44,18 @@ class FaceSwapper:
         )
         self.face_analyzer.prepare(ctx_id=0, det_size=(640, 640))
         
-        # Load face swapper model
+        # Load face swapper model using insightface's built-in INSwapper
+        # This handles emap extraction, alignment, and inference correctly
         print(f"Loading swapper model: {INSWAPPER_MODEL}")
         try:
-            self.swapper = ort.InferenceSession(
-                INSWAPPER_MODEL,
-                providers=providers
-            )
+            from insightface.model_zoo import get_model
+            self.swapper = get_model(INSWAPPER_MODEL, providers=providers)
+            print(f"Loaded INSwapper model via insightface (providers: {providers})")
         except Exception as e:
             print(f"Failed to load swapper with {providers}: {e}")
             print("Falling back to CPUExecutionProvider...")
-            self.swapper = ort.InferenceSession(
-                INSWAPPER_MODEL,
-                providers=["CPUExecutionProvider"]
-            )
-        
-        # Get model input/output info
-        self.input_name = self.swapper.get_inputs()[0].name
-        self.input_shape = self.swapper.get_inputs()[0].shape
-        
-        # Extract embedding map (emap) from model initializers
-        # This is critical: the model expects transformed embeddings, not raw ones
-        self.emap = None
-        model = ort.InferenceSession.__class__  # just for type reference
-        try:
-            import onnx
-            onnx_model = onnx.load(INSWAPPER_MODEL)
-            for initializer in onnx_model.graph.initializer:
-                if initializer.dims == [512, 512]:  # emap is always 512x512
-                    self.emap = np.frombuffer(initializer.raw_data, dtype=np.float32).reshape(512, 512).copy()
-                    print(f"Extracted emap from model (shape: {self.emap.shape})")
-                    break
-            if self.emap is None:
-                print("WARNING: Could not find emap in model initializers!")
-        except ImportError:
-            print("WARNING: onnx package not installed, trying alternative emap extraction...")
-            # Alternative: extract from model weights directly
-            try:
-                import onnxruntime as ort2
-                model_content = open(INSWAPPER_MODEL, 'rb').read()
-                # The emap is typically the last 512*512*4 bytes initializer
-                print("Could not extract emap without onnx package")
-            except Exception as e2:
-                print(f"Alternative emap extraction failed: {e2}")
-        except Exception as e:
-            print(f"emap extraction error: {e}")
+            from insightface.model_zoo import get_model
+            self.swapper = get_model(INSWAPPER_MODEL, providers=["CPUExecutionProvider"])
         
         # Optional face enhancer (GFPGAN)
         self.enhancer = None
@@ -266,7 +233,7 @@ class FaceSwapper:
     ) -> np.ndarray:
         """
         Swap a single face in the frame.
-        Uses InsightFace's inswapper model for high-quality swapping.
+        Uses InsightFace's INSwapper.get() which handles emap, alignment, and inference.
         """
         # Get face bounding box and landmarks
         bbox = source_face.bbox.astype(np.float32)
@@ -278,61 +245,12 @@ class FaceSwapper:
             bbox = self._smooth_bounding_box(session_id, bbox)
         bbox = bbox.astype(int)
 
-        # Prepare input for the swapper model
-        # The inswapper expects aligned face crops
-        aimg = self._align_face(frame, kps)
-        
-        if aimg is None:
-            return frame
-        
-        # Prepare model input
-        blob = cv2.dnn.blobFromImage(
-            aimg, 
-            1.0 / 255.0, 
-            (128, 128), 
-            (0.0, 0.0, 0.0), 
-            swapRB=True
-        )
-        
-        # Get target embedding and transform through emap
-        # The model expects: latent = normalize(normed_embedding @ emap)
-        normed_emb = target_face.normed_embedding if hasattr(target_face, 'normed_embedding') else target_face.embedding
-        normed_emb = normed_emb.reshape(1, -1).astype(np.float32)
-        
-        if self.emap is not None:
-            latent = np.dot(normed_emb, self.emap)
-            latent /= np.linalg.norm(latent)
-        else:
-            # Fallback: use raw embedding (won't work well)
-            latent = normed_emb
-            print("WARNING: Using raw embedding (no emap), swap quality will be poor")
-        
-        # Run inference
         try:
-            pred = self.swapper.run(
-                None, 
-                {
-                    self.input_name: blob,
-                    self.swapper.get_inputs()[1].name: latent
-                }
-            )[0]
-            
-            # Post-process output
-            print(f"[SWAP DEBUG] raw pred shape: {pred.shape}, min: {pred.min():.3f}, max: {pred.max():.3f}")
-            pred = pred.squeeze().transpose(1, 2, 0)
-            pred = (pred * 255).clip(0, 255).astype(np.uint8)
-            pred = cv2.cvtColor(pred, cv2.COLOR_RGB2BGR)
-            print(f"[SWAP DEBUG] final pred shape: {pred.shape}, dtype: {pred.dtype}")
-
-            # Optional enhancement
-            if self.enhancer is not None:
-                try:
-                    _, _, pred = self.enhancer.enhance(pred, has_aligned=True, only_center_face=True, paste_back=False)
-                except Exception as e:
-                    print(f"Enhancer error: {e}")
-            
-            # Paste back to original frame
-            result = self._paste_back(frame, pred, kps, bbox, source_face, session_id)
+            # Use INSwapper's built-in get() method
+            # It handles: alignment, emap transformation, inference, paste-back
+            # source_face = face detected in the webcam frame (to be replaced)
+            # target_face = the uploaded target face (identity to swap to)
+            result = self.swapper.get(frame, source_face, target_face, paste_back=True)
             return result
             
         except Exception as e:
