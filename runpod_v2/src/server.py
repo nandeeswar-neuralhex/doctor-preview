@@ -36,8 +36,12 @@ app.add_middleware(
 async def startup_event():
     global swapper
     print("Initializing FaceSwapper...")
-    swapper = FaceSwapper()
-    print("FaceSwapper ready.")
+    try:
+        swapper = FaceSwapper()
+        print("FaceSwapper ready.")
+    except Exception as e:
+        print(f"FaceSwapper initialization failed: {e}")
+        swapper = None
 
 @app.get("/health")
 async def health_check():
@@ -77,6 +81,9 @@ async def upload_target(
 
         if image is None:
             return JSONResponse(status_code=400, content={"error": "Invalid image file"})
+
+        if swapper is None:
+             return JSONResponse(status_code=500, content={"error": "FaceSwapper not initialized"})
 
         success, message = swapper.set_target_face(session_id, image)
         
@@ -151,10 +158,10 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
                 t3 = time.time() # Decode done
                 
                 # TRANSFORM: Face Swap
-                if swapper.has_target(session_id):
+                if swapper and swapper.has_target(session_id):
                     result = swapper.swap_face(session_id, frame)
                 else:
-                    # Fallback if no target set yet
+                    # Fallback if no target set yet or swapper failed
                     result = frame
 
                 t4 = time.time() # Process done

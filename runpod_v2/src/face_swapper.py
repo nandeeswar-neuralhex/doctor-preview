@@ -46,10 +46,18 @@ class FaceSwapper:
         
         # Load face swapper model
         print(f"Loading swapper model: {INSWAPPER_MODEL}")
-        self.swapper = ort.InferenceSession(
-            INSWAPPER_MODEL,
-            providers=providers
-        )
+        try:
+            self.swapper = ort.InferenceSession(
+                INSWAPPER_MODEL,
+                providers=providers
+            )
+        except Exception as e:
+            print(f"Failed to load swapper with {providers}: {e}")
+            print("Falling back to CPUExecutionProvider...")
+            self.swapper = ort.InferenceSession(
+                INSWAPPER_MODEL,
+                providers=["CPUExecutionProvider"]
+            )
         
         # Get model input/output info
         self.input_name = self.swapper.get_inputs()[0].name
