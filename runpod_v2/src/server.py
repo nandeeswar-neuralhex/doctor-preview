@@ -76,12 +76,16 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
     import json
     try:
         while True:
+            t0 = time.time()
+            
             # Receive data
             try:
                 data = await websocket.receive_text()
             except WebSocketDisconnect:
                 print(f"WebSocket disconnected: {session_id}")
                 break
+            
+            t1 = time.time() # Receive done
 
             # Parse input (JSON or raw base64)
             try:
@@ -95,6 +99,8 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
             except json.JSONDecodeError:
                 frame_data = data
                 client_ts = None
+            
+            t2 = time.time() # Parse done
 
             # Decode image
             try:
@@ -104,13 +110,22 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
                 
                 if frame is None:
                     continue
+
+                t3 = time.time() # Decode done
                 
                 # TRANSFORM: Flip horizontally
                 result = cv2.flip(frame, 1)
+
+                t4 = time.time() # Process done
                 
                 # Encode response
+                # Resize if HUGE (optional, let's log size first)
+                h, w, _ = result.shape
+                
                 _, buffer = cv2.imencode('.jpg', result, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
                 result_b64 = base64.b64encode(buffer).decode('utf-8')
+                
+                t5 = time.time() # Encode done
                 
                 # Send back (JSON if timestamp exists, else raw)
                 if client_ts:
@@ -121,6 +136,18 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
                     await websocket.send_text(response)
                 else:
                     await websocket.send_text(result_b64)
+                
+                t6 = time.time() # Send done
+
+                # Log performance
+                total_server_time = (t6 - t1) * 1000
+                decode_ms = (t3 - t2) * 1000
+                proc_ms = (t4 - t3) * 1000
+                encode_ms = (t5 - t4) * 1000
+                recv_size_kb = len(data) / 1024
+                send_size_kb = len(result_b64) / 1024
+                
+                print(f"[{session_id}] Server: {total_server_time:.1f}ms | Decode: {decode_ms:.1f}ms | Flip: {proc_ms:.1f}ms | Encode: {encode_ms:.1f}ms | In: {recv_size_kb:.1f}KB | Out: {send_size_kb:.1f}KB | Res: {w}x{h}")
 
             except Exception as e:
                 print(f"Frame processing error: {e}")
