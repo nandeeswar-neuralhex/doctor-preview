@@ -26,7 +26,7 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
     // Custom hooks for webcam and WebSocket
     const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true);
     // WebSocket hook – render into the dedicated <img> ref
-    const handleWsFrame = useCallback((base64Frame) => {
+    const handleWsFrame = useCallback((base64Frame, wsLatency) => {
         if (wsImgRef.current) {
             wsImgRef.current.src = `data:image/jpeg;base64,${base64Frame}`;
         }
@@ -37,6 +37,10 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
             setFps(wsFrameCountRef.current);
             wsFrameCountRef.current = 0;
             wsLastFpsTimeRef.current = now;
+        }
+        // Update latency if provided
+        if (wsLatency !== undefined) {
+            setLatency(wsLatency);
         }
     }, []);
 
@@ -89,10 +93,16 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
         const sendLoop = () => {
             if (!active) return;
             if (video.readyState === video.HAVE_ENOUGH_DATA) {
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
-                ctx.drawImage(video, 0, 0);
-                const base64 = canvas.toDataURL('image/jpeg', 0.8).split(',')[1];
+                // Downscale to max 640 width
+                const MAX_WIDTH = 640;
+                const scale = Math.min(1, MAX_WIDTH / video.videoWidth);
+                canvas.width = video.videoWidth * scale;
+                canvas.height = video.videoHeight * scale;
+
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+                // Low quality JPEG (0.6)
+                const base64 = canvas.toDataURL('image/jpeg', 0.6).split(',')[1];
                 sendWsFrame(base64);
             }
             setTimeout(sendLoop, FRAME_INTERVAL);

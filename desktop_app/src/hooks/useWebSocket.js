@@ -31,21 +31,25 @@ const useWebSocket = (serverUrl, sessionId, onFrame) => {
             };
 
             ws.onmessage = (event) => {
-                // If it's a JSON message (error/info)
+                // If it's a JSON message
                 if (event.data.startsWith('{') && event.data.endsWith('}')) {
                     try {
                         const data = JSON.parse(event.data);
                         if (data.error) {
                             setError(data.error);
                         }
+                        // Handle image response with timestamp
+                        if (data.image) {
+                            const latency = data.ts ? Date.now() - data.ts : 0;
+                            if (onFrame) onFrame(data.image, latency);
+                        }
                     } catch (e) {
-                        // ignore JSON parse error, treat as frame data if needed, 
-                        // but usually JSON is for control messages.
+                        // ignore
                     }
                 } else {
-                    // It's a base64 frame (or raw string)
+                    // Legacy: raw base64 frame
                     if (onFrame) {
-                        onFrame(event.data);
+                        onFrame(event.data, 0);
                     }
                 }
             };
@@ -68,7 +72,12 @@ const useWebSocket = (serverUrl, sessionId, onFrame) => {
 
     const sendFrame = useCallback((base64Frame) => {
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            wsRef.current.send(base64Frame);
+            // Send JSON with timestamp for latency tracking
+            const payload = JSON.stringify({
+                image: base64Frame,
+                ts: Date.now()
+            });
+            wsRef.current.send(payload);
         }
     }, []);
 
