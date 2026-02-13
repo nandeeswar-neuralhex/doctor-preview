@@ -55,7 +55,7 @@ def download_models():
     # 1. Inswapper (Face Fusion)
     # 529MB, SHA256: e4a3f08c753cb72d04e10aa0f7dbe3deebbf399cb48dc476af41638f6c84ceaa
     download_file(
-        "https://github.com/facefusion/facefusion-assets/releases/download/models/inswapper_128.onnx",
+        "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx",
         INSWAPPER_MODEL,
         min_size_mb=200,
         expected_sha256="e4a3f08c753cb72d04e10aa0f7dbe3deebbf399cb48dc476af41638f6c84ceaa"
