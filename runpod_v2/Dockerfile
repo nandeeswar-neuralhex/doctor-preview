@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     libgl1-mesa-glx \
     libglib2.0-0 \
+    libturbojpeg \
     wget \
     curl \
     && ln -sf /usr/bin/python3.11 /usr/bin/python3 \

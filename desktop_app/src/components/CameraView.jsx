@@ -27,11 +27,17 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
     // Custom hooks for webcam and WebSocket
     const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true);
     // WebSocket hook – render into the dedicated <img> ref
-    const handleWsFrame = useCallback((base64Frame, wsLatency) => {
+    const handleWsFrame = useCallback((frameUrl, wsLatency, isObjectURL) => {
         // Clear back-pressure flag — server has responded, we can send next frame
         pendingFrameRef.current = false;
         if (wsImgRef.current) {
-            wsImgRef.current.src = `data:image/jpeg;base64,${base64Frame}`;
+            // Revoke previous object URL to prevent memory leak
+            const prevSrc = wsImgRef.current.src;
+            if (prevSrc && prevSrc.startsWith('blob:')) {
+                URL.revokeObjectURL(prevSrc);
+            }
+            // Set new frame (either blob: URL from binary mode or data: URI from text mode)
+            wsImgRef.current.src = frameUrl;
         }
         // FPS counter for WS mode
         wsFrameCountRef.current++;
@@ -91,19 +97,20 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
         const ctx = canvas.getContext('2d');
         const video = originalVideoRef.current;
 
-        // Adaptive frame sending: don't send a new frame until the server
-        // has responded to the previous one. This prevents queue buildup
-        // and naturally adapts to network + GPU processing speed.
+        // Adaptive frame sending with binary WebSocket:
+        // - canvas.toBlob() is async and non-blocking (unlike toDataURL which blocks main thread)
+        // - Sends raw JPEG bytes (no base64 = 33% smaller, no JSON parse)
+        // - Back-pressure: waits for server response before sending next
         let active = true;
         const MAX_WIDTH = 480;       // 480px is enough for face detection + swap
         const JPEG_QUALITY = 0.5;    // Lower = smaller payload = faster network
-        const MIN_INTERVAL = 30;     // Cap at ~33 FPS even if server is super fast
+        const MIN_INTERVAL = 16;     // ~60 FPS cap (actual rate limited by back-pressure)
 
         const sendLoop = () => {
             if (!active) return;
             if (pendingFrameRef.current) {
                 // Server hasn't responded yet — skip this frame
-                setTimeout(sendLoop, MIN_INTERVAL);
+                requestAnimationFrame(sendLoop);
                 return;
             }
             if (video.readyState === video.HAVE_ENOUGH_DATA) {
@@ -113,9 +120,12 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
 
                 ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-                const base64 = canvas.toDataURL('image/jpeg', JPEG_QUALITY).split(',')[1];
-                pendingFrameRef.current = true;
-                sendWsFrame(base64);
+                // toBlob is async & non-blocking (vs toDataURL which blocks main thread)
+                canvas.toBlob((blob) => {
+                    if (!active || !blob) return;
+                    pendingFrameRef.current = true;
+                    sendWsFrame(blob); // Sends as binary: [timestamp header] + [JPEG bytes]
+                }, 'image/jpeg', JPEG_QUALITY);
             }
             setTimeout(sendLoop, MIN_INTERVAL);
         };
