@@ -63,6 +63,33 @@ class FaceSwapper:
         self.input_name = self.swapper.get_inputs()[0].name
         self.input_shape = self.swapper.get_inputs()[0].shape
         
+        # Extract embedding map (emap) from model initializers
+        # This is critical: the model expects transformed embeddings, not raw ones
+        self.emap = None
+        model = ort.InferenceSession.__class__  # just for type reference
+        try:
+            import onnx
+            onnx_model = onnx.load(INSWAPPER_MODEL)
+            for initializer in onnx_model.graph.initializer:
+                if initializer.dims == [512, 512]:  # emap is always 512x512
+                    self.emap = np.frombuffer(initializer.raw_data, dtype=np.float32).reshape(512, 512).copy()
+                    print(f"Extracted emap from model (shape: {self.emap.shape})")
+                    break
+            if self.emap is None:
+                print("WARNING: Could not find emap in model initializers!")
+        except ImportError:
+            print("WARNING: onnx package not installed, trying alternative emap extraction...")
+            # Alternative: extract from model weights directly
+            try:
+                import onnxruntime as ort2
+                model_content = open(INSWAPPER_MODEL, 'rb').read()
+                # The emap is typically the last 512*512*4 bytes initializer
+                print("Could not extract emap without onnx package")
+            except Exception as e2:
+                print(f"Alternative emap extraction failed: {e2}")
+        except Exception as e:
+            print(f"emap extraction error: {e}")
+        
         # Optional face enhancer (GFPGAN)
         self.enhancer = None
         if ENABLE_GFPGAN:
@@ -267,12 +294,18 @@ class FaceSwapper:
             swapRB=True
         )
         
-        # Get target embedding
-        target_emb = target_face.embedding.reshape(1, -1).astype(np.float32)
+        # Get target embedding and transform through emap
+        # The model expects: latent = normalize(normed_embedding @ emap)
+        normed_emb = target_face.normed_embedding if hasattr(target_face, 'normed_embedding') else target_face.embedding
+        normed_emb = normed_emb.reshape(1, -1).astype(np.float32)
         
-        # Debug: log input details
-        print(f"[SWAP DEBUG] blob shape: {blob.shape}, target_emb shape: {target_emb.shape}")
-        print(f"[SWAP DEBUG] input names: {[inp.name for inp in self.swapper.get_inputs()]}")
+        if self.emap is not None:
+            latent = np.dot(normed_emb, self.emap)
+            latent /= np.linalg.norm(latent)
+        else:
+            # Fallback: use raw embedding (won't work well)
+            latent = normed_emb
+            print("WARNING: Using raw embedding (no emap), swap quality will be poor")
         
         # Run inference
         try:
@@ -280,7 +313,7 @@ class FaceSwapper:
                 None, 
                 {
                     self.input_name: blob,
-                    self.swapper.get_inputs()[1].name: target_emb
+                    self.swapper.get_inputs()[1].name: latent
                 }
             )[0]
             
