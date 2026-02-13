@@ -10,10 +10,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
 
+import io
+from PIL import Image, ImageOps
+from face_swapper import FaceSwapper
+from config import JPEG_QUALITY
+
 # Constants
 HOST = "0.0.0.0"
 PORT = 8765
-JPEG_QUALITY = 60
+
+# Global swapper
+swapper: FaceSwapper = None
 
 app = FastAPI(title="Simple Flip Server")
 
@@ -24,6 +31,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+async def startup_event():
+    global swapper
+    print("Initializing FaceSwapper...")
+    swapper = FaceSwapper()
+    print("FaceSwapper ready.")
 
 @app.get("/health")
 async def health_check():
@@ -47,13 +61,36 @@ async def upload_target(
     session_id: str = Query(...),
     file: UploadFile = File(...)
 ):
-    # We don't actually need the target for a simple flip, 
-    # but we accept it to satisfy the client's protocol.
-    return {
-        "status": "success",
-        "session_id": session_id,
-        "message": "Target received (ignored in simple mode)"
-    }
+    try:
+        contents = await file.read()
+        image = None
+        try:
+            # Try PIL first for EXIF orientation
+            pil_image = Image.open(io.BytesIO(contents))
+            pil_image = ImageOps.exif_transpose(pil_image)
+            pil_image = pil_image.convert("RGB")
+            image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+        except Exception:
+            # Fallback to direct decode
+            nparr = np.frombuffer(contents, np.uint8)
+            image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if image is None:
+            return JSONResponse(status_code=400, content={"error": "Invalid image file"})
+
+        success, message = swapper.set_target_face(session_id, image)
+        
+        if not success:
+            return JSONResponse(status_code=400, content={"error": message})
+
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "message": "Target face set successfully"
+        }
+    except Exception as e:
+        print(f"Error in upload_target: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/session/settings")
 async def update_settings(session_id: str = Query(...)):
@@ -113,8 +150,12 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
 
                 t3 = time.time() # Decode done
                 
-                # TRANSFORM: Flip horizontally
-                result = cv2.flip(frame, 1)
+                # TRANSFORM: Face Swap
+                if swapper.has_target(session_id):
+                    result = swapper.swap_face(session_id, frame)
+                else:
+                    # Fallback if no target set yet
+                    result = frame
 
                 t4 = time.time() # Process done
                 
@@ -158,6 +199,8 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
 
 @app.delete("/session/{session_id}")
 async def delete_session(session_id: str):
+    if swapper:
+        swapper.cleanup_session(session_id)
     print(f"Session {session_id} cleaned up")
     return {"status": "success", "message": "Session cleaned up"}
 
