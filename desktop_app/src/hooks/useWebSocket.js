@@ -55,10 +55,10 @@ const useWebSocket = (serverUrl, sessionId, onFrame) => {
                     const sentTs = view.getFloat64(4, true);
                     const latency = Date.now() - sentTs;
 
-                    // Create blob URL from raw JPEG (zero-copy render)
+                    // Pass raw Blob directly — CameraView uses createImageBitmap(blob)
+                    // No blob URL creation/revocation overhead
                     const jpegBlob = new Blob([buf.slice(12)], { type: 'image/jpeg' });
-                    const url = URL.createObjectURL(jpegBlob);
-                    if (onFrame) onFrame(url, latency, true);
+                    if (onFrame) onFrame(jpegBlob, latency, true);
                 } else if (typeof event.data === 'string') {
                     // Legacy text fallback
                     if (event.data.startsWith('{')) {

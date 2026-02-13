@@ -6,11 +6,9 @@ import useWebSocket from '../hooks/useWebSocket';
 function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
     const originalVideoRef = useRef(null);
     const processedVideoRef = useRef(null);
-    const wsImgRef = useRef(null);
-    const wsImgBackRef = useRef(null); // Double-buffer for smooth crossfade
+    const wsCanvasRef = useRef(null);  // Direct canvas paint — zero flicker
     const wsFrameCountRef = useRef(0);
     const wsLastFpsTimeRef = useRef(performance.now());
-    const frontBufRef = useRef(0); // 0 = wsImgRef is front, 1 = wsImgBackRef is front
 
     const [fps, setFps] = useState(0);
     const [latency, setLatency] = useState(0);
@@ -28,31 +26,38 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
     // Custom hooks for webcam and WebSocket
     const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true);
     // WebSocket hook – render into the dedicated <img> ref
-    const handleWsFrame = useCallback((frameUrl, wsLatency, isObjectURL) => {
-        // Double-buffer crossfade: load new frame into the BACK buffer,
-        // then swap front/back. This eliminates flicker/flash between frames.
-        const frontImg = frontBufRef.current === 0 ? wsImgRef.current : wsImgBackRef.current;
-        const backImg = frontBufRef.current === 0 ? wsImgBackRef.current : wsImgRef.current;
+    const handleWsFrame = useCallback((frameData, wsLatency, isBinary) => {
+        // Direct canvas painting: decode blob → drawImage → done.
+        // createImageBitmap() decodes off main thread → zero jank.
+        // No DOM swaps, no opacity transitions, no blob URLs = zero blink.
+        const canvas = wsCanvasRef.current;
+        if (!canvas) return;
 
-        if (backImg) {
-            // Revoke previous blob URL on the back buffer
-            const prevSrc = backImg.src;
-            if (prevSrc && prevSrc.startsWith('blob:')) {
-                URL.revokeObjectURL(prevSrc);
-            }
-            // Load new frame into back buffer
-            backImg.onload = () => {
-                // Swap: bring back buffer to front
-                if (backImg) backImg.style.opacity = '1';
-                if (frontImg) frontImg.style.opacity = '0';
-                frontBufRef.current = frontBufRef.current === 0 ? 1 : 0;
+        if (isBinary && frameData instanceof Blob) {
+            // Binary mode: raw Blob from WebSocket → decode → paint
+            createImageBitmap(frameData)
+                .then(bitmap => {
+                    const ctx = canvas.getContext('2d');
+                    if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+                        canvas.width = bitmap.width;
+                        canvas.height = bitmap.height;
+                    }
+                    ctx.drawImage(bitmap, 0, 0);
+                    bitmap.close();
+                })
+                .catch(() => {});
+        } else if (typeof frameData === 'string') {
+            // Legacy text mode: data: URI
+            const img = new Image();
+            img.onload = () => {
+                const ctx = canvas.getContext('2d');
+                if (canvas.width !== img.width || canvas.height !== img.height) {
+                    canvas.width = img.width;
+                    canvas.height = img.height;
+                }
+                ctx.drawImage(img, 0, 0);
             };
-            backImg.src = frameUrl;
-        } else if (frontImg) {
-            // Fallback: single buffer
-            const prevSrc = frontImg.src;
-            if (prevSrc && prevSrc.startsWith('blob:')) URL.revokeObjectURL(prevSrc);
-            frontImg.src = frameUrl;
+            img.src = frameData;
         }
         // FPS counter for WS mode
         wsFrameCountRef.current++;
@@ -484,20 +489,11 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
                     <div className="aspect-video bg-black flex items-center justify-center">
                         {isStreaming ? (
                             isWsConnected ? (
-                                <div className="relative w-full h-full">
-                                    <img
-                                        ref={wsImgRef}
-                                        className="absolute inset-0 w-full h-full object-contain"
-                                        style={{ transition: 'opacity 40ms ease', opacity: 1 }}
-                                        alt="Live Feed A"
-                                    />
-                                    <img
-                                        ref={wsImgBackRef}
-                                        className="absolute inset-0 w-full h-full object-contain"
-                                        style={{ transition: 'opacity 40ms ease', opacity: 0 }}
-                                        alt="Live Feed B"
-                                    />
-                                </div>
+                                <canvas
+                                    ref={wsCanvasRef}
+                                    className="w-full h-full object-contain"
+                                    style={{ imageRendering: 'auto' }}
+                                />
                             ) : (
                                 <video
                                     ref={processedVideoRef}
