@@ -17,7 +17,8 @@ insightface==0.7.3
 
 # === GPU inference (MUST be after insightface to overwrite CPU onnxruntime) ===
 # Uninstall CPU version first during setup:  pip uninstall onnxruntime -y
-onnxruntime-gpu==1.17.1
+# v1.20.1 supports CUDA 12.8 + cuDNN 9 (RunPod default)
+onnxruntime-gpu==1.20.1
 
 # === Face enhancement ===
 gfpgan>=1.3.8

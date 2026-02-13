@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && pip uninstall -y onnxruntime 2>/dev/null || true \
-    && pip install --no-cache-dir onnxruntime-gpu==1.17.1
+    && pip install --no-cache-dir onnxruntime-gpu==1.20.1
 
 # Verify GPU provider is available at build time
 RUN python3 -c "import onnxruntime as ort; providers = ort.get_available_providers(); print('Available providers:', providers)"
