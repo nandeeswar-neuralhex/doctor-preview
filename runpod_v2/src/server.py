@@ -14,6 +14,7 @@ import io
 from PIL import Image, ImageOps
 from face_swapper import FaceSwapper
 from config import JPEG_QUALITY
+from download_models import download_models
 
 # Constants
 HOST = "0.0.0.0"
@@ -35,6 +36,13 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     global swapper
+    
+    print("Checking models...")
+    try:
+        download_models()
+    except Exception as e:
+        print(f"Auto-download warning: {e}")
+
     print("Initializing FaceSwapper...")
     try:
         swapper = FaceSwapper()
