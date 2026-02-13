@@ -49,9 +49,3 @@ def download_models():
 
 if __name__ == "__main__":
     download_models()
-
-    # 3. InsightFace Buffalo Model (usually downloaded automatically by insightface, but can pre-download if needed)
-    # kept simple for now, insightface will fetch if missing.
-
-if __name__ == "__main__":
-    download_models()
