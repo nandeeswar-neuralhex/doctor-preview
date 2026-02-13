@@ -93,10 +93,10 @@ async def upload_target(
         if swapper is None:
              return JSONResponse(status_code=500, content={"error": "FaceSwapper not initialized"})
 
-        success, message = swapper.set_target_face(session_id, image)
+        success = swapper.set_target_face(session_id, image)
         
         if not success:
-            return JSONResponse(status_code=400, content={"error": message})
+            return JSONResponse(status_code=400, content={"error": "No face detected in target image"})
 
         return {
             "status": "success",
