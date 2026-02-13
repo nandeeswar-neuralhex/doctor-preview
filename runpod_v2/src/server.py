@@ -73,18 +73,32 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
     await websocket.accept()
     print(f"WebSocket connected: {session_id}")
     
+    import json
     try:
         while True:
-            # Receive frame
+            # Receive data
             try:
                 data = await websocket.receive_text()
             except WebSocketDisconnect:
                 print(f"WebSocket disconnected: {session_id}")
                 break
-                
-            # Decode
+
+            # Parse input (JSON or raw base64)
             try:
-                frame_bytes = base64.b64decode(data)
+                payload = json.loads(data)
+                if isinstance(payload, dict) and "image" in payload:
+                    frame_data = payload["image"]
+                    client_ts = payload.get("ts")
+                else:
+                    frame_data = data
+                    client_ts = None
+            except json.JSONDecodeError:
+                frame_data = data
+                client_ts = None
+
+            # Decode image
+            try:
+                frame_bytes = base64.b64decode(frame_data)
                 nparr = np.frombuffer(frame_bytes, np.uint8)
                 frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 
@@ -92,15 +106,22 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
                     continue
                 
                 # TRANSFORM: Flip horizontally
-                # 1 = Horizontal flip
                 result = cv2.flip(frame, 1)
                 
-                # Encode
+                # Encode response
                 _, buffer = cv2.imencode('.jpg', result, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
                 result_b64 = base64.b64encode(buffer).decode('utf-8')
                 
-                # Send back
-                await websocket.send_text(result_b64)
+                # Send back (JSON if timestamp exists, else raw)
+                if client_ts:
+                    response = json.dumps({
+                        "image": result_b64,
+                        "ts": client_ts
+                    })
+                    await websocket.send_text(response)
+                else:
+                    await websocket.send_text(result_b64)
+
             except Exception as e:
                 print(f"Frame processing error: {e}")
                 continue
