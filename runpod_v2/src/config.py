@@ -9,7 +9,7 @@ PORT = int(os.getenv("PORT", "8765"))
 
 # Processing settings
 # Processing settings
-JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "60"))
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "50"))  # Lower = smaller = faster encode/decode
 MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", "10"))
 
 # Model paths

@@ -5,6 +5,7 @@ import time
 import uuid
 import cv2
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -15,6 +16,10 @@ from PIL import Image, ImageOps
 from face_swapper import FaceSwapper
 from config import JPEG_QUALITY
 from download_models import download_models
+
+# Thread pool for CPU-bound frame processing (decode/encode/swap)
+# Size 2: one active + one preparing, prevents thread explosion
+_frame_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="frame")
 
 # Constants
 HOST = "0.0.0.0"
@@ -128,95 +133,165 @@ async def webrtc_offer(session_id: str = Query(...)):
         content={"error": "WebRTC disabled in simple mode. Use WebSocket."}
     )
 
+def _process_frame_sync(frame_data: str, session_id: str, swapper_ref):
+    """
+    CPU-bound frame processing — runs in thread pool to free the asyncio loop.
+    Handles: base64 decode → cv2 decode → face swap → cv2 encode → base64 encode
+    """
+    t0 = time.time()
+
+    # Decode: base64 → numpy → BGR
+    frame_bytes = base64.b64decode(frame_data)
+    nparr = np.frombuffer(frame_bytes, np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if frame is None:
+        return None, None
+
+    t1 = time.time()
+
+    # Swap
+    if swapper_ref and swapper_ref.has_target(session_id):
+        result = swapper_ref.swap_face(session_id, frame)
+    else:
+        result = frame
+
+    t2 = time.time()
+
+    # Encode: BGR → JPEG → base64
+    _, buffer = cv2.imencode('.jpg', result, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    result_b64 = base64.b64encode(buffer).decode('ascii')  # ascii is faster than utf-8 for b64
+
+    t3 = time.time()
+
+    h, w = result.shape[:2]
+    timing = {
+        "decode_ms": (t1 - t0) * 1000,
+        "swap_ms": (t2 - t1) * 1000,
+        "encode_ms": (t3 - t2) * 1000,
+        "total_ms": (t3 - t0) * 1000,
+        "w": w, "h": h,
+    }
+    return result_b64, timing
+
+
 @app.websocket("/ws/{session_id}")
 async def websocket_stream(websocket: WebSocket, session_id: str):
     await websocket.accept()
     print(f"WebSocket connected: {session_id}")
-    
+
     import json
+    loop = asyncio.get_running_loop()
+    frame_count = 0
+    last_log_time = time.time()
+
+    # Latest incoming frame — older frames get dropped automatically
+    latest_frame_data = None
+    latest_client_ts = None
+    processing = False  # True while a frame is being processed in the thread pool
+
     try:
         while True:
-            t0 = time.time()
-            
-            # Receive data
+            # ── Receive next frame ──
             try:
                 data = await websocket.receive_text()
             except WebSocketDisconnect:
                 print(f"WebSocket disconnected: {session_id}")
                 break
-            
-            t1 = time.time() # Receive done
 
-            # Parse input (JSON or raw base64)
-            try:
-                payload = json.loads(data)
-                if isinstance(payload, dict) and "image" in payload:
-                    frame_data = payload["image"]
+            # ── Parse (fast path: check for JSON wrapper) ──
+            client_ts = None
+            if data[0] == '{':
+                try:
+                    payload = json.loads(data)
+                    frame_data = payload.get("image", data)
                     client_ts = payload.get("ts")
-                else:
+                except (json.JSONDecodeError, TypeError):
                     frame_data = data
-                    client_ts = None
-            except json.JSONDecodeError:
+            else:
                 frame_data = data
-                client_ts = None
-            
-            t2 = time.time() # Parse done
 
-            # Decode image
-            try:
-                frame_bytes = base64.b64decode(frame_data)
-                nparr = np.frombuffer(frame_bytes, np.uint8)
-                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                
-                if frame is None:
-                    continue
+            # ── Frame dropping: always keep only the latest frame ──
+            # If we're still processing the previous frame, just overwrite the buffer.
+            # This prevents queue buildup and latency spiral.
+            latest_frame_data = frame_data
+            latest_client_ts = client_ts
 
-                t3 = time.time() # Decode done
-                
-                # TRANSFORM: Face Swap
-                if swapper and swapper.has_target(session_id):
-                    result = swapper.swap_face(session_id, frame)
-                else:
-                    # Fallback if no target set yet or swapper failed
-                    result = frame
-
-                t4 = time.time() # Process done
-                
-                # Encode response
-                # Resize if HUGE (optional, let's log size first)
-                h, w, _ = result.shape
-                
-                _, buffer = cv2.imencode('.jpg', result, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-                result_b64 = base64.b64encode(buffer).decode('utf-8')
-                
-                t5 = time.time() # Encode done
-                
-                # Send back (JSON if timestamp exists, else raw)
-                if client_ts:
-                    response = json.dumps({
-                        "image": result_b64,
-                        "ts": client_ts
-                    })
-                    await websocket.send_text(response)
-                else:
-                    await websocket.send_text(result_b64)
-                
-                t6 = time.time() # Send done
-
-                # Log performance
-                total_server_time = (t6 - t1) * 1000
-                decode_ms = (t3 - t2) * 1000
-                proc_ms = (t4 - t3) * 1000
-                encode_ms = (t5 - t4) * 1000
-                recv_size_kb = len(data) / 1024
-                send_size_kb = len(result_b64) / 1024
-                
-                print(f"[{session_id}] Server: {total_server_time:.1f}ms | Decode: {decode_ms:.1f}ms | Flip: {proc_ms:.1f}ms | Encode: {encode_ms:.1f}ms | In: {recv_size_kb:.1f}KB | Out: {send_size_kb:.1f}KB | Res: {w}x{h}")
-
-            except Exception as e:
-                print(f"Frame processing error: {e}")
+            if processing:
+                # Drop this frame — the processor will pick up latest_frame_data when done
                 continue
-                
+
+            # ── Process frames in a loop until buffer is drained ──
+            while latest_frame_data is not None:
+                current_data = latest_frame_data
+                current_ts = latest_client_ts
+                latest_frame_data = None  # Clear buffer
+                latest_client_ts = None
+                processing = True
+
+                try:
+                    # Offload ALL CPU work to thread pool
+                    result_b64, timing = await loop.run_in_executor(
+                        _frame_pool,
+                        _process_frame_sync,
+                        current_data,
+                        session_id,
+                        swapper
+                    )
+
+                    if result_b64 is None:
+                        processing = False
+                        continue
+
+                    # Send response (async — doesn't block)
+                    if current_ts is not None:
+                        await websocket.send_text(
+                            '{"image":"' + result_b64 + '","ts":' + str(current_ts) + '}'
+                        )
+                    else:
+                        await websocket.send_text(result_b64)
+
+                    # ── Periodic logging (every 3 seconds instead of every frame) ──
+                    frame_count += 1
+                    now = time.time()
+                    elapsed = now - last_log_time
+                    if elapsed >= 3.0:
+                        fps = frame_count / elapsed
+                        print(
+                            f"[{session_id}] FPS: {fps:.1f} | "
+                            f"Last: decode={timing['decode_ms']:.1f}ms "
+                            f"swap={timing['swap_ms']:.1f}ms "
+                            f"encode={timing['encode_ms']:.1f}ms "
+                            f"total={timing['total_ms']:.1f}ms | "
+                            f"Res: {timing['w']}x{timing['h']}"
+                        )
+                        frame_count = 0
+                        last_log_time = now
+
+                except Exception as e:
+                    print(f"Frame processing error: {e}")
+                finally:
+                    processing = False
+
+                # Check if a new frame arrived while we were processing
+                # (latest_frame_data may have been set by a concurrent receive)
+                # We need to drain any pending messages before looping
+                try:
+                    data = await asyncio.wait_for(websocket.receive_text(), timeout=0.001)
+                    if data[0] == '{':
+                        try:
+                            payload = json.loads(data)
+                            latest_frame_data = payload.get("image", data)
+                            latest_client_ts = payload.get("ts")
+                        except (json.JSONDecodeError, TypeError):
+                            latest_frame_data = data
+                    else:
+                        latest_frame_data = data
+                except asyncio.TimeoutError:
+                    break  # No more pending frames, go back to blocking receive
+                except WebSocketDisconnect:
+                    print(f"WebSocket disconnected: {session_id}")
+                    return
+
     except Exception as e:
         print(f"WebSocket error: {e}")
 

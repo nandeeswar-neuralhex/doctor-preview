@@ -9,6 +9,7 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
     const wsImgRef = useRef(null);
     const wsFrameCountRef = useRef(0);
     const wsLastFpsTimeRef = useRef(performance.now());
+    const pendingFrameRef = useRef(false); // Back-pressure: true while waiting for server response
 
     const [fps, setFps] = useState(0);
     const [latency, setLatency] = useState(0);
@@ -27,6 +28,8 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
     const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true);
     // WebSocket hook – render into the dedicated <img> ref
     const handleWsFrame = useCallback((base64Frame, wsLatency) => {
+        // Clear back-pressure flag — server has responded, we can send next frame
+        pendingFrameRef.current = false;
         if (wsImgRef.current) {
             wsImgRef.current.src = `data:image/jpeg;base64,${base64Frame}`;
         }
@@ -87,29 +90,38 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
         const canvas = document.createElement('canvas');
         const ctx = canvas.getContext('2d');
         const video = originalVideoRef.current;
-        const FRAME_INTERVAL = 1000 / 24; // 24 FPS
 
+        // Adaptive frame sending: don't send a new frame until the server
+        // has responded to the previous one. This prevents queue buildup
+        // and naturally adapts to network + GPU processing speed.
         let active = true;
+        const MAX_WIDTH = 480;       // 480px is enough for face detection + swap
+        const JPEG_QUALITY = 0.5;    // Lower = smaller payload = faster network
+        const MIN_INTERVAL = 30;     // Cap at ~33 FPS even if server is super fast
+
         const sendLoop = () => {
             if (!active) return;
+            if (pendingFrameRef.current) {
+                // Server hasn't responded yet — skip this frame
+                setTimeout(sendLoop, MIN_INTERVAL);
+                return;
+            }
             if (video.readyState === video.HAVE_ENOUGH_DATA) {
-                // Downscale to max 640 width
-                const MAX_WIDTH = 640;
                 const scale = Math.min(1, MAX_WIDTH / video.videoWidth);
                 canvas.width = video.videoWidth * scale;
                 canvas.height = video.videoHeight * scale;
 
                 ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-                // Low quality JPEG (0.6)
-                const base64 = canvas.toDataURL('image/jpeg', 0.6).split(',')[1];
+                const base64 = canvas.toDataURL('image/jpeg', JPEG_QUALITY).split(',')[1];
+                pendingFrameRef.current = true;
                 sendWsFrame(base64);
             }
-            setTimeout(sendLoop, FRAME_INTERVAL);
+            setTimeout(sendLoop, MIN_INTERVAL);
         };
         sendLoop();
 
-        return () => { active = false; };
+        return () => { active = false; pendingFrameRef.current = false; };
     }, [isStreaming, isWsConnected, sendWsFrame]);
 
     // Auto re-upload target image when the user switches images mid-stream

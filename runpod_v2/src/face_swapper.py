@@ -50,9 +50,11 @@ class FaceSwapper:
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         sess_options.enable_mem_pattern = True
         sess_options.enable_cpu_mem_arena = True
-        # Use all available threads for any CPU fallback ops
-        sess_options.intra_op_num_threads = 0  # 0 = use all cores
-        sess_options.inter_op_num_threads = 0
+        # CRITICAL: Limit CPU threads for ONNX pre/post-processing ops
+        # Setting 0 = ALL cores, which starves asyncio event loop, base64, numpy
+        # 2 threads is enough for the small CPU-side ops (transpose, gather, etc.)
+        sess_options.intra_op_num_threads = 2
+        sess_options.inter_op_num_threads = 1
         
         # ── Step 3: Build provider list with CUDA options ──
         if self.gpu_active:
@@ -81,16 +83,19 @@ class FaceSwapper:
         self.face_analyzer.prepare(ctx_id=0, det_size=(640, 640))
         print(f"  Full analyzer: {len(self.face_analyzer.models)} models at 640×640 (for target upload)")
         
-        # ── Step 4b: FAST face analyzer for real-time webcam (320×320, det + landmarks only) ──
-        # This is the key CPU optimization: skip genderage + recognition per frame
+        # ── Step 4b: FAST face analyzer for real-time webcam (256×256, detection only) ──
+        # KEY INSIGHT: INSwapper.get() only needs bbox + kps (5-point) from detection.
+        # Landmark_3d_68 and landmark_2d_106 are NOT used by the swapper — they were
+        # only needed for our custom _paste_back (which paste_back=True bypasses).
+        # Dropping them saves ~10-15ms CPU per frame.
         self.face_analyzer_fast = FaceAnalysis(
             name="buffalo_l",
             root=MODELS_DIR,
             providers=providers,
-            allowed_modules=["detection", "landmark_3d_68", "landmark_2d_106"]
+            allowed_modules=["detection"]
         )
-        self.face_analyzer_fast.prepare(ctx_id=0, det_size=(320, 320))
-        print(f"  Fast analyzer: {len(self.face_analyzer_fast.models)} models at 320×320 (for real-time)")
+        self.face_analyzer_fast.prepare(ctx_id=0, det_size=(256, 256))
+        print(f"  Fast analyzer: {len(self.face_analyzer_fast.models)} models at 256×256 (for real-time)")
         
         # Verify which provider the models actually use
         for analyzer_name, analyzer in [("full", self.face_analyzer), ("fast", self.face_analyzer_fast)]:
@@ -351,18 +356,18 @@ class FaceSwapper:
                 return self._last_result[session_id], []
             return frame, []
 
-        # Sort faces by size (largest first)
-        source_faces = sorted(
-            source_faces,
-            key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]),
-            reverse=True
-        )
-
         result = frame
+        n_swap = max(1, MAX_FACES)
 
-        # Swap up to MAX_FACES for stability (default 1)
-        for source_face in source_faces[:max(1, MAX_FACES)]:
-            result = self._swap_single_face(result, source_face, target_face, session_id)
+        if n_swap == 1:
+            # Fast path: just pick the largest face, skip full sort
+            best = max(source_faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))
+            result = self._swap_single_face(result, best, target_face, session_id)
+        else:
+            # Multi-face: sort by area descending
+            source_faces.sort(key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]), reverse=True)
+            for source_face in source_faces[:n_swap]:
+                result = self._swap_single_face(result, source_face, target_face, session_id)
 
         # Cache last good result to avoid flashing on face-lost frames
         self._last_result[session_id] = result
@@ -379,42 +384,29 @@ class FaceSwapper:
         Swap a single face in the frame.
         Uses InsightFace's INSwapper.get() which handles emap, alignment, and inference.
         """
-        # Get face bounding box and landmarks
-        bbox = source_face.bbox.astype(np.float32)
-        
-        # Optionally smooth landmarks AND bbox for stability
-        kps = source_face.kps
-        if ENABLE_TEMPORAL_SMOOTHING:
-            kps = self._smooth_landmarks(session_id, kps)
-            bbox = self._smooth_bounding_box(session_id, bbox)
-        bbox = bbox.astype(int)
+        # Smooth kps for temporal stability (reduces jitter between frames)
+        if ENABLE_TEMPORAL_SMOOTHING and hasattr(source_face, 'kps') and source_face.kps is not None:
+            source_face.kps = self._smooth_landmarks(session_id, source_face.kps)
 
         try:
-            # Use INSwapper's built-in get() method
-            # It handles: alignment, emap transformation, inference, paste-back
-            # source_face = face detected in the webcam frame (to be replaced)
-            # target_face = the uploaded target face (identity to swap to)
-            result = self.swapper.get(frame, source_face, target_face, paste_back=True)
-            return result
-            
+            # INSwapper.get() handles: alignment, emap, ONNX inference (GPU), paste-back
+            # This is the GPU-heavy call — everything else should be minimal CPU
+            return self.swapper.get(frame, source_face, target_face, paste_back=True)
         except Exception as e:
-            import traceback
             print(f"Swap error: {e}")
-            traceback.print_exc()
             return frame
 
     def _detect_faces_with_fallback(self, frame: np.ndarray):
-        """Detect faces using fast analyzer (det-only, 320×320) for real-time."""
+        """Detect faces using fast analyzer (det-only, 256×256) for real-time."""
         faces = self.face_analyzer_fast.get(frame)
         if len(faces) > 0:
             return faces
 
+        # Fallback: upscale tiny frames so detector can find small faces
         height, width = frame.shape[:2]
         min_dim = min(height, width)
         scale = 1.0
-        resized = None
 
-        # Upscale if face likely too small
         if min_dim < 360:
             scale = 720 / max(1, min_dim)
         elif min_dim < 480:
@@ -423,32 +415,20 @@ class FaceSwapper:
             scale = 1.25
 
         if scale > 1.0:
-            resized = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            resized = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
             faces_resized = self.face_analyzer_fast.get(resized)
             if len(faces_resized) == 0:
                 return []
 
             # Map detections back to original coordinates
-            mapped = []
             inv_scale = 1.0 / scale
+            mapped = []
             for f in faces_resized:
                 try:
-                    bbox = (f.bbox.astype(np.float32) * inv_scale).astype(np.float32)
-                    kps = (f.kps.astype(np.float32) * inv_scale).astype(np.float32)
+                    bbox = (f.bbox * inv_scale).astype(np.float32)
+                    kps = (f.kps * inv_scale).astype(np.float32)
                     det_score = getattr(f, 'det_score', 0.9)
-                    ns = SimpleNamespace(bbox=bbox, kps=kps, det_score=det_score)
-                    # Preserve 68-point 3D landmarks for precise mask contour
-                    if hasattr(f, 'landmark_3d_68') and f.landmark_3d_68 is not None:
-                        lm68 = f.landmark_3d_68.copy().astype(np.float32)
-                        lm68[:, 0] *= inv_scale
-                        lm68[:, 1] *= inv_scale
-                        ns.landmark_3d_68 = lm68
-                    # Preserve 106-point 2D landmarks
-                    if hasattr(f, 'landmark_2d_106') and f.landmark_2d_106 is not None:
-                        lm106 = f.landmark_2d_106.copy().astype(np.float32)
-                        lm106 *= inv_scale
-                        ns.landmark_2d_106 = lm106
-                    mapped.append(ns)
+                    mapped.append(SimpleNamespace(bbox=bbox, kps=kps, det_score=det_score))
                 except Exception:
                     continue
             return mapped
