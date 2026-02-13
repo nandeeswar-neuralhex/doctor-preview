@@ -13,7 +13,7 @@ import uvicorn
 # Constants
 HOST = "0.0.0.0"
 PORT = 8765
-JPEG_QUALITY = 85
+JPEG_QUALITY = 60
 
 app = FastAPI(title="Simple Flip Server")
 
