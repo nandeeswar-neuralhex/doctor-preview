@@ -5,9 +5,9 @@
     "main": "electron/main.js",
     "scripts": {
         "start": "concurrently \"npm run start:react\" \"wait-on http://localhost:3000 && npm run start:electron\"",
-        "start:react": "vite",
+        "start:react": "NODE_OPTIONS='--require ./crypto-polyfill.cjs' vite",
         "start:electron": "electron .",
-        "build": "vite build",
+        "build": "NODE_OPTIONS='--require ./crypto-polyfill.cjs' vite build",
         "build:mac": "npm run build && electron-builder --mac",
         "build:win": "npm run build && electron-builder --win"
     },

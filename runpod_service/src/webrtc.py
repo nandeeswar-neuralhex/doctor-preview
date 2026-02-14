@@ -19,19 +19,22 @@ from config import ENABLE_LIPSYNC, LIPSYNC_AUDIO_WINDOW_MS
 
 
 class AudioBuffer:
+    """Circular buffer for audio PCM data with configurable window size."""
     def __init__(self):
         self._buffer = bytearray()
         self._sample_rate = 48000
         self._channels = 1
-        self._max_samples = int(0.5 * self._sample_rate)
+        # Keep up to 500ms of audio for better mel spectrogram context
+        self._max_duration_s = 0.5
 
     def append(self, frame: AudioFrame):
         try:
             self._sample_rate = frame.sample_rate
             pcm = frame.to_ndarray().tobytes()
             self._buffer.extend(pcm)
-            if len(self._buffer) > self._max_samples * 2:
-                self._buffer = self._buffer[-self._max_samples * 2 :]
+            max_bytes = int(self._max_duration_s * self._sample_rate) * 2  # 2 bytes per int16 sample
+            if len(self._buffer) > max_bytes:
+                self._buffer = self._buffer[-max_bytes:]
         except Exception:
             return
 
@@ -68,7 +71,7 @@ class VideoTransformTrack(MediaStreamTrack):
         # Face swap
         result, faces = self.swapper.swap_face_with_faces(self.session_id, img)
 
-        # Lip sync (optional)
+        # Lip sync (optional) — mouth-only blending for natural results
         settings = self.session_settings.get(self.session_id, {}) if self.session_settings else {}
         enable_lipsync = settings.get("enable_lipsync", ENABLE_LIPSYNC)
         if enable_lipsync and self.lip_syncer and self.lip_syncer.is_ready() and len(faces) > 0:
@@ -83,8 +86,10 @@ class VideoTransformTrack(MediaStreamTrack):
                     face_crop = result[y1:y2, x1:x2]
                     synced = self.lip_syncer.infer(face_crop, mel)
                     if synced is not None:
-                        synced = cv2.resize(synced, (x2 - x1, y2 - y1))
-                        result[y1:y2, x1:x2] = synced
+                        # Use mouth-only blending instead of replacing entire face
+                        result = self.lip_syncer.apply_mouth_only(
+                            result, (x1, y1, x2, y2), synced
+                        )
 
         if self.frame_queue is not None:
             try:

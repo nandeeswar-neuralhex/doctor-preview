@@ -9,6 +9,9 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     const wsCanvasRef = useRef(null);  // Direct canvas paint — zero flicker
     const wsFrameCountRef = useRef(0);
     const wsLastFpsTimeRef = useRef(performance.now());
+    const audioCtxRef = useRef(null);
+    const audioBufferRef = useRef(new Int16Array(0));
+    const audioSampleRateRef = useRef(16000);
 
     const [fps, setFps] = useState(0);
     const [latency, setLatency] = useState(0);
@@ -144,7 +147,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
 
                 canvas.toBlob((blob) => {
                     if (!active || !blob) return;
-                    sendWsFrame(blob);
+                    sendWsFrame(blob, audioBufferRef.current, audioSampleRateRef.current);
                 }, 'image/jpeg', JPEG_QUALITY);
             }
             setTimeout(sendLoop, INTERVAL);
@@ -217,6 +220,65 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
             }));
         }
     }, [stream]);
+
+    // Capture mic audio for lip sync when using WebSocket mode
+    useEffect(() => {
+        if (!isStreaming || !isWsConnected || !stream) return;
+
+        const audioTracks = stream.getAudioTracks();
+        if (audioTracks.length === 0) return;
+
+        let audioCtx;
+        try {
+            // Request 16kHz (Wav2Lip training rate) — Chromium resamples internally
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+        } catch (e) {
+            // Fallback to default sample rate
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        audioSampleRateRef.current = audioCtx.sampleRate;
+
+        const audioStream = new MediaStream(audioTracks);
+        const source = audioCtx.createMediaStreamSource(audioStream);
+        // 4096 samples per buffer — at 16kHz that's ~256ms per callback
+        const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+        // Silence output to prevent mic feedback through speakers
+        const silencer = audioCtx.createGain();
+        silencer.gain.value = 0;
+
+        processor.onaudioprocess = (e) => {
+            const float32 = e.inputBuffer.getChannelData(0);
+            const int16 = new Int16Array(float32.length);
+            for (let i = 0; i < float32.length; i++) {
+                const s = Math.max(-1, Math.min(1, float32[i]));
+                int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            // Circular buffer: keep last ~500ms at 16kHz = 8000 samples
+            const maxSamples = 8000;
+            const prev = audioBufferRef.current;
+            const combined = new Int16Array(prev.length + int16.length);
+            combined.set(prev);
+            combined.set(int16, prev.length);
+            audioBufferRef.current = combined.length > maxSamples
+                ? combined.slice(combined.length - maxSamples)
+                : combined;
+        };
+
+        source.connect(processor);
+        processor.connect(silencer);
+        silencer.connect(audioCtx.destination);
+        audioCtxRef.current = audioCtx;
+
+        return () => {
+            try { processor.disconnect(); } catch (e) { /* ignore */ }
+            try { source.disconnect(); } catch (e) { /* ignore */ }
+            try { silencer.disconnect(); } catch (e) { /* ignore */ }
+            try { audioCtx.close(); } catch (e) { /* ignore */ }
+            audioCtxRef.current = null;
+            audioBufferRef.current = new Int16Array(0);
+        };
+    }, [isStreaming, isWsConnected, stream]);
 
     // FPS from processed video – count actual decoded frames
     useEffect(() => {
@@ -400,6 +462,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         setIsStreaming(false);
         setFps(0);
         setLatency(0);
+        audioBufferRef.current = new Int16Array(0);
     };
 
     const handleHealthCheck = async () => {

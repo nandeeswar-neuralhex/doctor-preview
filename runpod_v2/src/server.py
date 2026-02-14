@@ -15,7 +15,8 @@ import uvicorn
 import io
 from PIL import Image, ImageOps
 from face_swapper import FaceSwapper
-from config import JPEG_QUALITY
+from lip_syncer import LipSyncer
+from config import JPEG_QUALITY, EXECUTION_PROVIDER, ENABLE_LIPSYNC
 from download_models import download_models
 
 # ── TurboJPEG: 3-5x faster JPEG encode/decode than cv2 ──
@@ -35,8 +36,9 @@ _frame_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="frame")
 HOST = "0.0.0.0"
 PORT = 8765
 
-# Global swapper
+# Global swapper and lip syncer
 swapper: FaceSwapper = None
+lip_syncer: LipSyncer = None
 
 app = FastAPI(title="Simple Flip Server")
 
@@ -50,7 +52,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
-    global swapper
+    global swapper, lip_syncer
     
     print("Checking models...")
     try:
@@ -65,6 +67,22 @@ async def startup_event():
     except Exception as e:
         print(f"FaceSwapper initialization failed: {e}")
         swapper = None
+
+    # Initialize lip syncer for real-time lip sync
+    if ENABLE_LIPSYNC:
+        try:
+            providers = [EXECUTION_PROVIDER, "CPUExecutionProvider"]
+            lip_syncer = LipSyncer(providers)
+            if lip_syncer.is_ready():
+                print("LipSyncer ready.")
+            else:
+                print("LipSyncer disabled (model not available or librosa missing).")
+                lip_syncer = None
+        except Exception as e:
+            print(f"LipSyncer initialization failed: {e}")
+            lip_syncer = None
+    else:
+        print("LipSyncer disabled by config.")
 
 @app.get("/health")
 async def health_check():
@@ -198,12 +216,13 @@ async def webrtc_offer(session_id: str = Query(...)):
         content={"error": "WebRTC disabled in simple mode. Use WebSocket."}
     )
 
-def _process_frame_binary(jpeg_bytes: bytes, session_id: str, swapper_ref):
+def _process_frame_binary(jpeg_bytes: bytes, audio_pcm: bytes, audio_sr: int,
+                          session_id: str, swapper_ref, lip_syncer_ref):
     """
-    Process a raw JPEG frame — runs in thread pool.
-    Input: raw JPEG bytes (no base64, no JSON)
-    Output: raw JPEG bytes (no base64, no JSON)
-    Eliminates ~10ms of base64+JSON overhead per frame.
+    Process a raw JPEG frame with optional audio for lip sync.
+    Input: raw JPEG bytes + PCM int16 audio
+    Output: raw JPEG bytes
+    Runs in thread pool for concurrency.
     """
     t0 = time.time()
 
@@ -218,13 +237,42 @@ def _process_frame_binary(jpeg_bytes: bytes, session_id: str, swapper_ref):
 
     t1 = time.time()
 
-    # Swap
+    # Face swap + get detected faces for lip sync
+    source_faces = []
     if swapper_ref and swapper_ref.has_target(session_id):
-        result = swapper_ref.swap_face(session_id, frame)
+        result, source_faces = swapper_ref.swap_face_with_faces(session_id, frame)
     else:
         result = frame
 
     t2 = time.time()
+
+    # Lip sync: apply Wav2Lip mouth correction using audio
+    t_lip = 0
+    if (lip_syncer_ref and lip_syncer_ref.is_ready()
+            and audio_pcm and len(audio_pcm) > 0 and len(source_faces) > 0):
+        try:
+            mel = lip_syncer_ref.audio_to_mel(audio_pcm, audio_sr)
+            if mel is not None:
+                # Use the largest detected face
+                face = max(source_faces,
+                           key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
+                bbox = face.bbox.astype(int)
+                x1, y1, x2, y2 = bbox
+                x1, y1 = max(0, x1), max(0, y1)
+                x2 = min(result.shape[1], x2)
+                y2 = min(result.shape[0], y2)
+                if x2 > x1 and y2 > y1:
+                    face_crop = result[y1:y2, x1:x2]
+                    synced = lip_syncer_ref.infer(face_crop, mel)
+                    if synced is not None:
+                        result = lip_syncer_ref.apply_mouth_only(
+                            result, (x1, y1, x2, y2), synced
+                        )
+        except Exception as e:
+            pass  # Don't break frame pipeline on lip sync error
+        t_lip = (time.time() - t2) * 1000
+
+    t3 = time.time()
 
     # Encode BGR → JPEG
     if _tj:
@@ -233,14 +281,15 @@ def _process_frame_binary(jpeg_bytes: bytes, session_id: str, swapper_ref):
         _, buffer = cv2.imencode('.jpg', result, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         out_bytes = buffer.tobytes()
 
-    t3 = time.time()
+    t4 = time.time()
 
     h, w = result.shape[:2]
     timing = {
         "decode_ms": (t1 - t0) * 1000,
         "swap_ms": (t2 - t1) * 1000,
-        "encode_ms": (t3 - t2) * 1000,
-        "total_ms": (t3 - t0) * 1000,
+        "lipsync_ms": t_lip,
+        "encode_ms": (t4 - t3) * 1000,
+        "total_ms": (t4 - t0) * 1000,
         "w": w, "h": h,
     }
     return out_bytes, timing
@@ -300,14 +349,17 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
     _latest_frame_id = 0         # Track latest to drop stale frames
 
     async def process_and_respond_binary(raw_data: bytes):
-        """Process a binary frame and send result back."""
+        """Process a binary frame (with optional audio) and send result back."""
         nonlocal last_timing, _latest_frame_id
-        if len(raw_data) < 13:  # 12-byte header + at least 1 byte JPEG
+        if len(raw_data) < 21:  # 20-byte header + at least 1 byte JPEG
             return
-        # Header: 4 bytes frameId + 8 bytes timestamp + JPEG
+        # Header: 4B frameId + 8B timestamp + 4B audioLen + 4B sampleRate + audio + JPEG
         frame_id_bytes = raw_data[:4]
         ts_bytes = raw_data[4:12]
-        jpeg_bytes = raw_data[12:]
+        audio_len = struct.unpack('<I', raw_data[12:16])[0]
+        audio_sr = struct.unpack('<I', raw_data[16:20])[0]
+        audio_pcm = raw_data[20:20+audio_len] if audio_len > 0 else b''
+        jpeg_bytes = raw_data[20+audio_len:]
 
         frame_id = struct.unpack('<I', frame_id_bytes)[0]
 
@@ -325,8 +377,11 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
                 _frame_pool,
                 _process_frame_binary,
                 jpeg_bytes,
+                audio_pcm,
+                audio_sr,
                 session_id,
-                swapper
+                swapper,
+                lip_syncer
             )
             if out_bytes is None:
                 return
@@ -396,6 +451,7 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
                     f"[{session_id}] FPS: {fps_val:.1f} | "
                     + (f"decode={last_timing['decode_ms']:.1f}ms "
                        f"swap={last_timing['swap_ms']:.1f}ms "
+                       f"lip={last_timing.get('lipsync_ms', 0):.1f}ms "
                        f"encode={last_timing['encode_ms']:.1f}ms "
                        f"total={last_timing['total_ms']:.1f}ms | "
                        f"Res: {last_timing['w']}x{last_timing['h']}"

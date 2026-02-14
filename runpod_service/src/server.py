@@ -4,6 +4,7 @@ Optimized for 24+ FPS streaming on GPU
 """
 import asyncio
 import base64
+import struct
 import time
 import uuid
 from typing import Dict, Deque
@@ -226,69 +227,125 @@ async def delete_session(session_id: str):
 @app.websocket("/ws/{session_id}")
 async def websocket_stream(websocket: WebSocket, session_id: str):
     """
-    Real-time face swap WebSocket endpoint.
-    
-    Protocol:
-    1. Client sends base64-encoded JPEG frame
-    2. Server processes and returns base64-encoded result
-    
-    Expected throughput: 24+ FPS on RTX 4090/A100
+    Real-time face swap + lip sync WebSocket endpoint.
+
+    Binary protocol (preferred):
+      Client sends: [4B frameId][8B timestamp][4B audioLen][4B sampleRate][audio PCM][JPEG]
+      Server sends: [4B frameId][8B timestamp][processed JPEG]
+
+    Text protocol (legacy fallback):
+      Client sends: base64-encoded JPEG
+      Server sends: base64-encoded result JPEG
     """
     await websocket.accept()
     log_event("ws_connected", session_id=session_id)
     active_connections[session_id] = websocket
-    
+
     frame_count = 0
     start_time = time.time()
-    
+
     print(f"WebSocket connected: {session_id}")
-    
+
     try:
         # Check if target face is set
         if not swapper.has_target(session_id):
             await websocket.send_json({
                 "error": "No target face set. Upload target first via POST /upload-target"
             })
-            # Keep connection open - target might be uploaded later
-        
+
         while True:
-            # Receive frame from client
-            data = await websocket.receive_text()
-            
-            # Decode input frame
-            frame_bytes = base64.b64decode(data)
-            nparr = np.frombuffer(frame_bytes, np.uint8)
-            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            
-            if frame is None:
-                await websocket.send_json({"error": "Invalid frame data"})
-                continue
-            
-            # Ensure target is set before processing
-            if not swapper.has_target(session_id):
-                await websocket.send_json({
-                    "error": "No target face set. Upload target first via POST /upload-target"
-                })
+            msg = await websocket.receive()
+
+            # ── Binary mode (with audio for lip sync) ──
+            if "bytes" in msg and msg["bytes"]:
+                raw_data = msg["bytes"]
+                if len(raw_data) < 21:  # 20-byte header + at least 1 byte JPEG
+                    continue
+
+                # Parse header: [4B frameId][8B timestamp][4B audioLen][4B sampleRate]
+                frame_id_bytes = raw_data[:4]
+                ts_bytes = raw_data[4:12]
+                audio_len = struct.unpack('<I', raw_data[12:16])[0]
+                audio_sr = struct.unpack('<I', raw_data[16:20])[0]
+                audio_pcm = raw_data[20:20+audio_len] if audio_len > 0 else b''
+                jpeg_bytes = raw_data[20+audio_len:]
+
+                # Decode frame
+                nparr = np.frombuffer(jpeg_bytes, np.uint8)
+                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                if frame is None:
+                    continue
+
+                if not swapper.has_target(session_id):
+                    continue
+
+                # Face swap (with detected faces for lip sync)
+                result, source_faces = swapper.swap_face_with_faces(session_id, frame)
+
+                # Lip sync: apply Wav2Lip mouth correction using audio
+                if (lip_syncer and lip_syncer.is_ready()
+                        and audio_pcm and len(audio_pcm) > 0
+                        and len(source_faces) > 0):
+                    try:
+                        mel = lip_syncer.audio_to_mel(audio_pcm, audio_sr)
+                        if mel is not None:
+                            face = max(source_faces,
+                                       key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
+                            bbox = face.bbox.astype(int)
+                            x1, y1, x2, y2 = bbox
+                            x1, y1 = max(0, x1), max(0, y1)
+                            x2 = min(result.shape[1], x2)
+                            y2 = min(result.shape[0], y2)
+                            if x2 > x1 and y2 > y1:
+                                face_crop = result[y1:y2, x1:x2]
+                                synced = lip_syncer.infer(face_crop, mel)
+                                if synced is not None:
+                                    result = lip_syncer.apply_mouth_only(
+                                        result, (x1, y1, x2, y2), synced
+                                    )
+                    except Exception:
+                        pass  # Don't break frame pipeline
+
+                # Encode result
+                encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+                _, buffer = cv2.imencode('.jpg', result, encode_params)
+                out_bytes = buffer.tobytes()
+
+                # Send back: [4B frameId][8B timestamp][JPEG]
+                await websocket.send_bytes(frame_id_bytes + ts_bytes + out_bytes)
+
+            # ── Text mode (legacy) ──
+            elif "text" in msg and msg["text"]:
+                data = msg["text"]
+                frame_bytes = base64.b64decode(data)
+                nparr = np.frombuffer(frame_bytes, np.uint8)
+                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+                if frame is None:
+                    await websocket.send_json({"error": "Invalid frame data"})
+                    continue
+
+                if not swapper.has_target(session_id):
+                    await websocket.send_json({
+                        "error": "No target face set. Upload target first."
+                    })
+                    continue
+
+                result = swapper.swap_face(session_id, frame)
+                encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+                _, buffer = cv2.imencode('.jpg', result, encode_params)
+                result_b64 = base64.b64encode(buffer).decode('utf-8')
+                await websocket.send_text(result_b64)
+            else:
                 continue
 
-            # Process face swap
-            result = swapper.swap_face(session_id, frame)
-            
-            # Encode result
-            encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
-            _, buffer = cv2.imencode('.jpg', result, encode_params)
-            result_b64 = base64.b64encode(buffer).decode('utf-8')
-            
-            # Send processed frame back
-            await websocket.send_text(result_b64)
-            
             # FPS tracking
             frame_count += 1
             if frame_count % 10 == 0:
                 elapsed = time.time() - start_time
                 fps = frame_count / elapsed
                 print(f"Session {session_id}: {fps:.1f} FPS")
-                
+
     except WebSocketDisconnect:
         log_event("ws_disconnected", session_id=session_id)
         print(f"WebSocket disconnected: {session_id}")
@@ -298,7 +355,6 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
     finally:
         if session_id in active_connections:
             del active_connections[session_id]
-        # Cleanup session resources on disconnect
         swapper.cleanup_session(session_id)
 
 

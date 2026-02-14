@@ -93,10 +93,11 @@ const useWebSocket = (serverUrl, sessionId, onFrame) => {
     }, [serverUrl, sessionId, onFrame]);
 
     /**
-     * Send frame as binary: [4-byte frameId] + [8-byte timestamp] + [JPEG bytes]
+     * Send frame as binary with audio for lip sync:
+     * [4B frameId] + [8B timestamp] + [4B audioLen] + [4B sampleRate] + [audio PCM] + [JPEG]
      * PIPELINED: does NOT wait for previous response — fires immediately.
      */
-    const sendFrame = useCallback((frameData) => {
+    const sendFrame = useCallback((frameData, audioData, sampleRate) => {
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
         // Check bufferedAmount — if too much is queued, skip this frame
@@ -110,15 +111,26 @@ const useWebSocket = (serverUrl, sessionId, onFrame) => {
         if (frameData instanceof Blob) {
             frameData.arrayBuffer().then((jpegBuf) => {
                 if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-                // Header: 4 bytes frameId (uint32) + 8 bytes timestamp (float64)
-                const header = new ArrayBuffer(12);
-                const hView = new DataView(header);
-                hView.setUint32(0, fid, true);
-                hView.setFloat64(4, Date.now(), true);
 
-                const combined = new Uint8Array(12 + jpegBuf.byteLength);
-                combined.set(new Uint8Array(header), 0);
-                combined.set(new Uint8Array(jpegBuf), 12);
+                // Audio PCM bytes (Int16Array → raw bytes)
+                const audioPcm = audioData instanceof Int16Array && audioData.length > 0
+                    ? audioData : new Int16Array(0);
+                const audioBytes = new Uint8Array(
+                    audioPcm.buffer, audioPcm.byteOffset, audioPcm.byteLength
+                );
+
+                // Header: 4B frameId + 8B timestamp + 4B audioLen + 4B sampleRate = 20 bytes
+                const headerSize = 20;
+                const totalSize = headerSize + audioBytes.length + jpegBuf.byteLength;
+                const combined = new Uint8Array(totalSize);
+                const view = new DataView(combined.buffer);
+                view.setUint32(0, fid, true);                // frameId
+                view.setFloat64(4, Date.now(), true);         // timestamp
+                view.setUint32(12, audioBytes.length, true);  // audio byte length
+                view.setUint32(16, sampleRate || 16000, true); // sample rate
+                combined.set(audioBytes, headerSize);
+                combined.set(new Uint8Array(jpegBuf), headerSize + audioBytes.length);
+
                 wsRef.current.send(combined.buffer);
             });
         } else if (typeof frameData === 'string') {
