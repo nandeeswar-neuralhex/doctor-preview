@@ -116,6 +116,9 @@ async def upload_target(
         if swapper is None:
              return JSONResponse(status_code=500, content={"error": "FaceSwapper not initialized"})
 
+        # Clear previous faces and set new one
+        if session_id in swapper.target_faces:
+            del swapper.target_faces[session_id]
         success = swapper.set_target_face(session_id, image)
         
         if not success:
@@ -124,10 +127,62 @@ async def upload_target(
         return {
             "status": "success",
             "session_id": session_id,
+            "faces_stored": len(swapper.target_faces.get(session_id, [])),
             "message": "Target face set successfully"
         }
     except Exception as e:
         print(f"Error in upload_target: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/upload-targets")
+async def upload_targets(
+    session_id: str = Query(...),
+    files: list[UploadFile] = File(...)
+):
+    """Upload multiple target images for expression matching.
+    Each image should show a different expression (smile, neutral, open mouth, etc.).
+    The server will match the webcam expression to the closest target.
+    """
+    try:
+        if swapper is None:
+            return JSONResponse(status_code=500, content={"error": "FaceSwapper not initialized"})
+
+        if len(files) > 10:
+            return JSONResponse(status_code=400, content={"error": "Maximum 10 images allowed"})
+
+        images = []
+        for f in files:
+            contents = await f.read()
+            image = None
+            try:
+                pil_image = Image.open(io.BytesIO(contents))
+                pil_image = ImageOps.exif_transpose(pil_image)
+                pil_image = pil_image.convert("RGB")
+                image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+            except Exception:
+                nparr = np.frombuffer(contents, np.uint8)
+                image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if image is not None:
+                images.append(image)
+
+        if not images:
+            return JSONResponse(status_code=400, content={"error": "No valid images found"})
+
+        result = swapper.set_target_faces(session_id, images)
+
+        if not result["success"]:
+            return JSONResponse(status_code=400, content={"error": result["message"]})
+
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "faces_stored": result["count"],
+            "total_uploaded": result["total"],
+            "message": f"{result['count']}/{result['total']} faces extracted for expression matching"
+        }
+    except Exception as e:
+        print(f"Error in upload_targets: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/session/settings")

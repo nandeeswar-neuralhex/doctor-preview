@@ -3,7 +3,7 @@ import useWebcam from '../hooks/useWebcam';
 import useWebRTC from '../hooks/useWebRTC';
 import useWebSocket from '../hooks/useWebSocket';
 
-function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
+function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setIsStreaming }) {
     const originalVideoRef = useRef(null);
     const processedVideoRef = useRef(null);
     const wsCanvasRef = useRef(null);  // Direct canvas paint — zero flicker
@@ -128,8 +128,8 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
         // at any time, and the server processes them concurrently.
         // Result: smooth 20 FPS output regardless of network latency.
         let active = true;
-        const MAX_WIDTH = 320;       // 320px = small payload, fast transfer
-        const JPEG_QUALITY = 0.45;   // Aggressive compression for speed
+        const MAX_WIDTH = 480;       // 480px = good quality, fast transfer
+        const JPEG_QUALITY = 0.65;   // Balanced quality/speed
         const SEND_FPS = 20;         // Fixed send rate
         const INTERVAL = 1000 / SEND_FPS;
 
@@ -154,34 +154,55 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
         return () => { active = false; };
     }, [isStreaming, isWsConnected, sendWsFrame]);
 
-    // Auto re-upload target image when the user switches images mid-stream
+    // Auto re-upload ALL target images when the user adds/removes images mid-stream
     useEffect(() => {
-        if (!isStreaming || !serverUrl || !targetImage) return;
+        if (!isStreaming || !serverUrl || !allTargetImages || allTargetImages.length === 0) return;
 
         const reupload = async () => {
             try {
-                setDiagnostics(prev => ({ ...prev, upload: 'Re-uploading target image...' }));
-                const formData = new FormData();
-                formData.append('file', targetImage.file);
-                const resp = await fetch(
-                    `${serverUrl}/upload-target?session_id=${sessionId}`,
-                    { method: 'POST', body: formData }
-                );
-                const body = await resp.json().catch(() => null);
-                if (!resp.ok) {
-                    setDiagnostics(prev => ({
-                        ...prev,
-                        upload: `Re-upload failed: ${body?.error || resp.status}`
-                    }));
-                    return;
+                if (allTargetImages.length > 1) {
+                    setDiagnostics(prev => ({ ...prev, upload: `Re-uploading ${allTargetImages.length} images...` }));
+                    const formData = new FormData();
+                    allTargetImages.forEach(img => {
+                        formData.append('files', img.file);
+                    });
+                    const resp = await fetch(
+                        `${serverUrl}/upload-targets?session_id=${sessionId}`,
+                        { method: 'POST', body: formData }
+                    );
+                    const body = await resp.json().catch(() => null);
+                    if (!resp.ok) {
+                        setDiagnostics(prev => ({
+                            ...prev,
+                            upload: `Re-upload failed: ${body?.error || resp.status}`
+                        }));
+                        return;
+                    }
+                    setDiagnostics(prev => ({ ...prev, upload: `Re-upload ok: ${body?.message || 'success'}` }));
+                } else {
+                    setDiagnostics(prev => ({ ...prev, upload: 'Re-uploading target image...' }));
+                    const formData = new FormData();
+                    formData.append('file', allTargetImages[0].file);
+                    const resp = await fetch(
+                        `${serverUrl}/upload-target?session_id=${sessionId}`,
+                        { method: 'POST', body: formData }
+                    );
+                    const body = await resp.json().catch(() => null);
+                    if (!resp.ok) {
+                        setDiagnostics(prev => ({
+                            ...prev,
+                            upload: `Re-upload failed: ${body?.error || resp.status}`
+                        }));
+                        return;
+                    }
+                    setDiagnostics(prev => ({ ...prev, upload: `Re-upload ok: ${body?.message || 'success'}` }));
                 }
-                setDiagnostics(prev => ({ ...prev, upload: `Re-upload ok: ${body?.message || 'success'}` }));
             } catch (err) {
                 setDiagnostics(prev => ({ ...prev, upload: `Re-upload error: ${err.message}` }));
             }
         };
         reupload();
-    }, [targetImage, isStreaming, serverUrl, sessionId]);
+    }, [allTargetImages, isStreaming, serverUrl, sessionId]);
 
     // Display webcam stream in video element
     useEffect(() => {
@@ -281,32 +302,63 @@ function CameraView({ serverUrl, targetImage, isStreaming, setIsStreaming }) {
         }
 
         try {
-            setDiagnostics(prev => ({ ...prev, upload: 'Uploading target image...' }));
-            // Upload target image to server
-            const formData = new FormData();
-            formData.append('file', targetImage.file);
+            // Upload ALL target images for expression matching
+            const imagesToUpload = allTargetImages && allTargetImages.length > 0 ? allTargetImages : [targetImage];
+            
+            if (imagesToUpload.length > 1) {
+                // Multi-image upload for expression matching
+                setDiagnostics(prev => ({ ...prev, upload: `Uploading ${imagesToUpload.length} images for expression matching...` }));
+                const formData = new FormData();
+                imagesToUpload.forEach(img => {
+                    formData.append('files', img.file);
+                });
 
-            const response = await fetch(`${serverUrl}/upload-target?session_id=${sessionId}`, {
-                method: 'POST',
-                body: formData
-            });
+                const response = await fetch(`${serverUrl}/upload-targets?session_id=${sessionId}`, {
+                    method: 'POST',
+                    body: formData
+                });
 
-            const responseBody = await response.json().catch(() => null);
-            if (!response.ok) {
-                const errorMessage = responseBody?.error || 'Failed to upload target image';
+                const responseBody = await response.json().catch(() => null);
+                if (!response.ok) {
+                    const errorMessage = responseBody?.error || 'Failed to upload target images';
+                    setDiagnostics(prev => ({
+                        ...prev,
+                        upload: `Upload failed: ${errorMessage} (HTTP ${response.status})`
+                    }));
+                    throw new Error(errorMessage);
+                }
                 setDiagnostics(prev => ({
                     ...prev,
-                    upload: `Upload failed: ${errorMessage} (HTTP ${response.status})`
+                    upload: `Upload ok: ${responseBody?.message || 'success'} (${responseBody?.faces_stored || '?'} faces)`
                 }));
-                if ((responseBody?.error || '').toLowerCase().includes('no face detected')) {
-                    throw new Error('No face detected. Use a clear frontal target photo (full face, no extreme crop).');
+            } else {
+                // Single image upload
+                setDiagnostics(prev => ({ ...prev, upload: 'Uploading target image...' }));
+                const formData = new FormData();
+                formData.append('file', targetImage.file);
+
+                const response = await fetch(`${serverUrl}/upload-target?session_id=${sessionId}`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const responseBody = await response.json().catch(() => null);
+                if (!response.ok) {
+                    const errorMessage = responseBody?.error || 'Failed to upload target image';
+                    setDiagnostics(prev => ({
+                        ...prev,
+                        upload: `Upload failed: ${errorMessage} (HTTP ${response.status})`
+                    }));
+                    if ((responseBody?.error || '').toLowerCase().includes('no face detected')) {
+                        throw new Error('No face detected. Use a clear frontal target photo (full face, no extreme crop).');
+                    }
+                    throw new Error(errorMessage);
                 }
-                throw new Error(errorMessage);
+                setDiagnostics(prev => ({
+                    ...prev,
+                    upload: `Upload ok: ${responseBody?.message || 'success'}`
+                }));
             }
-            setDiagnostics(prev => ({
-                ...prev,
-                upload: `Upload ok: ${responseBody?.message || 'success'}`
-            }));
 
             // Apply session settings
             setDiagnostics(prev => ({ ...prev, settings: 'Applying session settings...' }));

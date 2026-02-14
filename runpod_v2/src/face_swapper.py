@@ -83,7 +83,7 @@ class FaceSwapper:
         self.face_analyzer.prepare(ctx_id=0, det_size=(640, 640))
         print(f"  Full analyzer: {len(self.face_analyzer.models)} models at 640×640 (for target upload)")
         
-        # ── Step 4b: FAST face analyzer for real-time webcam (256×256, detection only) ──
+        # ── Step 4b: FAST face analyzer for real-time webcam (320×320, detection only) ──
         # KEY INSIGHT: INSwapper.get() only needs bbox + kps (5-point) from detection.
         # Landmark_3d_68 and landmark_2d_106 are NOT used by the swapper — they were
         # only needed for our custom _paste_back (which paste_back=True bypasses).
@@ -94,8 +94,8 @@ class FaceSwapper:
             providers=providers,
             allowed_modules=["detection"]
         )
-        self.face_analyzer_fast.prepare(ctx_id=0, det_size=(256, 256))
-        print(f"  Fast analyzer: {len(self.face_analyzer_fast.models)} models at 256×256 (for real-time)")
+        self.face_analyzer_fast.prepare(ctx_id=0, det_size=(320, 320))
+        print(f"  Fast analyzer: {len(self.face_analyzer_fast.models)} models at 320×320 (for real-time)")
         
         # Verify which provider the models actually use
         for analyzer_name, analyzer in [("full", self.face_analyzer), ("fast", self.face_analyzer_fast)]:
@@ -211,9 +211,37 @@ class FaceSwapper:
         """Get number of active sessions"""
         return len(self.target_faces)
     
+    def set_target_faces(self, session_id: str, images: list) -> dict:
+        """
+        Extract and store multiple target faces from uploaded images.
+        Each image captures a different expression for expression matching.
+        
+        Args:
+            session_id: Unique session identifier
+            images: List of BGR images containing the target face
+            
+        Returns:
+            dict with status and count of successful faces
+        """
+        # Clear previous faces for this session
+        if session_id in self.target_faces:
+            del self.target_faces[session_id]
+        
+        results = []
+        for i, image in enumerate(images):
+            success = self._extract_and_store_target(session_id, image, index=i)
+            results.append(success)
+        
+        success_count = sum(results)
+        if success_count == 0:
+            return {"success": False, "count": 0, "message": "No faces detected in any image"}
+        
+        print(f"  Stored {success_count}/{len(images)} target faces for session {session_id}")
+        return {"success": True, "count": success_count, "total": len(images)}
+
     def set_target_face(self, session_id: str, image: np.ndarray) -> bool:
         """
-        Extract and store the target face from an uploaded image.
+        Extract and store a single target face (appends to multi-face list).
         
         Args:
             session_id: Unique session identifier
@@ -221,6 +249,13 @@ class FaceSwapper:
             
         Returns:
             True if face was successfully extracted and stored
+        """
+        return self._extract_and_store_target(session_id, image, index=None)
+
+    def _extract_and_store_target(self, session_id: str, image: np.ndarray, index: int = None) -> bool:
+        """
+        Internal: Extract and store a target face from an image.
+        Appends to the session's target face list for expression matching.
         """
         height, width = image.shape[:2]
         min_dim = min(height, width)
@@ -306,24 +341,120 @@ class FaceSwapper:
                 break
 
         if len(faces) == 0:
-            print(f"  ❌ No face detected in target image for session {session_id} after all attempts")
+            label = f"image #{index}" if index is not None else "target image"
+            print(f"  ❌ No face detected in {label} for session {session_id} after all attempts")
             return False
         
         # Use the largest face (most prominent)
         target_face = max(faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))
         
-        # Store face data for this session
-        self.target_faces[session_id] = {
+        # Extract expression features for matching:
+        # - pose (yaw/pitch/roll) from bbox geometry
+        # - landmark positions encode mouth open/smile/etc.
+        expression_features = self._extract_expression_features(target_face)
+        
+        face_entry = {
             "face": target_face,
             "embedding": target_face.embedding,
+            "expression_features": expression_features,
+            "index": index,
         }
         
-        print(f"Target face set for session {session_id}")
+        # Initialize or append to the session's face list
+        if session_id not in self.target_faces:
+            self.target_faces[session_id] = []
+        self.target_faces[session_id].append(face_entry)
+        
+        label = f"image #{index}" if index is not None else "target"
+        print(f"  Target face ({label}) stored for session {session_id} (total: {len(self.target_faces[session_id])})")
         return True
     
+    def _extract_expression_features(self, face) -> np.ndarray:
+        """
+        Extract a compact expression feature vector from a face.
+        Uses landmark geometry to capture mouth openness, smile, eye state, and head pose.
+        """
+        features = []
+        
+        # From 5-point kps: eye distance, mouth-to-eye ratio
+        if hasattr(face, 'kps') and face.kps is not None:
+            kps = face.kps
+            # Inter-eye distance (normalization reference)
+            eye_dist = np.linalg.norm(kps[0] - kps[1]) + 1e-6
+            # Nose-to-mouth distance (relative)
+            nose_mouth = np.linalg.norm(kps[2] - np.mean([kps[3], kps[4]], axis=0)) / eye_dist
+            # Mouth width
+            mouth_w = np.linalg.norm(kps[3] - kps[4]) / eye_dist
+            # Face symmetry (nose offset from eye midpoint)
+            eye_mid = (kps[0] + kps[1]) / 2
+            nose_offset = (kps[2][0] - eye_mid[0]) / eye_dist  # yaw proxy
+            nose_v_offset = (kps[2][1] - eye_mid[1]) / eye_dist  # pitch proxy
+            features.extend([nose_mouth, mouth_w, nose_offset, nose_v_offset])
+        
+        # From 68-point landmarks (if available): detailed expression
+        if hasattr(face, 'landmark_3d_68') and face.landmark_3d_68 is not None:
+            lm = face.landmark_3d_68[:, :2]
+            eye_dist = np.linalg.norm(lm[36] - lm[45]) + 1e-6
+            # Mouth openness (vertical)
+            mouth_open = np.linalg.norm(lm[62] - lm[66]) / eye_dist
+            # Mouth width
+            mouth_width = np.linalg.norm(lm[48] - lm[54]) / eye_dist
+            # Smile: corner height relative to center
+            mouth_center_y = (lm[62][1] + lm[66][1]) / 2
+            smile_left = (mouth_center_y - lm[48][1]) / eye_dist
+            smile_right = (mouth_center_y - lm[54][1]) / eye_dist
+            # Eye openness
+            left_eye_open = np.linalg.norm(lm[37] - lm[41]) / eye_dist
+            right_eye_open = np.linalg.norm(lm[43] - lm[47]) / eye_dist
+            # Brow raise
+            left_brow = np.linalg.norm(lm[19] - lm[37]) / eye_dist
+            right_brow = np.linalg.norm(lm[24] - lm[43]) / eye_dist
+            # Jaw angle (head tilt)
+            jaw_angle = np.arctan2(lm[16][1] - lm[0][1], lm[16][0] - lm[0][0])
+            features.extend([
+                mouth_open, mouth_width, smile_left, smile_right,
+                left_eye_open, right_eye_open, left_brow, right_brow, jaw_angle
+            ])
+        
+        return np.array(features, dtype=np.float32) if features else np.zeros(4, dtype=np.float32)
+    
+    def _match_best_target(self, session_id: str, source_face) -> dict:
+        """
+        Match the source face's expression to the best target face from the uploaded set.
+        Returns the target face entry that best matches the current expression.
+        """
+        target_list = self.target_faces.get(session_id, [])
+        if not target_list:
+            return None
+        if len(target_list) == 1:
+            return target_list[0]
+        
+        # Extract expression features from the source (webcam) face
+        source_features = self._extract_expression_features(source_face)
+        
+        # Find the target with the most similar expression
+        best_match = None
+        best_score = float('inf')
+        
+        for entry in target_list:
+            target_features = entry.get("expression_features")
+            if target_features is None:
+                continue
+            # Compare features (use only the overlapping dimensions)
+            min_len = min(len(source_features), len(target_features))
+            if min_len == 0:
+                continue
+            dist = np.linalg.norm(source_features[:min_len] - target_features[:min_len])
+            if dist < best_score:
+                best_score = dist
+                best_match = entry
+        
+        return best_match if best_match else target_list[0]
+    
     def has_target(self, session_id: str) -> bool:
-        """Check if a session has a target face set"""
-        return session_id in self.target_faces
+        """Check if a session has at least one target face set"""
+        targets = self.target_faces.get(session_id, [])
+        return len(targets) > 0
     
     def swap_face(self, session_id: str, frame: np.ndarray) -> np.ndarray:
         """
@@ -340,12 +471,10 @@ class FaceSwapper:
         return result
 
     def swap_face_with_faces(self, session_id: str, frame: np.ndarray):
-        """Swap face and also return detected source faces for downstream processing."""
-        if session_id not in self.target_faces:
+        """Swap face using expression-matched target and return detected faces."""
+        target_list = self.target_faces.get(session_id, [])
+        if not target_list:
             return frame, []
-
-        target_data = self.target_faces[session_id]
-        target_face = target_data["face"]
 
         # Detect faces in the input frame (with fallback for small/low-res faces)
         source_faces = self._detect_faces_with_fallback(frame)
@@ -362,12 +491,17 @@ class FaceSwapper:
         if n_swap == 1:
             # Fast path: just pick the largest face, skip full sort
             best = max(source_faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))
-            result = self._swap_single_face(result, best, target_face, session_id)
+            # Match expression to best target image
+            matched_target = self._match_best_target(session_id, best)
+            if matched_target:
+                result = self._swap_single_face(result, best, matched_target["face"], session_id)
         else:
             # Multi-face: sort by area descending
             source_faces.sort(key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]), reverse=True)
             for source_face in source_faces[:n_swap]:
-                result = self._swap_single_face(result, source_face, target_face, session_id)
+                matched_target = self._match_best_target(session_id, source_face)
+                if matched_target:
+                    result = self._swap_single_face(result, source_face, matched_target["face"], session_id)
 
         # Cache last good result to avoid flashing on face-lost frames
         self._last_result[session_id] = result

@@ -63,6 +63,7 @@ function App() {
                     <CameraView
                         serverUrl={serverUrl}
                         targetImage={targetImages[selectedImageIndex]}
+                        allTargetImages={targetImages}
                         isStreaming={isStreaming}
                         setIsStreaming={setIsStreaming}
                     />

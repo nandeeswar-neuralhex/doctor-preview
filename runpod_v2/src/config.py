@@ -9,7 +9,7 @@ PORT = int(os.getenv("PORT", "8765"))
 
 # Processing settings
 # Processing settings
-JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "50"))  # Lower = smaller = faster encode/decode
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "75"))  # Higher quality AI preview output
 MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", "10"))
 
 # Model paths
@@ -28,7 +28,7 @@ FACE_MASK_BLUR = int(os.getenv("FACE_MASK_BLUR", "25"))
 FACE_MASK_SCALE = float(os.getenv("FACE_MASK_SCALE", "1.1"))
 
 # Optional face enhancement
-ENABLE_GFPGAN = os.getenv("ENABLE_GFPGAN", "false").lower() == "true"
+ENABLE_GFPGAN = os.getenv("ENABLE_GFPGAN", "true").lower() == "true"
 _GFPGAN_PATH_ENV = os.getenv("GFPGAN_MODEL_PATH", "")
 GFPGAN_MODEL_PATH = _GFPGAN_PATH_ENV or os.path.join(MODELS_DIR, "GFPGANv1.4.pth")
 
