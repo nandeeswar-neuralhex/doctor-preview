@@ -428,7 +428,7 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
         while True:
             try:
                 msg = await websocket.receive()
-            except WebSocketDisconnect:
+            except (WebSocketDisconnect, RuntimeError):
                 print(f"WebSocket disconnected: {session_id}")
                 break
 

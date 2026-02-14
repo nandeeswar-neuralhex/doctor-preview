@@ -164,8 +164,16 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     }, [isStreaming, isWsConnected, sendWsFrame]);
 
     // Auto re-upload ALL target images when the user adds/removes images mid-stream
+    // Track previous images to prevent redundant upload on start (when isStreaming flips to true)
+    const prevImagesRef = useRef(allTargetImages);
+
     useEffect(() => {
         if (!isStreaming || !serverUrl || !allTargetImages || allTargetImages.length === 0) return;
+
+        // Skip if images haven't changed since last successful upload (e.g. initial start)
+        // We compare length or reference. For deeper check, we rely on parent to maintain stable references.
+        if (prevImagesRef.current === allTargetImages) return;
+        prevImagesRef.current = allTargetImages;
 
         const reupload = async () => {
             try {
