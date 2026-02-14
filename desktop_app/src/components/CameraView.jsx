@@ -52,8 +52,14 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                     }
                     ctx.drawImage(bitmap, 0, 0);
                     bitmap.close();
+                    if (diagnostics.remoteMedia === null) {
+                        setDiagnostics(prev => ({ ...prev, remoteMedia: 'Receiving frames' }));
+                    }
                 })
-                .catch(() => { });
+                .catch((err) => {
+                    console.error('Canvas paint error:', err);
+                    setDiagnostics(prev => ({ ...prev, remoteMedia: `Paint error: ${err.message}` }));
+                });
         } else if (typeof frameData === 'string') {
             // Legacy text mode: data: URI
             const img = new Image();
@@ -366,7 +372,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         try {
             // Upload ALL target images for expression matching
             const imagesToUpload = allTargetImages && allTargetImages.length > 0 ? allTargetImages : [targetImage];
-            
+
             if (imagesToUpload.length > 1) {
                 // Multi-image upload for expression matching
                 setDiagnostics(prev => ({ ...prev, upload: `Uploading ${imagesToUpload.length} images for expression matching...` }));
@@ -686,9 +692,11 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                 </div>
                 <div>
                     <span className="text-gray-400">Remote media:</span>{' '}
-                    {diagnostics.remoteMedia
-                        ? `video=${diagnostics.remoteMedia.videoTracks}, audio=${diagnostics.remoteMedia.audioTracks}`
-                        : '—'}
+                    {typeof diagnostics.remoteMedia === 'string'
+                        ? diagnostics.remoteMedia
+                        : diagnostics.remoteMedia
+                            ? `video=${diagnostics.remoteMedia.videoTracks}, audio=${diagnostics.remoteMedia.audioTracks}`
+                            : '—'}
                 </div>
             </div>
         </div>

@@ -29,8 +29,8 @@ except Exception:
     print("ℹ️  TurboJPEG not available — using cv2 JPEG codec (install PyTurboJPEG for 3x speedup)")
 
 # Thread pool for CPU-bound frame processing (decode/encode/swap)
-# Size 2: one active + one preparing, prevents thread explosion
-_frame_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="frame")
+# Size 4: enough for concurrent GPU calls + CPU prep
+_frame_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="frame")
 
 # Constants
 HOST = "0.0.0.0"
@@ -342,10 +342,10 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
 
     # Pipelined processing with bounded concurrency:
     # - We receive frames continuously (client sends at 20fps)
-    # - Process up to 3 concurrently (matches thread pool + GPU)
+    # - Process up to 5 concurrently (matches thread pool + GPU)
     # - Drop frames if we fall behind (latest-frame-wins)
     # - This hides the RTT latency: output FPS ≈ server throughput
-    _sem = asyncio.Semaphore(3)  # Max 3 frames in-flight
+    _sem = asyncio.Semaphore(5)  # Max 5 frames in-flight (was 3)
     _latest_frame_id = 0         # Track latest to drop stale frames
 
     async def process_and_respond_binary(raw_data: bytes):

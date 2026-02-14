@@ -101,9 +101,10 @@ const useWebSocket = (serverUrl, sessionId, onFrame) => {
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
         // Check bufferedAmount — if too much is queued, skip this frame
-        // This prevents memory buildup if network is slower than capture rate
-        if (wsRef.current.bufferedAmount > 200_000) {
-            return; // Skip frame, ~200KB already queued
+        // This prevents memory buildup if network is slower than capture rate.
+        // Increased to 1MB to better handle high-latency (RunPod) sessions.
+        if (wsRef.current.bufferedAmount > 1_000_000) {
+            return;
         }
 
         const fid = frameIdRef.current++;
