@@ -1,4 +1,4 @@
-const { app, BrowserWindow } = require('electron');
+const { app, BrowserWindow, globalShortcut } = require('electron');
 const path = require('path');
 
 let mainWindow;
@@ -21,10 +21,19 @@ function createWindow() {
 
     if (isDev) {
         mainWindow.loadURL('http://localhost:3000');
-        mainWindow.webContents.openDevTools();
+        // Don't auto-open DevTools — it crashes on Electron 28 + macOS
+        // Use Cmd+Shift+I or F12 to open manually when needed
     } else {
         mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
     }
+
+    // Open DevTools on demand via keyboard shortcut
+    mainWindow.webContents.on('before-input-event', (event, input) => {
+        if (input.key === 'F12' ||
+            (input.meta && input.shift && input.key.toLowerCase() === 'i')) {
+            mainWindow.webContents.toggleDevTools();
+        }
+    });
 
     mainWindow.on('closed', () => {
         mainWindow = null;

@@ -47,7 +47,12 @@ class LipSyncer:
             self.session = None
 
     def is_ready(self) -> bool:
-        return self.session is not None and librosa is not None
+        if self.session is None:
+            return False
+        if librosa is None:
+            print("LipSyncer: librosa not installed — pip install librosa")
+            return False
+        return True
 
     def audio_to_mel(self, audio_pcm: bytes, sample_rate: int) -> Optional[np.ndarray]:
         """

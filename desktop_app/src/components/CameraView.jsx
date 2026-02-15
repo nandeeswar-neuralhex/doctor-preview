@@ -240,59 +240,73 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         if (!isStreaming || !isWsConnected || !stream) return;
 
         const audioTracks = stream.getAudioTracks();
-        if (audioTracks.length === 0) return;
+        if (audioTracks.length === 0) {
+            console.log('No audio tracks available for lip sync');
+            return;
+        }
 
+        let disposed = false;
         let audioCtx;
         try {
-            // Request 16kHz (Wav2Lip training rate) — Chromium resamples internally
+            // Request 16kHz (Wav2Lip training rate) — browser resamples internally
             audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
         } catch (e) {
-            // Fallback to default sample rate
             audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         }
         audioSampleRateRef.current = audioCtx.sampleRate;
+        audioCtxRef.current = audioCtx;
 
         const audioStream = new MediaStream(audioTracks);
         const source = audioCtx.createMediaStreamSource(audioStream);
-        // 4096 samples per buffer — at 16kHz that's ~256ms per callback
-        const processor = audioCtx.createScriptProcessor(4096, 1, 1);
 
-        // Silence output to prevent mic feedback through speakers
+        // Use LARGE buffer (16384) to minimize main-thread callbacks.
+        // At 16kHz this fires every ~1024ms — much lighter on CPU than 4096 (~256ms).
+        const bufferSize = 16384;
+        const processor = audioCtx.createScriptProcessor(bufferSize, 1, 1);
+
+        // Silence output — prevents mic feedback
         const silencer = audioCtx.createGain();
         silencer.gain.value = 0;
 
         processor.onaudioprocess = (e) => {
+            if (disposed) return;
             const float32 = e.inputBuffer.getChannelData(0);
+            // Convert float32 → int16 in one pass (fast bitwise truncation)
             const int16 = new Int16Array(float32.length);
             for (let i = 0; i < float32.length; i++) {
-                const s = Math.max(-1, Math.min(1, float32[i]));
-                int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                int16[i] = (float32[i] * 0x7FFF) | 0;
             }
             // Circular buffer: keep last ~500ms at 16kHz = 8000 samples
             const maxSamples = 8000;
             const prev = audioBufferRef.current;
-            const combined = new Int16Array(prev.length + int16.length);
-            combined.set(prev);
-            combined.set(int16, prev.length);
-            audioBufferRef.current = combined.length > maxSamples
-                ? combined.slice(combined.length - maxSamples)
-                : combined;
+            if (prev.length === 0) {
+                audioBufferRef.current = int16.length > maxSamples
+                    ? int16.slice(int16.length - maxSamples) : int16;
+            } else {
+                const combined = new Int16Array(prev.length + int16.length);
+                combined.set(prev);
+                combined.set(int16, prev.length);
+                audioBufferRef.current = combined.length > maxSamples
+                    ? combined.slice(combined.length - maxSamples) : combined;
+            }
         };
 
         source.connect(processor);
         processor.connect(silencer);
         silencer.connect(audioCtx.destination);
-        audioCtxRef.current = audioCtx;
+        console.log(`Audio capture started: ${audioCtx.sampleRate}Hz, buffer=${bufferSize}`);
 
         return () => {
-            try { processor.disconnect(); } catch (e) { /* ignore */ }
-            try { source.disconnect(); } catch (e) { /* ignore */ }
-            try { silencer.disconnect(); } catch (e) { /* ignore */ }
-            try { audioCtx.close(); } catch (e) { /* ignore */ }
+            disposed = true;
+            try { processor.disconnect(); } catch (_) {}
+            try { source.disconnect(); } catch (_) {}
+            try { silencer.disconnect(); } catch (_) {}
+            try { audioCtx.close(); } catch (_) {}
             audioCtxRef.current = null;
             audioBufferRef.current = new Int16Array(0);
+            console.log('Audio capture stopped');
         };
-    }, [isStreaming, stream]); // Removed isWsConnected to prevent cleanup on connect
+    }, [isStreaming, isWsConnected, stream]);
 
     // FPS from processed video – count actual decoded frames
     useEffect(() => {
@@ -436,47 +450,42 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                 }));
             }
 
-            // Apply session settings
-            setDiagnostics(prev => ({ ...prev, settings: 'Applying session settings...' }));
-            const settingsResponse = await fetch(`${serverUrl}/session/settings?session_id=${sessionId}`, {
+            // Apply session settings (fire-and-forget, don't block start)
+            fetch(`${serverUrl}/session/settings?session_id=${sessionId}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ enable_lipsync: lipSyncEnabled })
+            }).then(() => {
+                setDiagnostics(prev => ({ ...prev, settings: 'Settings applied' }));
+            }).catch(() => {
+                setDiagnostics(prev => ({ ...prev, settings: 'Settings failed (non-critical)' }));
             });
-            if (!settingsResponse.ok) {
-                const settingsBody = await settingsResponse.json().catch(() => null);
-                const message = settingsBody?.error || 'Failed to apply session settings';
-                setDiagnostics(prev => ({
-                    ...prev,
-                    settings: `Settings failed: ${message} (HTTP ${settingsResponse.status})`
-                }));
-                throw new Error(message);
-            }
-            setDiagnostics(prev => ({ ...prev, settings: 'Settings applied' }));
 
-            // Start webcam and WebSocket
+            // Start webcam
             const mediaStream = await startWebcam();
             if (!mediaStream) {
                 throw new Error('Unable to access webcam/microphone');
             }
-            setDiagnostics(prev => ({ ...prev, webrtc: 'Connecting (offer)...' }));
-            await connect(mediaStream);
-            setDiagnostics(prev => ({ ...prev, webrtc: 'WebRTC connected' }));
+
+            // Connect via WebSocket directly (runpod_v2 doesn't support WebRTC)
+            setDiagnostics(prev => ({ ...prev, webrtc: 'Connecting via WebSocket...' }));
+            connectWs();
             setIsStreaming(true);
         } catch (error) {
-            setDiagnostics(prev => ({ ...prev, webrtc: `WebRTC error: ${error.message}` }));
+            setDiagnostics(prev => ({ ...prev, webrtc: `Connection error: ${error.message}` }));
             alert(`Error: ${error.message}`);
         }
     };
 
     const handleStop = () => {
-        stopWebcam();
-        disconnect();
+        setIsStreaming(false);  // Set first to stop send loops immediately
         disconnectWs();
-        setIsStreaming(false);
+        disconnect();
+        stopWebcam();
         setFps(0);
         setLatency(0);
         audioBufferRef.current = new Int16Array(0);
+        setDiagnostics({ health: null, upload: null, settings: null, webrtc: null, localMedia: null, remoteMedia: null });
     };
 
     const handleHealthCheck = async () => {
