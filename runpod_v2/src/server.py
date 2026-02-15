@@ -29,8 +29,8 @@ except Exception:
     print("ℹ️  TurboJPEG not available — using cv2 JPEG codec (install PyTurboJPEG for 3x speedup)")
 
 # Thread pool for CPU-bound frame processing (decode/encode/swap)
-# Size 4: enough for concurrent GPU calls + CPU prep
-_frame_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="frame")
+# Size 8: RTX 6000 server has 16 vCPU, use more workers to distribute CPU load
+_frame_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="frame")
 
 # Constants
 HOST = "0.0.0.0"

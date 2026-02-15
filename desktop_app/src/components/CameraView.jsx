@@ -138,7 +138,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         // Result: smooth 20 FPS output regardless of network latency.
         let active = true;
         const MAX_WIDTH = 720;       // 720p = high quality for RTX 6000
-        const JPEG_QUALITY = 0.75;   // Higher quality (GPU can handle it)
+        const JPEG_QUALITY = 0.60;   // Lower input quality = faster server decode
         const SEND_FPS = 24;         // Full speed - GPU has headroom
         const INTERVAL = 1000 / SEND_FPS;
 
