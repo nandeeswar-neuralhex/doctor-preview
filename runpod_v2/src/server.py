@@ -345,8 +345,7 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
     # - Process up to 5 concurrently (matches thread pool + GPU)
     # - Drop frames if we fall behind (latest-frame-wins)
     # - This hides the RTT latency: output FPS ≈ server throughput
-    _sem = asyncio.Semaphore(5)  # Max 5 frames in-flight (was 3)
-    _sem = asyncio.Semaphore(5)  # Max 5 frames in-flight (was 3)
+    _sem = asyncio.Semaphore(10)  # Max 10 frames in-flight (RTX 6000 can handle it)
     _latest_frame_id = 0         # Track latest to drop stale frames
     _send_lock = asyncio.Lock()  # Prevent concurrent writes to WebSocket
 
