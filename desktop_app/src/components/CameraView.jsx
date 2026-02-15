@@ -133,13 +133,14 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
 
         // PIPELINED frame sending: send at fixed rate, don't wait for responses.
         // With ~300ms RTT, back-pressure limits us to ~3 FPS.
-        // Pipelining: we send 20 FPS continuously, ~6 frames are "in flight"
-        // at any time, and the server processes them concurrently.
-        // Result: smooth 20 FPS output regardless of network latency.
+        // Pipelining: we send 24 FPS continuously, ~8 frames are "in flight"
+        // at any time, and the pipelined server processes them concurrently.
+        // GPU 0 swaps frame N while GPU 1 lip-syncs frame N-1 in parallel.
+        // Result: smooth 24 FPS output regardless of network latency.
         let active = true;
-        const MAX_WIDTH = 720;       // 720p = high quality for RTX 6000
-        const JPEG_QUALITY = 0.60;   // Lower input quality = faster server decode
-        const SEND_FPS = 24;         // Full speed - GPU has headroom
+        const MAX_WIDTH = 1080;      // 1080p — 2x RTX 5090 GPUs handle it, more detail for face models
+        const JPEG_QUALITY = 0.80;   // Higher quality input → better GPU face detection + swap
+        const SEND_FPS = 24;         // 24 FPS — pipelined multi-GPU server handles it
         const INTERVAL = 1000 / SEND_FPS;
 
         const sendLoop = () => {

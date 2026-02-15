@@ -112,8 +112,8 @@ const useWebSocket = (serverUrl, sessionId, onFrame) => {
 
         // Check bufferedAmount — if too much is queued, skip this frame
         // This prevents memory buildup if network is slower than capture rate.
-        // Increased to 1MB to better handle high-latency (RunPod) sessions.
-        if (wsRef.current.bufferedAmount > 1_000_000) {
+        // 1.5MB to handle pipelined 24fps with high-latency RunPod sessions.
+        if (wsRef.current.bufferedAmount > 1_500_000) {
             return;
         }
 
