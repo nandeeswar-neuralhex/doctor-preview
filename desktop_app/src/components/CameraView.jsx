@@ -292,7 +292,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
             audioCtxRef.current = null;
             audioBufferRef.current = new Int16Array(0);
         };
-    }, [isStreaming, isWsConnected, stream]);
+    }, [isStreaming, stream]); // Removed isWsConnected to prevent cleanup on connect
 
     // FPS from processed video – count actual decoded frames
     useEffect(() => {
