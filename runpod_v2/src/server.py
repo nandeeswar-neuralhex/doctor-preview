@@ -346,7 +346,9 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
     # - Drop frames if we fall behind (latest-frame-wins)
     # - This hides the RTT latency: output FPS ≈ server throughput
     _sem = asyncio.Semaphore(5)  # Max 5 frames in-flight (was 3)
+    _sem = asyncio.Semaphore(5)  # Max 5 frames in-flight (was 3)
     _latest_frame_id = 0         # Track latest to drop stale frames
+    _send_lock = asyncio.Lock()  # Prevent concurrent writes to WebSocket
 
     async def process_and_respond_binary(raw_data: bytes):
         """Process a binary frame (with optional audio) and send result back."""
@@ -388,8 +390,10 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
             last_timing = timing
 
             # Response: [4 bytes frameId] + [8 bytes timestamp] + JPEG
+            # Response: [4 bytes frameId] + [8 bytes timestamp] + JPEG
             try:
-                await websocket.send_bytes(frame_id_bytes + ts_bytes + out_bytes)
+                async with _send_lock:
+                    await websocket.send_bytes(frame_id_bytes + ts_bytes + out_bytes)
             except Exception:
                 pass  # WebSocket may have closed
 
@@ -418,11 +422,13 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
         last_timing = timing
 
         if client_ts is not None:
-            await websocket.send_text(
-                '{"image":"' + result_b64 + '","ts":' + str(client_ts) + '}'
-            )
+            async with _send_lock:
+                await websocket.send_text(
+                    '{"image":"' + result_b64 + '","ts":' + str(client_ts) + '}'
+                )
         else:
-            await websocket.send_text(result_b64)
+            async with _send_lock:
+                await websocket.send_text(result_b64)
 
     try:
         while True:
