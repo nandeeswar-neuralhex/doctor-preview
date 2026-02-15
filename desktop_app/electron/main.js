@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut } = require('electron');
+const { app, BrowserWindow } = require('electron');
 const path = require('path');
 
 let mainWindow;
@@ -10,7 +10,8 @@ function createWindow() {
         webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
-            sandbox: false
+            sandbox: false,
+            webSecurity: false          // Allow cross-origin requests (Vite HMR + RunPod)
         },
         title: 'Doctor Preview - Surgery Preview System',
         backgroundColor: '#1a1a1a'
@@ -20,14 +21,32 @@ function createWindow() {
     const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
 
     if (isDev) {
-        mainWindow.loadURL('http://localhost:3000');
-        // Don't auto-open DevTools — it crashes on Electron 28 + macOS
-        // Use Cmd+Shift+I or F12 to open manually when needed
+        // Wait for Vite to be fully ready before loading
+        const loadDevServer = () => {
+            mainWindow.loadURL('http://localhost:3000').catch(() => {
+                // Retry if Vite isn't ready yet
+                setTimeout(loadDevServer, 1000);
+            });
+        };
+        loadDevServer();
     } else {
         mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
     }
 
-    // Open DevTools on demand via keyboard shortcut
+    // Log renderer crashes and errors to terminal
+    mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDesc) => {
+        console.error(`[Electron] Page failed to load: ${errorCode} ${errorDesc}`);
+    });
+    mainWindow.webContents.on('render-process-gone', (event, details) => {
+        console.error(`[Electron] Renderer crashed:`, details);
+    });
+    mainWindow.webContents.on('console-message', (event, level, message, line, sourceId) => {
+        if (level >= 2) { // warnings and errors
+            console.error(`[Renderer] ${message}`);
+        }
+    });
+
+    // Open DevTools on demand: F12 or Cmd+Shift+I
     mainWindow.webContents.on('before-input-event', (event, input) => {
         if (input.key === 'F12' ||
             (input.meta && input.shift && input.key.toLowerCase() === 'i')) {

@@ -25,11 +25,16 @@ const useWebSocket = (serverUrl, sessionId, onFrame) => {
 
         const wsUrl = serverUrl.replace(/^http/, 'ws').replace(/\/$/, '') + `/ws/${sessionId}`;
 
+        // If already open or connecting, don't create a new socket
         if (wsRef.current) {
-            if (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING) {
+            const state = wsRef.current.readyState;
+            if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) {
+                console.log('WebSocket already connected/connecting, skipping');
                 return;
             }
-            wsRef.current.close();
+            // Clean up dead socket
+            try { wsRef.current.close(); } catch (_) { }
+            wsRef.current = null;
         }
 
         try {
@@ -39,6 +44,11 @@ const useWebSocket = (serverUrl, sessionId, onFrame) => {
             wsRef.current = ws;
 
             ws.onopen = () => {
+                // Verify this is still the active socket (not replaced during handshake)
+                if (wsRef.current !== ws) {
+                    ws.close();
+                    return;
+                }
                 console.log('WebSocket Connected (binary pipeline mode)');
                 setIsConnected(true);
                 setError(null);

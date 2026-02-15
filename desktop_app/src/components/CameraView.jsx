@@ -248,7 +248,6 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         let disposed = false;
         let audioCtx;
         try {
-            // Request 16kHz (Wav2Lip training rate) — browser resamples internally
             audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
         } catch (e) {
             audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -259,48 +258,92 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         const audioStream = new MediaStream(audioTracks);
         const source = audioCtx.createMediaStreamSource(audioStream);
 
-        // Use LARGE buffer (16384) to minimize main-thread callbacks.
-        // At 16kHz this fires every ~1024ms — much lighter on CPU than 4096 (~256ms).
-        const bufferSize = 16384;
-        const processor = audioCtx.createScriptProcessor(bufferSize, 1, 1);
+        // Use AudioWorkletNode (runs off-main-thread, doesn't crash Electron 28).
+        // ScriptProcessorNode causes a renderer SIGSEGV crash in Chromium 120.
+        const setupAudioCapture = async () => {
+            try {
+                // Register an inline AudioWorklet processor via Blob URL
+                const workletCode = `
+                    class PcmCapture extends AudioWorkletProcessor {
+                        process(inputs) {
+                            const input = inputs[0];
+                            if (input && input[0] && input[0].length > 0) {
+                                this.port.postMessage(input[0]);
+                            }
+                            return true;
+                        }
+                    }
+                    registerProcessor('pcm-capture', PcmCapture);
+                `;
+                const blob = new Blob([workletCode], { type: 'application/javascript' });
+                const url = URL.createObjectURL(blob);
+                await audioCtx.audioWorklet.addModule(url);
+                URL.revokeObjectURL(url);
 
-        // Silence output — prevents mic feedback
-        const silencer = audioCtx.createGain();
-        silencer.gain.value = 0;
+                if (disposed) return;
 
-        processor.onaudioprocess = (e) => {
-            if (disposed) return;
-            const float32 = e.inputBuffer.getChannelData(0);
-            // Convert float32 → int16 in one pass (fast bitwise truncation)
-            const int16 = new Int16Array(float32.length);
-            for (let i = 0; i < float32.length; i++) {
-                int16[i] = (float32[i] * 0x7FFF) | 0;
-            }
-            // Circular buffer: keep last ~500ms at 16kHz = 8000 samples
-            const maxSamples = 8000;
-            const prev = audioBufferRef.current;
-            if (prev.length === 0) {
-                audioBufferRef.current = int16.length > maxSamples
-                    ? int16.slice(int16.length - maxSamples) : int16;
-            } else {
-                const combined = new Int16Array(prev.length + int16.length);
-                combined.set(prev);
-                combined.set(int16, prev.length);
-                audioBufferRef.current = combined.length > maxSamples
-                    ? combined.slice(combined.length - maxSamples) : combined;
+                const workletNode = new AudioWorkletNode(audioCtx, 'pcm-capture');
+                workletNode.port.onmessage = (e) => {
+                    if (disposed) return;
+                    const float32 = e.data;
+                    const int16 = new Int16Array(float32.length);
+                    for (let i = 0; i < float32.length; i++) {
+                        int16[i] = (float32[i] * 0x7FFF) | 0;
+                    }
+                    const maxSamples = 8000;
+                    const prev = audioBufferRef.current;
+                    if (prev.length === 0) {
+                        audioBufferRef.current = int16.length > maxSamples
+                            ? int16.slice(int16.length - maxSamples) : int16;
+                    } else {
+                        const combined = new Int16Array(prev.length + int16.length);
+                        combined.set(prev);
+                        combined.set(int16, prev.length);
+                        audioBufferRef.current = combined.length > maxSamples
+                            ? combined.slice(combined.length - maxSamples) : combined;
+                    }
+                };
+
+                source.connect(workletNode);
+                workletNode.connect(audioCtx.destination);
+                console.log(`Audio capture started (AudioWorklet): ${audioCtx.sampleRate}Hz`);
+            } catch (workletErr) {
+                // AudioWorklet not supported — use AnalyserNode polling as safe fallback
+                // (NOT ScriptProcessorNode which crashes Electron 28)
+                console.warn('AudioWorklet failed, using AnalyserNode fallback:', workletErr.message);
+                const analyser = audioCtx.createAnalyser();
+                analyser.fftSize = 2048;
+                source.connect(analyser);
+
+                const captureInterval = setInterval(() => {
+                    if (disposed) return;
+                    const float32 = new Float32Array(analyser.fftSize);
+                    analyser.getFloatTimeDomainData(float32);
+                    const int16 = new Int16Array(float32.length);
+                    for (let i = 0; i < float32.length; i++) {
+                        int16[i] = (float32[i] * 0x7FFF) | 0;
+                    }
+                    const maxSamples = 8000;
+                    const prev = audioBufferRef.current;
+                    const combined = new Int16Array(prev.length + int16.length);
+                    combined.set(prev);
+                    combined.set(int16, prev.length);
+                    audioBufferRef.current = combined.length > maxSamples
+                        ? combined.slice(combined.length - maxSamples) : combined;
+                }, 100); // ~10 captures/sec
+
+                // Store interval for cleanup
+                audioCtx._captureInterval = captureInterval;
+                console.log(`Audio capture started (AnalyserNode fallback): ${audioCtx.sampleRate}Hz`);
             }
         };
 
-        source.connect(processor);
-        processor.connect(silencer);
-        silencer.connect(audioCtx.destination);
-        console.log(`Audio capture started: ${audioCtx.sampleRate}Hz, buffer=${bufferSize}`);
+        setupAudioCapture();
 
         return () => {
             disposed = true;
-            try { processor.disconnect(); } catch (_) {}
+            if (audioCtx._captureInterval) clearInterval(audioCtx._captureInterval);
             try { source.disconnect(); } catch (_) {}
-            try { silencer.disconnect(); } catch (_) {}
             try { audioCtx.close(); } catch (_) {}
             audioCtxRef.current = null;
             audioBufferRef.current = new Int16Array(0);
