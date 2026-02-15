@@ -9,7 +9,7 @@ PORT = int(os.getenv("PORT", "8765"))
 
 # Processing settings
 # Processing settings
-JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "75"))  # Higher quality AI preview output
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "90"))  # Premium quality for RTX 6000
 MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", "10"))
 
 # Model paths
