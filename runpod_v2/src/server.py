@@ -434,8 +434,8 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
         while True:
             try:
                 msg = await websocket.receive()
-            except (WebSocketDisconnect, RuntimeError):
-                print(f"WebSocket disconnected: {session_id}")
+            except (WebSocketDisconnect, RuntimeError) as e:
+                print(f"WebSocket disconnected: {session_id} (Reason: {e})")
                 break
 
             if "bytes" in msg and msg["bytes"]:

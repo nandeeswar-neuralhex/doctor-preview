@@ -5,7 +5,11 @@ function Settings({ serverUrl, setServerUrl }) {
     const [tempUrl, setTempUrl] = useState(serverUrl);
 
     const handleSave = () => {
-        setServerUrl(tempUrl);
+        // Sanitize URL: remove trailing slashes, remove /health, remove /ws
+        let cleanUrl = tempUrl.trim().replace(/\/+$/, '');
+        cleanUrl = cleanUrl.replace(/\/health$/, '');
+        cleanUrl = cleanUrl.replace(/\/ws$/, '');
+        setServerUrl(cleanUrl);
         setIsOpen(false);
     };
 

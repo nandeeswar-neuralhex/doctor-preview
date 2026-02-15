@@ -139,7 +139,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         let active = true;
         const MAX_WIDTH = 480;       // 480px = good quality, fast transfer
         const JPEG_QUALITY = 0.65;   // Balanced quality/speed
-        const SEND_FPS = 20;         // Fixed send rate
+        const SEND_FPS = 15;         // Reduced to 15 FPS for better stability on start
         const INTERVAL = 1000 / SEND_FPS;
 
         const sendLoop = () => {
