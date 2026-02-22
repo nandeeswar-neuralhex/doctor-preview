@@ -515,29 +515,77 @@ class FaceSwapper:
         session_id: str
     ) -> np.ndarray:
         """
-        Swap a single face in the frame.
-        Uses InsightFace's INSwapper.get() which handles emap, alignment, and inference.
+        Swap a single face in the frame using ROI-based blending.
+        
+        Key design:
+        - paste_back=False returns (bgr_fake_128, M) where M maps frame→128px space
+        - M_inv maps 128px swapped face back to full frame (100% accurate, no re-estimation)
+        - SeamlessClone runs only on the face bounding box ROI (~5ms vs ~100ms full-frame)
         """
-        # Smooth kps for temporal stability (reduces jitter between frames)
         if ENABLE_TEMPORAL_SMOOTHING and hasattr(source_face, 'kps') and source_face.kps is not None:
             source_face.kps = self._smooth_landmarks(session_id, source_face.kps)
 
         try:
-            # paste_back=False: GPU does alignment + inference, returns (bgr_fake, matrix).
-            # We then do our own ROI-based paste-back which is 15-20x faster than
-            # insightface's default full-frame seamlessClone.
+            # GPU does face alignment + ONNX inference, returns 128x128 swapped face + matrix M
             res = self.swapper.get(frame, source_face, target_face, paste_back=False)
             if res is None:
                 return frame
-            bgr_fake, M = res
-            return self._paste_back(
-                frame,
-                bgr_fake,
-                source_face.kps,
-                source_face.bbox,
-                source_face=source_face,
-                session_id=session_id
-            )
+            bgr_fake, M = res  # bgr_fake: (128,128,3), M: (2,3) affine frame→128px
+
+            h, w = frame.shape[:2]
+
+            # ── Step 1: Warp 128x128 swapped face back to full frame using M_inv ──
+            # This is the CORRECT approach — avoids any re-estimation error.
+            M_inv = cv2.invertAffineTransform(M)
+            warped = cv2.warpAffine(bgr_fake, M_inv, (w, h), borderMode=cv2.BORDER_REPLICATE)
+
+            # ── Step 2: Create mask by warping a solid 128x128 white image via M_inv ──
+            # This mask perfectly covers exactly the pixels that were swapped — no guessing.
+            aimg_mask = np.ones((128, 128), dtype=np.uint8) * 255
+            full_mask = cv2.warpAffine(aimg_mask, M_inv, (w, h))
+
+            # ── Step 3: Crop face ROI for fast seamlessClone (15-20x speedup) ──
+            bbox = source_face.bbox.astype(int)
+            x1 = max(0, bbox[0]); y1 = max(0, bbox[1])
+            x2 = min(w, bbox[2]); y2 = min(h, bbox[3])
+
+            pad = 30  # Pixels of context around the face for seamlessClone
+            roi_y1 = max(0, y1 - pad); roi_y2 = min(h, y2 + pad)
+            roi_x1 = max(0, x1 - pad); roi_x2 = min(w, x2 + pad)
+            roi_h = roi_y2 - roi_y1; roi_w = roi_x2 - roi_x1
+
+            if roi_h < 10 or roi_w < 10:
+                return frame  # Face too small to process
+
+            roi_frame  = frame[roi_y1:roi_y2, roi_x1:roi_x2].copy()
+            roi_warped = warped[roi_y1:roi_y2, roi_x1:roi_x2].copy()
+            roi_mask   = full_mask[roi_y1:roi_y2, roi_x1:roi_x2].copy()
+
+            # Center of the face within the ROI (for seamlessClone target point)
+            sc_cx = int(np.clip((x1 - roi_x1) + (x2 - x1) // 2, 1, roi_w - 2))
+            sc_cy = int(np.clip((y1 - roi_y1) + (y2 - y1) // 2, 1, roi_h - 2))
+
+            if ENABLE_SEAMLESS_CLONE and roi_mask.sum() > 0:
+                try:
+                    blended_roi = cv2.seamlessClone(
+                        roi_warped, roi_frame, roi_mask,
+                        (sc_cx, sc_cy), cv2.NORMAL_CLONE
+                    )
+                    result = frame.copy()
+                    result[roi_y1:roi_y2, roi_x1:roi_x2] = blended_roi
+                    return result
+                except Exception as e:
+                    print(f"SeamlessClone failed: {e} — using alpha blend fallback")
+
+            # ── Alpha-blend fallback (also ROI-only, very fast) ──
+            blur_k = FACE_MASK_BLUR if FACE_MASK_BLUR % 2 == 1 else FACE_MASK_BLUR + 1
+            blurred_mask = cv2.GaussianBlur(roi_mask, (blur_k, blur_k), 0) if blur_k > 1 else roi_mask
+            alpha = (blurred_mask.astype(np.float32) / 255.0)[..., None]
+            blended_roi = (roi_frame * (1 - alpha) + roi_warped * alpha).astype(np.uint8)
+            result = frame.copy()
+            result[roi_y1:roi_y2, roi_x1:roi_x2] = blended_roi
+            return result
+
         except Exception as e:
             print(f"Swap error: {e}")
             return frame
