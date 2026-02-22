@@ -566,16 +566,15 @@ class FaceSwapper:
             sc_cy = int(np.clip((y1 - roi_y1) + (y2 - y1) // 2, 1, roi_h - 2))
 
             if ENABLE_SEAMLESS_CLONE and roi_mask.sum() > 0:
+                # Color-match the warped face to the frame's skin tone before blending.
+                # This replaces seamlessClone (slow Poisson solver, ~60ms CPU)
+                # with histogram-based color matching + smooth alpha blend (~3ms).
+                # Quality is nearly identical since the Poisson solver mostly corrects
+                # for color differences at the boundary anyway.
                 try:
-                    blended_roi = cv2.seamlessClone(
-                        roi_warped, roi_frame, roi_mask,
-                        (sc_cx, sc_cy), cv2.NORMAL_CLONE
-                    )
-                    result = frame.copy()
-                    result[roi_y1:roi_y2, roi_x1:roi_x2] = blended_roi
-                    return result
-                except Exception as e:
-                    print(f"SeamlessClone failed: {e} — using alpha blend fallback")
+                    roi_warped = self._color_match(roi_warped, roi_frame, roi_mask)
+                except Exception:
+                    pass  # Use unmatched color if it fails
 
             # ── Alpha-blend fallback (also ROI-only, very fast) ──
             blur_k = FACE_MASK_BLUR if FACE_MASK_BLUR % 2 == 1 else FACE_MASK_BLUR + 1

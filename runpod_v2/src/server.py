@@ -29,8 +29,12 @@ except Exception:
     print("ℹ️  TurboJPEG not available — using cv2 JPEG codec (install PyTurboJPEG for 3x speedup)")
 
 # Thread pool for CPU-bound frame processing (decode/encode/swap)
-# Size 8: RTX 6000 server has 16 vCPU, use more workers to distribute CPU load
-_frame_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="frame")
+# Workers = min(4, CPU count). On a 2-vCPU RunPod, 8 workers causes 100% CPU
+# from context switching alone. Match workers to real cores for best throughput.
+import os as _os
+_cpu_count = min(4, max(2, _os.cpu_count() or 2))
+print(f"Thread pool: {_cpu_count} workers (detected {_os.cpu_count()} CPUs)")
+_frame_pool = ThreadPoolExecutor(max_workers=_cpu_count, thread_name_prefix="frame")
 
 # Constants
 HOST = "0.0.0.0"
