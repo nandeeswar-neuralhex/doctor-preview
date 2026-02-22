@@ -515,18 +515,19 @@ class FaceSwapper:
         session_id: str
     ) -> np.ndarray:
         """
-        Swap a single face in the frame using ROI-based blending.
-        
-        Key design:
-        - paste_back=False returns (bgr_fake_128, M) where M maps frame→128px space
-        - M_inv maps 128px swapped face back to full frame (100% accurate, no re-estimation)
-        - SeamlessClone runs only on the face bounding box ROI (~5ms vs ~100ms full-frame)
+        Swap a single face using ROI-direct warping for maximum CPU efficiency.
+
+        Key optimization:
+        - M maps frame→128px, M_inv maps 128px→full frame
+        - Instead of warpAffine over entire 1080p frame (657K pixels), we adjust
+          M_inv's translation to warp DIRECTLY into the face ROI (~300x300 = 90K pixels)
+        - This is a 7x CPU speedup for the paste-back step with identical quality
         """
         if ENABLE_TEMPORAL_SMOOTHING and hasattr(source_face, 'kps') and source_face.kps is not None:
             source_face.kps = self._smooth_landmarks(session_id, source_face.kps)
 
         try:
-            # GPU does face alignment + ONNX inference, returns 128x128 swapped face + matrix M
+            # GPU: face alignment + ONNX inference → 128x128 swapped face + affine matrix M
             res = self.swapper.get(frame, source_face, target_face, paste_back=False)
             if res is None:
                 return frame
@@ -534,53 +535,49 @@ class FaceSwapper:
 
             h, w = frame.shape[:2]
 
-            # ── Step 1: Warp 128x128 swapped face back to full frame using M_inv ──
-            # This is the CORRECT approach — avoids any re-estimation error.
-            M_inv = cv2.invertAffineTransform(M)
-            warped = cv2.warpAffine(bgr_fake, M_inv, (w, h), borderMode=cv2.BORDER_REPLICATE)
-
-            # ── Step 2: Create mask by warping a solid 128x128 white image via M_inv ──
-            # This mask perfectly covers exactly the pixels that were swapped — no guessing.
-            aimg_mask = np.ones((128, 128), dtype=np.uint8) * 255
-            full_mask = cv2.warpAffine(aimg_mask, M_inv, (w, h))
-
-            # ── Step 3: Crop face ROI for fast seamlessClone (15-20x speedup) ──
+            # ── Build face ROI (bounding box + padding) ──
             bbox = source_face.bbox.astype(int)
             x1 = max(0, bbox[0]); y1 = max(0, bbox[1])
             x2 = min(w, bbox[2]); y2 = min(h, bbox[3])
-
-            pad = 30  # Pixels of context around the face for seamlessClone
+            pad = 30
             roi_y1 = max(0, y1 - pad); roi_y2 = min(h, y2 + pad)
             roi_x1 = max(0, x1 - pad); roi_x2 = min(w, x2 + pad)
             roi_h = roi_y2 - roi_y1; roi_w = roi_x2 - roi_x1
-
             if roi_h < 10 or roi_w < 10:
-                return frame  # Face too small to process
+                return frame
 
-            roi_frame  = frame[roi_y1:roi_y2, roi_x1:roi_x2].copy()
-            roi_warped = warped[roi_y1:roi_y2, roi_x1:roi_x2].copy()
-            roi_mask   = full_mask[roi_y1:roi_y2, roi_x1:roi_x2].copy()
+            # ── ROI-direct warp: adjust M_inv translation by ROI origin ──
+            # M_inv maps: 128px → (x, y) in full frame
+            # M_roi_inv maps: 128px → (x - roi_x1, y - roi_y1) in ROI
+            # No full-frame allocation needed — warp directly to ~300x300 ROI.
+            M_inv = cv2.invertAffineTransform(M)
+            M_roi_inv = M_inv.copy()
+            M_roi_inv[0, 2] -= roi_x1   # shift x translation
+            M_roi_inv[1, 2] -= roi_y1   # shift y translation
 
-            # Center of the face within the ROI (for seamlessClone target point)
-            sc_cx = int(np.clip((x1 - roi_x1) + (x2 - x1) // 2, 1, roi_w - 2))
-            sc_cy = int(np.clip((y1 - roi_y1) + (y2 - y1) // 2, 1, roi_h - 2))
+            # Warp 128×128 swapped face → ROI-sized (not 1080p!)
+            roi_warped = cv2.warpAffine(bgr_fake, M_roi_inv, (roi_w, roi_h),
+                                        borderMode=cv2.BORDER_REPLICATE)
 
+            # Warp 128×128 solid mask → ROI-sized (tells us which pixels changed)
+            aimg_mask = np.ones((128, 128), dtype=np.uint8) * 255
+            roi_mask = cv2.warpAffine(aimg_mask, M_roi_inv, (roi_w, roi_h))
+
+            roi_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2].copy()
+
+            # ── Color match (if enabled) for skin-tone correction at boundary ──
             if ENABLE_SEAMLESS_CLONE and roi_mask.sum() > 0:
-                # Color-match the warped face to the frame's skin tone before blending.
-                # This replaces seamlessClone (slow Poisson solver, ~60ms CPU)
-                # with histogram-based color matching + smooth alpha blend (~3ms).
-                # Quality is nearly identical since the Poisson solver mostly corrects
-                # for color differences at the boundary anyway.
                 try:
                     roi_warped = self._color_match(roi_warped, roi_frame, roi_mask)
                 except Exception:
-                    pass  # Use unmatched color if it fails
+                    pass
 
-            # ── Alpha-blend fallback (also ROI-only, very fast) ──
+            # ── Smooth alpha blend on ROI ──
             blur_k = FACE_MASK_BLUR if FACE_MASK_BLUR % 2 == 1 else FACE_MASK_BLUR + 1
             blurred_mask = cv2.GaussianBlur(roi_mask, (blur_k, blur_k), 0) if blur_k > 1 else roi_mask
             alpha = (blurred_mask.astype(np.float32) / 255.0)[..., None]
             blended_roi = (roi_frame * (1 - alpha) + roi_warped * alpha).astype(np.uint8)
+
             result = frame.copy()
             result[roi_y1:roi_y2, roi_x1:roi_x2] = blended_roi
             return result
