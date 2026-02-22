@@ -63,8 +63,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 # 1. Decode payload
                 if "text" in data:
                     payload = data["text"]
-                    
-                    # Desktop app sends: {"image": "base64..."} or {"type": "ping"}
                     if payload.startswith('{'):
                         import json
                         try:
@@ -83,7 +81,23 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                         payload = payload.split(',')[1]
                     img_bytes = base64.b64decode(payload)
                 elif "bytes" in data:
-                    img_bytes = data["bytes"]
+                    # Frontend sends binary struct:
+                    # 4B frameId + 8B timestamp + 4B audioLen + 4B sampleRate = 20-byte header
+                    # Then audio bytes, then JPEG bytes
+                    raw_data = data["bytes"]
+                    if len(raw_data) < 20: 
+                        continue
+                        
+                    import struct
+                    # Read the 4-byte audio length at offset 12
+                    audio_len = struct.unpack_from('<I', raw_data, 12)[0]
+                    
+                    # JPEG starts after 20-byte header + audio_len
+                    jpeg_offset = 20 + audio_len
+                    if jpeg_offset >= len(raw_data):
+                        continue
+                        
+                    img_bytes = raw_data[jpeg_offset:]
                 else:
                     continue
 
