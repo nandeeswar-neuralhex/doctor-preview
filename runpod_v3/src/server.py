@@ -63,6 +63,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 # 1. Decode payload
                 if "text" in data:
                     payload = data["text"]
+                    frame_id = 0
+                    sent_ts = 0.0
                     if payload.startswith('{'):
                         import json
                         try:
@@ -76,27 +78,26 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                                 continue
                         except:
                             pass
-                            
                     if ',' in payload:
                         payload = payload.split(',')[1]
                     img_bytes = base64.b64decode(payload)
                 elif "bytes" in data:
                     # Frontend sends binary struct:
-                    # 4B frameId + 8B timestamp + 4B audioLen + 4B sampleRate = 20-byte header
+                    # 4B frameId + 8B timestamp(float64) + 4B audioLen + 4B sampleRate = 20-byte header
                     # Then audio bytes, then JPEG bytes
                     raw_data = data["bytes"]
                     if len(raw_data) < 20: 
                         continue
                         
                     import struct
-                    # Read the 4-byte audio length at offset 12
-                    audio_len = struct.unpack_from('<I', raw_data, 12)[0]
+                    frame_id = struct.unpack_from('<I', raw_data, 0)[0]   # 4 bytes at offset 0
+                    sent_ts  = struct.unpack_from('<d', raw_data, 4)[0]   # 8 bytes float64 at offset 4
+                    audio_len = struct.unpack_from('<I', raw_data, 12)[0]  # audio len at offset 12
                     
-                    # JPEG starts after 20-byte header + audio_len
+                    # JPEG starts after 20-byte header + audio bytes
                     jpeg_offset = 20 + audio_len
                     if jpeg_offset >= len(raw_data):
                         continue
-                        
                     img_bytes = raw_data[jpeg_offset:]
                 else:
                     continue
@@ -124,9 +125,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     _, buffer = cv2.imencode('.jpg', result, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
                     out_bytes = buffer.tobytes()
 
-                # 5. Send back as raw binary JPEG
+                # 5. Build binary response the client expects:
+                #    4 bytes frameId (uint32 LE) + 8 bytes timestamp (float64 LE) + JPEG bytes
                 t4 = time.time()
-                await websocket.send_bytes(out_bytes)
+                resp = struct.pack('<Id', frame_id, sent_ts) + out_bytes
+                await websocket.send_bytes(resp)
                 t5 = time.time()
 
                 # Logging
