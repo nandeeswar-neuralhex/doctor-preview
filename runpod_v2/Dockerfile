@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx \
     libglib2.0-0 \
     libturbojpeg \
+    libturbojpeg0-dev \
     wget \
     curl \
     && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
@@ -41,6 +42,10 @@ COPY src/ ./src/
 
 # Expose port
 EXPOSE 8765
+
+# Health check for RunPod
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8765/health || exit 1
 
 # Command to run the application
 CMD ["python", "src/server.py"]

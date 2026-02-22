@@ -28,9 +28,12 @@ except Exception:
     _tj = None
     print("ℹ️  TurboJPEG not available — using cv2 JPEG codec (install PyTurboJPEG for 3x speedup)")
 
-# Thread pool for CPU-bound frame processing (decode/encode/swap)
-# Size 8: RTX 6000 server has 16 vCPU, use more workers to distribute CPU load
-_frame_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="frame")
+# ── Thread pools: separate CPU and GPU work for pipelining ──
+# GPU pool: 2 workers — 1 active on GPU, 1 preparing next frame
+# More workers cause GPU contention (ONNX serializes GPU calls internally)
+_gpu_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gpu")
+# CPU pool: JPEG decode/encode — runs in parallel with GPU work
+_cpu_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cpu")
 
 # Constants
 HOST = "0.0.0.0"
@@ -216,107 +219,103 @@ async def webrtc_offer(session_id: str = Query(...)):
         content={"error": "WebRTC disabled in simple mode. Use WebSocket."}
     )
 
-def _process_frame_binary(jpeg_bytes: bytes, audio_pcm: bytes, audio_sr: int,
-                          session_id: str, swapper_ref, lip_syncer_ref):
-    """
-    Process a raw JPEG frame with optional audio for lip sync.
-    Input: raw JPEG bytes + PCM int16 audio
-    Output: raw JPEG bytes
-    Runs in thread pool for concurrency.
-    """
-    t0 = time.time()
+# ── CODEC helpers (CPU-bound, run in _cpu_pool) ──
 
-    # Decode JPEG → BGR
-    if _tj:
-        frame = _tj.decode(jpeg_bytes, pixel_format=TJPF_BGR)
-    else:
+def _decode_jpeg(jpeg_bytes: bytes) -> np.ndarray:
+    """Decode JPEG to BGR numpy array — CPU only. Returns None on failure."""
+    try:
+        if _tj:
+            return _tj.decode(jpeg_bytes, pixel_format=TJPF_BGR)
         nparr = np.frombuffer(jpeg_bytes, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if frame is None:
-        return None, None
+        return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    except Exception:
+        return None
 
-    t1 = time.time()
 
-    # Face swap + get detected faces for lip sync
+def _encode_jpeg(frame: np.ndarray) -> bytes:
+    """Encode BGR numpy array to JPEG bytes — CPU only."""
+    if _tj:
+        return _tj.encode(frame, quality=JPEG_QUALITY)
+    _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    return buf.tobytes()
+
+
+# ── GPU helper (runs in _gpu_pool) ──
+
+def _gpu_swap(frame: np.ndarray, session_id: str, swapper_ref, lip_syncer_ref,
+             audio_pcm: bytes, audio_sr: int):
+    """GPU-bound: face detection + swap + optional lip sync. No JPEG work."""
     source_faces = []
     if swapper_ref and swapper_ref.has_target(session_id):
         result, source_faces = swapper_ref.swap_face_with_faces(session_id, frame)
     else:
         result = frame
 
-    t2 = time.time()
-
-    # Lip sync: apply Wav2Lip mouth correction using audio
-    t_lip = 0
+    # Lip sync (GPU)
     if (lip_syncer_ref and lip_syncer_ref.is_ready()
             and audio_pcm and len(audio_pcm) > 0 and len(source_faces) > 0):
         try:
             mel = lip_syncer_ref.audio_to_mel(audio_pcm, audio_sr)
             if mel is not None:
-                # Use the largest detected face
                 face = max(source_faces,
                            key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
                 bbox = face.bbox.astype(int)
-                x1, y1, x2, y2 = bbox
-                x1, y1 = max(0, x1), max(0, y1)
-                x2 = min(result.shape[1], x2)
-                y2 = min(result.shape[0], y2)
+                x1, y1 = max(0, bbox[0]), max(0, bbox[1])
+                x2 = min(result.shape[1], bbox[2])
+                y2 = min(result.shape[0], bbox[3])
                 if x2 > x1 and y2 > y1:
                     face_crop = result[y1:y2, x1:x2]
                     synced = lip_syncer_ref.infer(face_crop, mel)
                     if synced is not None:
                         result = lip_syncer_ref.apply_mouth_only(
-                            result, (x1, y1, x2, y2), synced
-                        )
-        except Exception as e:
-            pass  # Don't break frame pipeline on lip sync error
-        t_lip = (time.time() - t2) * 1000
+                            result, (x1, y1, x2, y2), synced)
+        except Exception:
+            pass
 
+    return result
+
+
+def _process_frame_binary(jpeg_bytes: bytes, audio_pcm: bytes, audio_sr: int,
+                          session_id: str, swapper_ref, lip_syncer_ref):
+    """
+    Legacy: full pipeline in one call (kept for fallback).
+    """
+    t0 = time.time()
+    frame = _decode_jpeg(jpeg_bytes)
+    if frame is None:
+        return None, None
+    t1 = time.time()
+    result = _gpu_swap(frame, session_id, swapper_ref, lip_syncer_ref, audio_pcm, audio_sr)
+    t2 = time.time()
+    out_bytes = _encode_jpeg(result)
     t3 = time.time()
-
-    # Encode BGR → JPEG
-    if _tj:
-        out_bytes = _tj.encode(result, quality=JPEG_QUALITY)
-    else:
-        _, buffer = cv2.imencode('.jpg', result, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-        out_bytes = buffer.tobytes()
-
-    t4 = time.time()
-
     h, w = result.shape[:2]
     timing = {
         "decode_ms": (t1 - t0) * 1000,
         "swap_ms": (t2 - t1) * 1000,
-        "lipsync_ms": t_lip,
-        "encode_ms": (t4 - t3) * 1000,
-        "total_ms": (t4 - t0) * 1000,
+        "lipsync_ms": 0,
+        "encode_ms": (t3 - t2) * 1000,
+        "total_ms": (t3 - t0) * 1000,
         "w": w, "h": h,
     }
     return out_bytes, timing
 
 
 def _process_frame_text(frame_data: str, session_id: str, swapper_ref):
-    """
-    Legacy text-mode processor for backward compatibility.
-    Handles: base64 decode → cv2 decode → face swap → cv2 encode → base64 encode
-    """
+    """Legacy text-mode processor for backward compatibility."""
     t0 = time.time()
     frame_bytes = base64.b64decode(frame_data)
-    nparr = np.frombuffer(frame_bytes, np.uint8)
-    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    frame = _decode_jpeg(frame_bytes)
     if frame is None:
         return None, None
-
     t1 = time.time()
     if swapper_ref and swapper_ref.has_target(session_id):
         result = swapper_ref.swap_face(session_id, frame)
     else:
         result = frame
-
     t2 = time.time()
-    _, buffer = cv2.imencode('.jpg', result, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-    result_b64 = base64.b64encode(buffer).decode('ascii')
-
+    out_bytes = _encode_jpeg(result)
+    result_b64 = base64.b64encode(out_bytes).decode('ascii')
     t3 = time.time()
     h, w = result.shape[:2]
     timing = {
@@ -337,24 +336,24 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
     import json
     loop = asyncio.get_running_loop()
     frame_count = 0
+    processed_count = 0
+    dropped_count = 0
     last_log_time = time.time()
     last_timing = None
 
-    # Pipelined processing with bounded concurrency:
-    # - We receive frames continuously (client sends at 20fps)
-    # - Process up to 5 concurrently (matches thread pool + GPU)
-    # - Drop frames if we fall behind (latest-frame-wins)
-    # - This hides the RTT latency: output FPS ≈ server throughput
-    _sem = asyncio.Semaphore(10)  # Max 10 frames in-flight (RTX 6000 can handle it)
-    _latest_frame_id = 0         # Track latest to drop stale frames
-    _send_lock = asyncio.Lock()  # Prevent concurrent writes to WebSocket
+    # ── Bounded concurrency: 2 in-flight max ──
+    # Frame N on GPU while Frame N+1 decodes on CPU = true pipeline
+    # If both slots full → drop incoming frame (it's already stale)
+    _sem = asyncio.Semaphore(2)
+    _latest_frame_id = 0
+    _send_lock = asyncio.Lock()
 
-    async def process_and_respond_binary(raw_data: bytes):
-        """Process a binary frame (with optional audio) and send result back."""
-        nonlocal last_timing, _latest_frame_id
-        if len(raw_data) < 21:  # 20-byte header + at least 1 byte JPEG
+    async def process_binary_pipelined(raw_data: bytes):
+        """3-stage pipeline: decode(CPU) → swap(GPU) → encode(CPU) with overlap."""
+        nonlocal last_timing, _latest_frame_id, processed_count, dropped_count
+        if len(raw_data) < 21:
             return
-        # Header: 4B frameId + 8B timestamp + 4B audioLen + 4B sampleRate + audio + JPEG
+
         frame_id_bytes = raw_data[:4]
         ts_bytes = raw_data[4:12]
         audio_len = struct.unpack('<I', raw_data[12:16])[0]
@@ -364,42 +363,55 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
 
         frame_id = struct.unpack('<I', frame_id_bytes)[0]
 
-        # Drop if a newer frame is already queued
+        # Drop stale frames
         if frame_id < _latest_frame_id:
+            dropped_count += 1
             return
         _latest_frame_id = frame_id
 
-        # Bounded concurrency — if all slots full, skip this frame
+        # Drop if pipeline is full (both slots taken)
         if _sem.locked():
+            dropped_count += 1
             return
 
         async with _sem:
-            out_bytes, timing = await loop.run_in_executor(
-                _frame_pool,
-                _process_frame_binary,
-                jpeg_bytes,
-                audio_pcm,
-                audio_sr,
-                session_id,
-                swapper,
-                lip_syncer
-            )
-            if out_bytes is None:
-                return
-            last_timing = timing
+            t0 = time.time()
 
-            # Response: [4 bytes frameId] + [8 bytes timestamp] + JPEG
-            # Response: [4 bytes frameId] + [8 bytes timestamp] + JPEG
+            # Stage 1: JPEG decode on CPU pool (overlaps with previous frame's GPU work)
+            frame = await loop.run_in_executor(_cpu_pool, _decode_jpeg, jpeg_bytes)
+            if frame is None:
+                return
+            t1 = time.time()
+
+            # Stage 2: Face swap + lip sync on GPU pool
+            result = await loop.run_in_executor(
+                _gpu_pool, _gpu_swap,
+                frame, session_id, swapper, lip_syncer, audio_pcm, audio_sr)
+            t2 = time.time()
+
+            # Stage 3: JPEG encode on CPU pool (overlaps with next frame's GPU work)
+            out_bytes = await loop.run_in_executor(_cpu_pool, _encode_jpeg, result)
+            t3 = time.time()
+
+            h, w = result.shape[:2]
+            last_timing = {
+                "decode_ms": (t1 - t0) * 1000,
+                "swap_ms": (t2 - t1) * 1000,
+                "encode_ms": (t3 - t2) * 1000,
+                "total_ms": (t3 - t0) * 1000,
+                "w": w, "h": h,
+            }
+            processed_count += 1
+
             try:
                 async with _send_lock:
                     await websocket.send_bytes(frame_id_bytes + ts_bytes + out_bytes)
             except Exception:
-                pass  # WebSocket may have closed
+                return
 
     async def process_and_respond_text(data: str, client_ts):
         """Process a text/JSON frame and send result back."""
-        nonlocal last_timing
-        # Parse frame data
+        nonlocal last_timing, processed_count
         frame_data = data
         if data[0] == '{':
             try:
@@ -410,7 +422,7 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
                 pass
 
         result_b64, timing = await loop.run_in_executor(
-            _frame_pool,
+            _gpu_pool,
             _process_frame_text,
             frame_data,
             session_id,
@@ -419,15 +431,18 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
         if result_b64 is None:
             return
         last_timing = timing
+        processed_count += 1
 
-        if client_ts is not None:
+        try:
             async with _send_lock:
-                await websocket.send_text(
-                    '{"image":"' + result_b64 + '","ts":' + str(client_ts) + '}'
-                )
-        else:
-            async with _send_lock:
-                await websocket.send_text(result_b64)
+                if client_ts is not None:
+                    await websocket.send_text(
+                        '{"image":"' + result_b64 + '","ts":' + str(client_ts) + '}'
+                    )
+                else:
+                    await websocket.send_text(result_b64)
+        except Exception:
+            return
 
     try:
         while True:
@@ -438,31 +453,30 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
                 break
 
             if "bytes" in msg and msg["bytes"]:
-                # Fire-and-forget: start processing, don't await before receiving next
-                asyncio.ensure_future(process_and_respond_binary(msg["bytes"]))
-
+                asyncio.ensure_future(process_binary_pipelined(msg["bytes"]))
             elif "text" in msg and msg["text"]:
                 asyncio.ensure_future(process_and_respond_text(msg["text"], None))
             else:
                 continue
 
-            # Periodic logging
             frame_count += 1
             now = time.time()
             elapsed = now - last_log_time
             if elapsed >= 3.0:
-                fps_val = frame_count / elapsed
-                print(
-                    f"[{session_id}] FPS: {fps_val:.1f} | "
-                    + (f"decode={last_timing['decode_ms']:.1f}ms "
-                       f"swap={last_timing['swap_ms']:.1f}ms "
-                       f"lip={last_timing.get('lipsync_ms', 0):.1f}ms "
-                       f"encode={last_timing['encode_ms']:.1f}ms "
-                       f"total={last_timing['total_ms']:.1f}ms | "
-                       f"Res: {last_timing['w']}x{last_timing['h']}"
-                       if last_timing else "no timing yet")
-                )
+                fps_in = frame_count / elapsed
+                fps_out = processed_count / elapsed
+                timing_str = (
+                    f"decode={last_timing['decode_ms']:.1f}ms "
+                    f"swap={last_timing['swap_ms']:.1f}ms "
+                    f"encode={last_timing['encode_ms']:.1f}ms "
+                    f"total={last_timing['total_ms']:.1f}ms | "
+                    f"Res: {last_timing['w']}x{last_timing['h']}"
+                ) if last_timing else "no timing yet"
+                print(f"[{session_id}] IN={fps_in:.1f} OUT={fps_out:.1f} FPS | "
+                      f"dropped={dropped_count} | {timing_str}")
                 frame_count = 0
+                processed_count = 0
+                dropped_count = 0
                 last_log_time = now
 
     except Exception as e:

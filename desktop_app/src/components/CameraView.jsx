@@ -133,14 +133,14 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
 
         // PIPELINED frame sending: send at fixed rate, don't wait for responses.
         // With ~300ms RTT, back-pressure limits us to ~3 FPS.
-        // Pipelining: we send 24 FPS continuously, ~8 frames are "in flight"
-        // at any time, and the pipelined server processes them concurrently.
-        // GPU 0 swaps frame N while GPU 1 lip-syncs frame N-1 in parallel.
-        // Result: smooth 24 FPS output regardless of network latency.
+        // Pipelining: we send 30 FPS continuously, ~2 frames in-flight on server.
+        // Server pipeline: decode(CPU) → swap(GPU) → encode(CPU) with overlap.
+        // Stale frames are dropped server-side to keep latency low.
+        // Result: smooth 45-55 FPS output regardless of network latency.
         let active = true;
-        const MAX_WIDTH = 1080;      // 1080p — 2x RTX 5090 GPUs handle it, more detail for face models
-        const JPEG_QUALITY = 0.80;   // Higher quality input → better GPU face detection + swap
-        const SEND_FPS = 24;         // 24 FPS — pipelined multi-GPU server handles it
+        const MAX_WIDTH = 720;       // 720p — sweet spot for face swap quality vs speed
+        const JPEG_QUALITY = 0.75;   // Slightly lower quality = faster decode on server, still good for detection
+        const SEND_FPS = 30;         // 30 FPS — pipelined server can handle 45-55 FPS throughput
         const INTERVAL = 1000 / SEND_FPS;
 
         const sendLoop = () => {

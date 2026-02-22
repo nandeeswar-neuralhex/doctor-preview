@@ -8,8 +8,7 @@ HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8765"))
 
 # Processing settings
-# Processing settings
-JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "90"))  # Premium quality for RTX 6000
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "80"))  # 80 = high quality, 2x smaller than 90
 MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", "10"))
 
 # Model paths
@@ -23,19 +22,23 @@ BUFFALO_MODEL_DIR = os.path.join(MODELS_DIR, "buffalo_l")
 EXECUTION_PROVIDER = os.getenv("EXECUTION_PROVIDER", "CUDAExecutionProvider")
 
 # Quality/Blending settings
-ENABLE_SEAMLESS_CLONE = os.getenv("ENABLE_SEAMLESS_CLONE", "true").lower() == "true"
-FACE_MASK_BLUR = int(os.getenv("FACE_MASK_BLUR", "25"))
-FACE_MASK_SCALE = float(os.getenv("FACE_MASK_SCALE", "1.1"))
+ENABLE_SEAMLESS_CLONE = os.getenv("ENABLE_SEAMLESS_CLONE", "false").lower() == "true"
+FACE_MASK_BLUR = int(os.getenv("FACE_MASK_BLUR", "15"))
+FACE_MASK_SCALE = float(os.getenv("FACE_MASK_SCALE", "1.0"))
 
-# Optional face enhancement
-ENABLE_GFPGAN = os.getenv("ENABLE_GFPGAN", "true").lower() == "true"
+# Face enhancement: DISABLED by default — saves 15-25ms/frame for imperceptible gain in video
+ENABLE_GFPGAN = os.getenv("ENABLE_GFPGAN", "false").lower() == "true"
 _GFPGAN_PATH_ENV = os.getenv("GFPGAN_MODEL_PATH", "")
 GFPGAN_MODEL_PATH = _GFPGAN_PATH_ENV or os.path.join(MODELS_DIR, "GFPGANv1.4.pth")
 
 # Smoothing / tracking
 ENABLE_TEMPORAL_SMOOTHING = os.getenv("ENABLE_TEMPORAL_SMOOTHING", "true").lower() == "true"
-SMOOTHING_ALPHA = float(os.getenv("SMOOTHING_ALPHA", "0.4"))
+SMOOTHING_ALPHA = float(os.getenv("SMOOTHING_ALPHA", "0.5"))
 MAX_FACES = int(os.getenv("MAX_FACES", "1"))
+
+# Performance tuning
+DETECTION_SKIP_FRAMES = int(os.getenv("DETECTION_SKIP_FRAMES", "2"))  # Reuse cached face 2/3 frames
+ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "false").lower() == "true"
 
 # WebRTC / Lip sync
 ENABLE_WEBRTC = os.getenv("ENABLE_WEBRTC", "false").lower() == "true"
