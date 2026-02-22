@@ -39,10 +39,14 @@ async def upload_target(session_id: str):
     print(f"[{session_id}] Received target face upload (ignored in baseline test)")
     return {"success": True, "message": "Dummy upload complete", "count": 1}
 
-@app.websocket("/ws/stream")
-async def websocket_endpoint(websocket: WebSocket):
+@app.post("/session/settings")
+async def update_settings(session_id: str):
+    print(f"[{session_id}] Received settings update (ignored in baseline test)")
+    return {"success": True}
+
+@app.websocket("/ws/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
     await websocket.accept()
-    session_id = f"session-{int(time.time()*1000)}"
     print(f"[{session_id}] Client connected (Baseline Test)")
 
     frame_count = 0
