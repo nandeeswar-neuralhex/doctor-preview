@@ -33,6 +33,12 @@ JPEG_QUALITY = 75
 def health_check():
     return {"status": "ok", "service": "runpod_v3_baseline"}
 
+# Dummy endpoint to satisfy the desktop app's initialization flow
+@app.post("/upload-target")
+async def upload_target(session_id: str):
+    print(f"[{session_id}] Received target face upload (ignored in baseline test)")
+    return {"success": True, "message": "Dummy upload complete", "count": 1}
+
 @app.websocket("/ws/stream")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
