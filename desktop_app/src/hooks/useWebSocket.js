@@ -111,9 +111,9 @@ const useWebSocket = (serverUrl, sessionId, onFrame) => {
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
         // Check bufferedAmount — if too much is queued, skip this frame
-        // This prevents memory buildup if network is slower than capture rate.
-        // 200KB = max 2 frames in flight for stable low latency (vs old 1.5MB = 15 frames)
-        if (wsRef.current.bufferedAmount > 200_000) {
+        // 1MB threshold: allows ~5-6 frames in-flight over high-latency connections
+        // (India→US RunPod = ~300ms RTT; 200KB was too aggressive and starved the pipeline)
+        if (wsRef.current.bufferedAmount > 1_000_000) {
             return;
         }
 
