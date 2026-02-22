@@ -571,8 +571,13 @@ class FaceSwapper:
             roi_warped = cv2.warpAffine(bgr_fake, M_roi_inv, (roi_w, roi_h),
                                         borderMode=cv2.BORDER_REPLICATE)
 
-            # Warp 128×128 solid mask → ROI-sized (tells us which pixels changed)
-            aimg_mask = np.ones((128, 128), dtype=np.uint8) * 255
+            # Warp 128×128 SOFT OVAL mask → ROI-sized
+            # Using a solid square creates a visible box artifact at the edges.
+            # A Gaussian-blurred ellipse warps into a smooth face oval with no hard boundary.
+            aimg_mask = np.zeros((128, 128), dtype=np.float32)
+            cv2.ellipse(aimg_mask, (64, 64), (52, 58), 0, 0, 360, 1.0, -1)
+            aimg_mask = cv2.GaussianBlur(aimg_mask, (31, 31), 0)
+            aimg_mask = (aimg_mask * 255).astype(np.uint8)
             roi_mask = cv2.warpAffine(aimg_mask, M_roi_inv, (roi_w, roi_h))
 
             roi_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2].copy()
