@@ -233,11 +233,19 @@ def _decode_jpeg(jpeg_bytes: bytes) -> np.ndarray:
 
 
 def _encode_jpeg(frame: np.ndarray) -> bytes:
-    """Encode BGR numpy array to JPEG bytes — CPU only."""
-    if _tj:
-        return _tj.encode(frame, quality=JPEG_QUALITY)
-    _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-    return buf.tobytes()
+    """Encode BGR numpy array to JPEG bytes — CPU only. Returns empty bytes on failure."""
+    try:
+        if frame is None or frame.size == 0:
+            return b''
+        # Ensure correct dtype — GPU can occasionally produce float32
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        if _tj:
+            return _tj.encode(frame, quality=JPEG_QUALITY)
+        _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        return buf.tobytes()
+    except Exception:
+        return b''
 
 
 # ── GPU helper (runs in _gpu_pool) ──
@@ -257,9 +265,12 @@ def _gpu_swap(frame: np.ndarray, session_id: str, swapper_ref, lip_syncer_ref,
         try:
             mel = lip_syncer_ref.audio_to_mel(audio_pcm, audio_sr)
             if mel is not None:
+                # Use the largest detected/cached face for bbox
                 face = max(source_faces,
                            key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
-                bbox = face.bbox.astype(int)
+                # Clamp bbox to frame bounds to prevent out-of-bounds crop
+                h_frame, w_frame = result.shape[:2]
+                bbox = np.clip(face.bbox.astype(int), 0, [w_frame, h_frame, w_frame, h_frame])
                 x1, y1 = max(0, bbox[0]), max(0, bbox[1])
                 x2 = min(result.shape[1], bbox[2])
                 y2 = min(result.shape[0], bbox[3])
@@ -392,6 +403,9 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
             # Stage 3: JPEG encode on CPU pool (overlaps with next frame's GPU work)
             out_bytes = await loop.run_in_executor(_cpu_pool, _encode_jpeg, result)
             t3 = time.time()
+
+            if not out_bytes:
+                return  # Encode failed — skip this frame
 
             h, w = result.shape[:2]
             last_timing = {

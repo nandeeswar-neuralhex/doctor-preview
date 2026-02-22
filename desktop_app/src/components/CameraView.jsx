@@ -154,7 +154,12 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
 
                 canvas.toBlob((blob) => {
                     if (!active || !blob) return;
-                    sendWsFrame(blob, audioBufferRef.current, audioSampleRateRef.current);
+                    // Grab audio captured since last frame and CLEAR the buffer.
+                    // Without clearing, every frame sends the same audio → lip sync
+                    // animates the same mouth shape repeatedly instead of tracking speech.
+                    const audioPcm = audioBufferRef.current;
+                    audioBufferRef.current = new Int16Array(0);
+                    sendWsFrame(blob, audioPcm, audioSampleRateRef.current);
                 }, 'image/jpeg', JPEG_QUALITY);
             }
             setTimeout(sendLoop, INTERVAL);
