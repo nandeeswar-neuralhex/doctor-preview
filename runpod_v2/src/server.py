@@ -68,6 +68,17 @@ async def startup_event():
     try:
         swapper = FaceSwapper()
         print("FaceSwapper ready.")
+
+        # GPU Warmup: run a dummy frame through the ONNX pipeline so the CUDA
+        # context is initialized BEFORE the first real user frame arrives.
+        # Without this, the first call takes 300-500ms (cold CUDA context).
+        try:
+            dummy = np.zeros((320, 320, 3), dtype=np.uint8)
+            swapper.face_analyzer_fast.get(dummy)
+            print("✅ GPU warmup complete — CUDA context pre-heated")
+        except Exception as e:
+            print(f"Warmup note: {e}")
+
     except Exception as e:
         print(f"FaceSwapper initialization failed: {e}")
         swapper = None
@@ -358,7 +369,11 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
     # - Process max 2 concurrently to prevent latency buildup
     # - Drop frames aggressively if we fall behind (latest-frame-wins)
     # - This ensures stable low latency (200-400ms) instead of growing queue
-    _sem = asyncio.Semaphore(2)  # Max 2 frames in-flight for stable latency
+    # CRITICAL: Serialize GPU inference — CUDA cannot run 2 ONNX kernels concurrently
+    # from different threads without CUDA MPS. Semaphore(2) caused one thread to be
+    # on GPU (25ms) and the other to stall/fallback to CPU (90ms) — oscillating pattern.
+    # Semaphore(1) = all frames get GPU -> stable 25-30ms swap time.
+    _sem = asyncio.Semaphore(1)  # ONE frame on GPU at a time
     _latest_frame_id = 0         # Track latest to drop stale frames
     _send_lock = asyncio.Lock()  # Prevent concurrent writes to WebSocket
 
