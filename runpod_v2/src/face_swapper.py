@@ -472,12 +472,15 @@ class FaceSwapper:
 
     def swap_face_with_faces(self, session_id: str, frame: np.ndarray):
         """Swap face using expression-matched target and return detected faces."""
+        import time as _t
         target_list = self.target_faces.get(session_id, [])
         if not target_list:
             return frame, []
 
+        _t0 = _t.time()
         # Detect faces in the input frame (with fallback for small/low-res faces)
         source_faces = self._detect_faces_with_fallback(frame)
+        _t1 = _t.time()
 
         if len(source_faces) == 0:
             # Return last good result to avoid flashing raw frame
@@ -488,20 +491,29 @@ class FaceSwapper:
         result = frame
         n_swap = max(1, MAX_FACES)
 
+        _t2 = _t.time()
         if n_swap == 1:
-            # Fast path: just pick the largest face, skip full sort
             best = max(source_faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))
-            # Match expression to best target image
             matched_target = self._match_best_target(session_id, best)
+            _t3 = _t.time()
             if matched_target:
                 result = self._swap_single_face(result, best, matched_target["face"], session_id)
+            _t4 = _t.time()
         else:
-            # Multi-face: sort by area descending
             source_faces.sort(key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]), reverse=True)
+            _t3 = _t.time()
             for source_face in source_faces[:n_swap]:
                 matched_target = self._match_best_target(session_id, source_face)
                 if matched_target:
                     result = self._swap_single_face(result, source_face, matched_target["face"], session_id)
+            _t4 = _t.time()
+
+        # Print per-step breakdown every 60 frames (every ~3 seconds at 20fps)
+        if not hasattr(self, '_dbg_count'):
+            self._dbg_count = {}
+        self._dbg_count[session_id] = self._dbg_count.get(session_id, 0) + 1
+        if self._dbg_count[session_id] % 60 == 0:
+            print(f"  [PROFILE] detect={(_t1-_t0)*1000:.1f}ms  match={(_t3-_t2)*1000:.1f}ms  swap={(_t4-_t3)*1000:.1f}ms  total={(_t4-_t0)*1000:.1f}ms")
 
         # Cache last good result to avoid flashing on face-lost frames
         self._last_result[session_id] = result
