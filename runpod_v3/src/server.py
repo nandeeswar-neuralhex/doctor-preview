@@ -124,11 +124,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     _, buffer = cv2.imencode('.jpg', result, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
                     out_bytes = buffer.tobytes()
 
-                # 5. Send back
+                # 5. Send back as raw binary JPEG
                 t4 = time.time()
-                b64_out = base64.b64encode(out_bytes).decode('utf-8')
-                out_payload = f"data:image/jpeg;base64,{b64_out}"
-                await websocket.send_text(out_payload)
+                await websocket.send_bytes(out_bytes)
                 t5 = time.time()
 
                 # Logging
