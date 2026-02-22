@@ -60,8 +60,25 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             try:
                 # 1. Decode payload
+                # 1. Decode payload
                 if "text" in data:
                     payload = data["text"]
+                    
+                    # Desktop app sends: {"image": "base64..."} or {"type": "ping"}
+                    if payload.startswith('{'):
+                        import json
+                        try:
+                            msg = json.loads(payload)
+                            if "image" in msg:
+                                payload = msg["image"]
+                            elif msg.get("type") == "ping":
+                                await websocket.send_text('{"type":"pong"}')
+                                continue
+                            else:
+                                continue
+                        except:
+                            pass
+                            
                     if ',' in payload:
                         payload = payload.split(',')[1]
                     img_bytes = base64.b64decode(payload)
