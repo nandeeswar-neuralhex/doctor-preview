@@ -5,7 +5,7 @@ import Settings from './components/Settings';
 import Login from './components/Login';
 
 function App() {
-    const [serverUrl, setServerUrl] = useState('https://u4ln48a51ahjsh-8765.proxy.runpod.net');
+    const [serverUrl, setServerUrl] = useState('http://20.115.36.199:8765');
     const [targetImages, setTargetImages] = useState([]);
     const [selectedImageIndex, setSelectedImageIndex] = useState(0);
     const [isStreaming, setIsStreaming] = useState(false);

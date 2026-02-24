@@ -1,5 +1,6 @@
-const { app, BrowserWindow } = require('electron');
+const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
+const { exec } = require('child_process');
 
 let mainWindow;
 
@@ -11,9 +12,10 @@ function createWindow() {
             nodeIntegration: false,
             contextIsolation: true,
             sandbox: false,
-            webSecurity: false          // Allow cross-origin requests (Vite HMR + RunPod)
+            webSecurity: false,          // Allow cross-origin requests (Vite HMR + RunPod)
+            preload: path.join(__dirname, 'preload.js')
         },
-        title: 'Doctor Preview - Surgery Preview System',
+        title: 'Doctor Preview',
         backgroundColor: '#1a1a1a'
     });
 
@@ -71,4 +73,34 @@ app.on('activate', () => {
     if (mainWindow === null) {
         createWindow();
     }
+});
+
+ipcMain.handle('install-virtual-mic', async () => {
+    return new Promise((resolve) => {
+        if (process.platform !== 'darwin') {
+            resolve({ success: false, error: 'Only supported on macOS currently.' });
+            return;
+        }
+
+        console.log('[Electron] Installing BlackHole via Homebrew...');
+
+        // Use Homebrew to install BlackHole - handles macOS compatibility automatically
+        const brewPath = '/opt/homebrew/bin/brew';
+        exec(brewPath + ' install blackhole-2ch', { timeout: 120000 }, (error, stdout, stderr) => {
+            if (error) {
+                console.error('[Electron] Homebrew install failed:', error.message);
+                console.error('[Electron] stderr:', stderr);
+                // Check if already installed
+                if (stderr && stderr.includes('already installed')) {
+                    console.log('[Electron] BlackHole is already installed!');
+                    resolve({ success: true, alreadyInstalled: true });
+                    return;
+                }
+                resolve({ success: false, error: error.message });
+                return;
+            }
+            console.log('[Electron] Homebrew install stdout:', stdout);
+            resolve({ success: true });
+        });
+    });
 });

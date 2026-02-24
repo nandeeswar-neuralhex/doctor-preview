@@ -17,6 +17,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     const [latency, setLatency] = useState(0);
     const [sessionId] = useState(() => `session-${Date.now()}`);
     const [lipSyncEnabled, setLipSyncEnabled] = useState(true);
+    const [audioDelayMs, setAudioDelayMs] = useState(300);
     const [diagnostics, setDiagnostics] = useState({
         health: null,
         upload: null,
@@ -32,7 +33,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     };
 
     // Custom hooks for webcam and WebSocket
-    const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true);
+    const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true, audioDelayMs);
     // WebSocket hook – render into the dedicated <img> ref
     const handleWsFrame = useCallback((frameData, wsLatency, isBinary) => {
         // Direct canvas painting: decode blob → drawImage → done.
@@ -344,8 +345,8 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         return () => {
             disposed = true;
             if (audioCtx._captureInterval) clearInterval(audioCtx._captureInterval);
-            try { source.disconnect(); } catch (_) {}
-            try { audioCtx.close(); } catch (_) {}
+            try { source.disconnect(); } catch (_) { }
+            try { audioCtx.close(); } catch (_) { }
             audioCtxRef.current = null;
             audioBufferRef.current = new Int16Array(0);
             console.log('Audio capture stopped');
@@ -597,6 +598,19 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                         />
                         Lip Sync
                     </label>
+                    <div className="flex items-center gap-2 text-sm text-gray-300">
+                        <span className="whitespace-nowrap">Audio Delay:</span>
+                        <input
+                            type="range"
+                            min="0"
+                            max="1000"
+                            step="50"
+                            value={audioDelayMs}
+                            onChange={(e) => setAudioDelayMs(Number(e.target.value))}
+                            className="w-24 accent-blue-500"
+                        />
+                        <span className="font-mono text-blue-400 font-semibold w-14 text-right">{audioDelayMs}ms</span>
+                    </div>
                     <button
                         onClick={handleHealthCheck}
                         className="px-3 py-2 text-xs bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors"

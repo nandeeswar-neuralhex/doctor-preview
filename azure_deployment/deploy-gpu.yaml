@@ -1,0 +1,39 @@
+apiVersion: 2021-09-01
+name: doctor-preview-gpu-instance
+location: eastus
+properties:
+  containers:
+    - name: doctor-preview-gpu
+      properties:
+        image: doctorpreviewacr.azurecr.io/doctor-preview-gpu:latest
+        resources:
+          requests:
+            cpu: 4
+            memoryInGb: 28
+            gpu:
+              count: 1
+              sku: V100
+        ports:
+          - port: 8765
+            protocol: TCP
+        environmentVariables:
+          - name: EXECUTION_PROVIDER
+            value: CUDAExecutionProvider
+          - name: PORT
+            value: "8765"
+          - name: ENABLE_WEBRTC
+            value: "true"
+          - name: ENABLE_LIPSYNC
+            value: "true"
+  imageRegistryCredentials:
+    - server: doctorpreviewacr.azurecr.io
+      username: doctorpreviewacr
+      password: "7AYMKBwuNEZ1s0MRfhTMLlqObHZUwizMv7vW7uJ9bhYAW5VYLkoOJQQJ99CBACYeBjFEqg7NAAACACRZXQJO"
+  ipAddress:
+    type: Public
+    dnsNameLabel: doctor-preview-svc
+    ports:
+      - port: 8765
+        protocol: TCP
+  osType: Linux
+  sku: Standard

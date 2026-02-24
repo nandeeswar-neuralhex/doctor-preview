@@ -14,13 +14,24 @@
     "build": {
         "appId": "com.doctorpreview.app",
         "productName": "Doctor Preview",
+        "icon": "assets/plastic.png",
         "files": [
             "dist/**/*",
             "electron/**/*"
         ],
         "mac": {
             "target": "dmg",
-            "category": "public.app-category.medical"
+            "identity": null,
+            "category": "public.app-category.medical",
+            "extraResources": [
+                {
+                    "from": "assets/BlackHole2ch.pkg",
+                    "to": "assets/BlackHole2ch.pkg",
+                    "filter": [
+                        "**/*"
+                    ]
+                }
+            ]
         },
         "win": {
             "target": "nsis"
