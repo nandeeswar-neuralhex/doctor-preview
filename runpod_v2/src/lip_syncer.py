@@ -39,7 +39,11 @@ class LipSyncer:
             return
 
         try:
-            self.session = ort.InferenceSession(WAV2LIP_MODEL_PATH, providers=providers)
+            sess_opts = ort.SessionOptions()
+            sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            sess_opts.intra_op_num_threads = 2   # Limit CPU threads to avoid starving event loop
+            sess_opts.inter_op_num_threads = 1
+            self.session = ort.InferenceSession(WAV2LIP_MODEL_PATH, sess_options=sess_opts, providers=providers)
             self.input_names = [i.name for i in self.session.get_inputs()]
             print(f"LipSyncer loaded model: {WAV2LIP_MODEL_PATH}")
         except Exception as e:

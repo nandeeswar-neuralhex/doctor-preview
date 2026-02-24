@@ -67,5 +67,12 @@ def download_models():
         GFPGAN_MODEL_PATH
     )
 
+    # 3. Wav2Lip GAN (Lip Sync) — 96x96 ONNX from FaceFusion assets
+    download_file(
+        "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/wav2lip_gan_96.onnx",
+        WAV2LIP_MODEL_PATH,
+        min_size_mb=1
+    )
+
 if __name__ == "__main__":
     download_models()
