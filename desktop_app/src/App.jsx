@@ -1,26 +1,53 @@
 import React, { useState } from 'react';
+import { useAuth, useClerk } from '@clerk/clerk-react';
 import ImageUpload from './components/ImageUpload';
 import CameraView from './components/CameraView';
-import Settings from './components/Settings';
 import Login from './components/Login';
 
 function App() {
-    const [serverUrl, setServerUrl] = useState('http://20.115.36.199:8765');
+    const { isSignedIn, isLoaded } = useAuth();
+    const { signOut } = useClerk();
+    // Server URL is now hidden from user - loaded from environment variable
+    const serverUrl = import.meta.env.VITE_SERVER_URL || 'http://20.115.36.199:8765';
+    
+    // Function to mask URL - shows only last 2 digits of IP
+    const getMaskedUrl = (url) => {
+        if (!url) return '...';
+        // Extract last 2 digits from IP (e.g., 20.115.36.199 -> ...99)
+        const ipMatch = url.match(/(\d+\.\d+\.\d+\.(\d{2,3}))/);
+        if (ipMatch) {
+            const lastDigits = ipMatch[2].slice(-2);
+            return `...${lastDigits}`;
+        }
+        return '...';
+    };
     const [targetImages, setTargetImages] = useState([]);
     const [selectedImageIndex, setSelectedImageIndex] = useState(0);
     const [isStreaming, setIsStreaming] = useState(false);
-    const [isLoggedIn, setIsLoggedIn] = useState(false);
 
     const handleLogin = () => {
-        setIsLoggedIn(true);
+        // This is handled by Clerk now, but kept for compatibility
+        console.log('Login successful');
     };
 
-    const handleLogout = () => {
-        setIsLoggedIn(false);
-        // Optional: clear any other state if needed
+    const handleLogout = async () => {
+        console.log('Logging out...');
+        await signOut();
     };
 
-    if (!isLoggedIn) {
+    // Show loading state while Clerk is initializing
+    if (!isLoaded) {
+        return (
+            <div className="h-screen flex items-center justify-center bg-gray-900 text-white">
+                <div className="text-center">
+                    <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-white mx-auto mb-4"></div>
+                    <p>Loading...</p>
+                </div>
+            </div>
+        );
+    }
+
+    if (!isSignedIn) {
         return <Login onLogin={handleLogin} />;
     }
 
@@ -34,7 +61,6 @@ function App() {
                         <p className="text-sm text-gray-400">Real-time Surgery Preview System</p>
                     </div>
                     <div className="flex items-center gap-4">
-                        <Settings serverUrl={serverUrl} setServerUrl={setServerUrl} />
                         <button
                             onClick={handleLogout}
                             className="text-sm text-gray-400 hover:text-white transition-colors border border-gray-600 px-3 py-1 rounded hover:bg-gray-700"
@@ -77,7 +103,7 @@ function App() {
                         {serverUrl ? (
                             <span className="flex items-center gap-2">
                                 <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
-                                Connected to {serverUrl}
+                                Connected to Server {getMaskedUrl(serverUrl)}
                             </span>
                         ) : (
                             <span className="flex items-center gap-2">

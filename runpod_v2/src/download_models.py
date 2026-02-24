@@ -1,7 +1,7 @@
 
 import os
 import subprocess
-from config import INSWAPPER_MODEL, GFPGAN_MODEL_PATH
+from config import INSWAPPER_MODEL, GFPGAN_MODEL_PATH, WAV2LIP_MODEL_PATH
 
 import hashlib
 

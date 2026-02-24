@@ -40,7 +40,7 @@ MAX_FACES = int(os.getenv("MAX_FACES", "1"))
 # WebRTC / Lip sync
 ENABLE_WEBRTC = os.getenv("ENABLE_WEBRTC", "false").lower() == "true"
 ENABLE_LIPSYNC = os.getenv("ENABLE_LIPSYNC", "true").lower() == "true"
-WAV2LIP_MODEL_PATH = os.getenv("WAV2LIP_MODEL_PATH", os.path.join(MODELS_DIR, "wav2lip.onnx"))
+WAV2LIP_MODEL_PATH = os.getenv("WAV2LIP_MODEL_PATH", os.path.join(MODELS_DIR, "wav2lip_gan_96.onnx"))
 LIPSYNC_AUDIO_WINDOW_MS = int(os.getenv("LIPSYNC_AUDIO_WINDOW_MS", "500"))
 
 # Frame processing

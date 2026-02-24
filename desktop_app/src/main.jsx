@@ -1,7 +1,14 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
+import { ClerkProvider } from '@clerk/clerk-react';
 import App from './App';
 import './index.css';
+
+const PUBLISHABLE_KEY = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY;
+
+if (!PUBLISHABLE_KEY) {
+    throw new Error('Missing Clerk Publishable Key. Add VITE_CLERK_PUBLISHABLE_KEY to .env');
+}
 
 // Error boundary to catch React crashes and show them instead of blank screen
 class ErrorBoundary extends React.Component {
@@ -36,6 +43,8 @@ class ErrorBoundary extends React.Component {
 
 ReactDOM.createRoot(document.getElementById('root')).render(
     <ErrorBoundary>
-        <App />
+        <ClerkProvider publishableKey={PUBLISHABLE_KEY}>
+            <App />
+        </ClerkProvider>
     </ErrorBoundary>
 );

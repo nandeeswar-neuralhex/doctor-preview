@@ -28,6 +28,20 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     });
     const [fullScreenView, setFullScreenView] = useState(null); // 'original' | 'processed' | null
 
+    // Function to mask MJPEG URL - shows only last 2 digits of IP and session timestamp
+    const getMaskedMjpegUrl = (url) => {
+        if (!url) return '...';
+        // Extract last 2 digits from IP and show only last 6 digits of session ID
+        const ipMatch = url.match(/(\d+)\.(\d+)\.(\d+)\.(\d{2,3})/);
+        const sessionMatch = url.match(/session-(\d+)/);
+        if (ipMatch && sessionMatch) {
+            const lastDigits = ipMatch[4].slice(-2);
+            const sessionDigits = sessionMatch[1].slice(-6);
+            return `...${lastDigits}/mjpeg/...${sessionDigits}`;
+        }
+        return '...';
+    };
+
     const toggleFullScreen = (view) => {
         setFullScreenView(prev => prev === view ? null : view);
     };
@@ -645,12 +659,12 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
             <div className="mb-4 grid grid-cols-2 gap-4 text-sm">
                 <div className="bg-gray-800 border border-gray-700 rounded-lg p-3">
                     <div className="text-gray-400">Session ID</div>
-                    <div className="text-white font-mono break-all">{sessionId}</div>
+                    <div className="text-white font-mono break-all">...{sessionId.slice(-6)}</div>
                 </div>
                 <div className="bg-gray-800 border border-gray-700 rounded-lg p-3">
                     <div className="text-gray-400">MJPEG URL (Virtual Camera)</div>
                     <div className="text-white font-mono break-all">
-                        {serverUrl ? `${serverUrl}/mjpeg/${sessionId}` : 'Set server URL'}
+                        {serverUrl ? getMaskedMjpegUrl(`${serverUrl}/mjpeg/${sessionId}`) : '...'}
                     </div>
                 </div>
             </div>

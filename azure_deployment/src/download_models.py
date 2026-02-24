@@ -1,7 +1,7 @@
 
 import os
 import subprocess
-from config import INSWAPPER_MODEL, GFPGAN_MODEL_PATH
+from config import INSWAPPER_MODEL, GFPGAN_MODEL_PATH, WAV2LIP_MODEL_PATH
 
 import hashlib
 
@@ -65,6 +65,13 @@ def download_models():
     download_file(
         "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth",
         GFPGAN_MODEL_PATH
+    )
+
+    # 3. Wav2Lip GAN (Lip Sync) — 96x96 ONNX from FaceFusion assets
+    download_file(
+        "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/wav2lip_gan_96.onnx",
+        WAV2LIP_MODEL_PATH,
+        min_size_mb=1
     )
 
 if __name__ == "__main__":
