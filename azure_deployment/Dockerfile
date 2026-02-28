@@ -1,9 +1,10 @@
 # ===================================================================
-# AZURE GPU DEPLOYMENT - CUDA 12.1 + cuDNN 8
+# AZURE GPU DEPLOYMENT - CUDA 12.6 + cuDNN 9
 # Optimized for Azure NC-series (T4, V100, A100) GPUs
 # ===================================================================
 # Use DEVEL image (includes g++ compiler needed for insightface C extensions)
-FROM nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04
+# cuDNN 9 required by onnxruntime-gpu 1.20.1 (libcudnn_adv.so.9)
+FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
 
 ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive

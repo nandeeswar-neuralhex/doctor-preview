@@ -12,7 +12,7 @@ properties:
             memoryInGb: 28
             gpu:
               count: 1
-              sku: V100
+              sku: K80
         ports:
           - port: 8765
             protocol: TCP
@@ -28,7 +28,7 @@ properties:
   imageRegistryCredentials:
     - server: doctorpreviewacr.azurecr.io
       username: doctorpreviewacr
-      password: "7AYMKBwuNEZ1s0MRfhTMLlqObHZUwizMv7vW7uJ9bhYAW5VYLkoOJQQJ99CBACYeBjFEqg7NAAACACRZXQJO"
+      password: "7AYMKBwuNEZ1s0MRfhTMLlqObHZUwizMv7vW7uJ9bhYAW5VYLkoOJQQJ99CBACYeBjFEqg7NAAACAZCRXQJO"
   ipAddress:
     type: Public
     dnsNameLabel: doctor-preview-svc
