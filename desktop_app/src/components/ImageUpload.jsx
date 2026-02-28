@@ -24,13 +24,6 @@ function ImageUpload({ targetImages, setTargetImages, selectedImageIndex, setSel
         });
     };
 
-    const removeImage = (index) => {
-        setTargetImages(prev => prev.filter((_, i) => i !== index));
-        if (selectedImageIndex >= targetImages.length - 1) {
-            setSelectedImageIndex(Math.max(0, targetImages.length - 2));
-        }
-    };
-
     return (
         <div className="space-y-4">
             <div>
@@ -87,7 +80,7 @@ function ImageUpload({ targetImages, setTargetImages, selectedImageIndex, setSel
                     <div
                         key={index}
                         onClick={() => setSelectedImageIndex(index)}
-                        className={`relative group cursor-pointer rounded-lg overflow-hidden border-2 transition-all ${selectedImageIndex === index
+                        className={`relative cursor-pointer rounded-lg overflow-hidden border-2 transition-all ${selectedImageIndex === index
                             ? 'border-blue-500 ring-2 ring-blue-500/50'
                             : 'border-gray-700 hover:border-gray-600'
                             }`}
@@ -97,21 +90,6 @@ function ImageUpload({ targetImages, setTargetImages, selectedImageIndex, setSel
                             alt={img.name}
                             className="w-full h-32 object-cover"
                         />
-
-                        {/* Overlay */}
-                        <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                            <button
-                                onClick={(e) => {
-                                    e.stopPropagation();
-                                    removeImage(index);
-                                }}
-                                className="p-2 bg-red-600 hover:bg-red-700 rounded-full"
-                            >
-                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                                </svg>
-                            </button>
-                        </div>
 
                         {/* Selected Badge */}
                         {selectedImageIndex === index && (

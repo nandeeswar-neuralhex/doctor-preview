@@ -49,10 +49,16 @@ function createWindow() {
     });
 
     // Open DevTools on demand: F12 or Cmd+Shift+I
+    // Intercept Cmd+R / Cmd+Shift+R to log out instead of reloading
     mainWindow.webContents.on('before-input-event', (event, input) => {
         if (input.key === 'F12' ||
             (input.meta && input.shift && input.key.toLowerCase() === 'i')) {
             mainWindow.webContents.toggleDevTools();
+        }
+        // Cmd+R or Cmd+Shift+R → trigger logout instead of page refresh
+        if (input.meta && (input.key.toLowerCase() === 'r') && input.type === 'keyDown') {
+            event.preventDefault();
+            mainWindow.webContents.send('trigger-logout');
         }
     });
 

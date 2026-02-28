@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useAuth, useClerk } from '@clerk/clerk-react';
 import ImageUpload from './components/ImageUpload';
 import CameraView from './components/CameraView';
@@ -34,6 +34,22 @@ function App() {
         console.log('Logging out...');
         await signOut();
     };
+
+    // Cmd+R / Cmd+Shift+R triggers logout instead of refresh
+    useEffect(() => {
+        const handler = () => {
+            console.log('Refresh intercepted — logging out...');
+            handleLogout();
+        };
+        if (window.electronAPI?.onTriggerLogout) {
+            window.electronAPI.onTriggerLogout(handler);
+        }
+        return () => {
+            if (window.electronAPI?.removeTriggerLogout) {
+                window.electronAPI.removeTriggerLogout(handler);
+            }
+        };
+    }, []);
 
     // Show loading state while Clerk is initializing
     if (!isLoaded) {

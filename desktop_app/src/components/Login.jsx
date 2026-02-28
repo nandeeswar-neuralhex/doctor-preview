@@ -54,7 +54,7 @@ function Login({ onLogin }) {
 
             console.log('✅ OTP sent successfully via Clerk');
             setOtpSent(true);
-            setSuccessMessage(`OTP has been sent to ${HARDCODED_EMAIL}`);
+            setSuccessMessage('OTP has been sent.');
             
         } catch (err) {
             console.error('❌ SEND OTP ERROR:', err);
@@ -150,27 +150,14 @@ function Login({ onLogin }) {
 
                 <form onSubmit={handleSubmit} className="space-y-6">
                     <div>
-                        <label htmlFor="email" className="block text-sm font-medium text-gray-400 mb-2">
-                            Email Address
-                        </label>
-                        <div className="flex gap-2">
-                            <input
-                                type="email"
-                                id="email"
-                                className="flex-1 px-4 py-3 bg-gray-600 border border-gray-600 rounded-lg text-gray-300 cursor-not-allowed"
-                                value={HARDCODED_EMAIL}
-                                readOnly
-                                disabled
-                            />
-                            <button
-                                type="button"
-                                onClick={handleSendOtp}
-                                disabled={!isLoaded || otpSent}
-                                className="px-6 py-3 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-bold rounded-lg transition duration-200 whitespace-nowrap"
-                            >
-                                {otpSent ? 'OTP Sent' : 'Send OTP'}
-                            </button>
-                        </div>
+                        <button
+                            type="button"
+                            onClick={handleSendOtp}
+                            disabled={!isLoaded || otpSent}
+                            className="w-full px-6 py-3 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-bold rounded-lg transition duration-200"
+                        >
+                            {otpSent ? 'OTP Sent ✓' : 'Send OTP'}
+                        </button>
                     </div>
 
                     <div>
