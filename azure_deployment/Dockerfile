@@ -57,6 +57,15 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 # Step 5: Pin numpy back to 1.x after all installs (avoid binary compat issues)
 RUN pip3 install --no-cache-dir "numpy>=1.24,<2.0"
 
+# Step 6: Create torchvision compatibility shim (functional_tensor removed in 0.20+, needed by GFPGAN/basicsr)
+RUN python3 -c "\
+import os, torchvision; \
+p = os.path.join(os.path.dirname(torchvision.__file__), 'transforms', 'functional_tensor.py'); \
+exists = os.path.exists(p); \
+print(f'functional_tensor exists: {exists}'); \
+open(p, 'w').write('from torchvision.transforms.functional import *\n') if not exists else None; \
+print('Shim created' if not exists else 'Already exists')"
+
 # Copy application source
 COPY src/ ./src/
 
