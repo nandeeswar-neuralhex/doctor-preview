@@ -55,11 +55,7 @@ function createWindow() {
             (input.meta && input.shift && input.key.toLowerCase() === 'i')) {
             mainWindow.webContents.toggleDevTools();
         }
-        // Cmd+R or Cmd+Shift+R → trigger logout instead of page refresh
-        if (input.meta && (input.key.toLowerCase() === 'r') && input.type === 'keyDown') {
-            event.preventDefault();
-            mainWindow.webContents.send('trigger-logout');
-        }
+        // Dev branch: allow normal Cmd+R refresh (logout-on-refresh disabled)
     });
 
     mainWindow.on('closed', () => {
@@ -83,30 +79,63 @@ app.on('activate', () => {
 
 ipcMain.handle('install-virtual-mic', async () => {
     return new Promise((resolve) => {
-        if (process.platform !== 'darwin') {
-            resolve({ success: false, error: 'Only supported on macOS currently.' });
-            return;
-        }
+        const platform = process.platform;
 
-        console.log('[Electron] Installing BlackHole via Homebrew...');
+        if (platform === 'darwin') {
+            // macOS: Install BlackHole via Homebrew
+            console.log('[Electron] Installing BlackHole via Homebrew...');
+            const brewPaths = ['/opt/homebrew/bin/brew', '/usr/local/bin/brew'];
+            const brewPath = brewPaths.find(p => {
+                try { require('fs').accessSync(p); return true; } catch { return false; }
+            }) || 'brew';
 
-        // Use Homebrew to install BlackHole - handles macOS compatibility automatically
-        const brewPath = '/opt/homebrew/bin/brew';
-        exec(brewPath + ' install blackhole-2ch', { timeout: 120000 }, (error, stdout, stderr) => {
-            if (error) {
-                console.error('[Electron] Homebrew install failed:', error.message);
-                console.error('[Electron] stderr:', stderr);
-                // Check if already installed
-                if (stderr && stderr.includes('already installed')) {
-                    console.log('[Electron] BlackHole is already installed!');
-                    resolve({ success: true, alreadyInstalled: true });
+            exec(brewPath + ' install blackhole-2ch', { timeout: 120000 }, (error, stdout, stderr) => {
+                if (error) {
+                    console.error('[Electron] Homebrew install failed:', error.message);
+                    if (stderr && stderr.includes('already installed')) {
+                        console.log('[Electron] BlackHole is already installed!');
+                        resolve({ success: true, alreadyInstalled: true });
+                        return;
+                    }
+                    resolve({ success: false, error: error.message });
                     return;
                 }
-                resolve({ success: false, error: error.message });
-                return;
-            }
-            console.log('[Electron] Homebrew install stdout:', stdout);
-            resolve({ success: true });
-        });
+                console.log('[Electron] Homebrew install stdout:', stdout);
+                resolve({ success: true });
+            });
+
+        } else if (platform === 'win32') {
+            // Windows: Check if VB-Audio Virtual Cable is installed, guide user if not
+            console.log('[Electron] Checking for VB-Audio Virtual Cable on Windows...');
+            exec('reg query "HKLM\\SOFTWARE\\VB-Audio" /s', { timeout: 10000 }, (error) => {
+                if (error) {
+                    // VB-Audio not found in registry — guide user to install
+                    console.log('[Electron] VB-Audio not found. Opening download page...');
+                    const { shell } = require('electron');
+                    shell.openExternal('https://vb-audio.com/Cable/');
+                    resolve({
+                        success: false,
+                        error: 'VB-Audio Virtual Cable not detected. Download page opened — install it and restart the app.',
+                        downloadUrl: 'https://vb-audio.com/Cable/'
+                    });
+                } else {
+                    console.log('[Electron] VB-Audio Virtual Cable is installed!');
+                    resolve({ success: true, alreadyInstalled: true });
+                }
+            });
+
+        } else {
+            // Linux: Create a PulseAudio null sink
+            console.log('[Electron] Setting up PulseAudio null sink on Linux...');
+            exec('pactl load-module module-null-sink sink_name=DoctorPreview sink_properties=device.description=DoctorPreview', { timeout: 10000 }, (error, stdout) => {
+                if (error) {
+                    console.error('[Electron] PulseAudio setup failed:', error.message);
+                    resolve({ success: false, error: `PulseAudio error: ${error.message}` });
+                    return;
+                }
+                console.log('[Electron] PulseAudio null sink created:', stdout);
+                resolve({ success: true });
+            });
+        }
     });
 });

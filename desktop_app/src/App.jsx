@@ -35,21 +35,7 @@ function App() {
         await signOut();
     };
 
-    // Cmd+R / Cmd+Shift+R triggers logout instead of refresh
-    useEffect(() => {
-        const handler = () => {
-            console.log('Refresh intercepted — logging out...');
-            handleLogout();
-        };
-        if (window.electronAPI?.onTriggerLogout) {
-            window.electronAPI.onTriggerLogout(handler);
-        }
-        return () => {
-            if (window.electronAPI?.removeTriggerLogout) {
-                window.electronAPI.removeTriggerLogout(handler);
-            }
-        };
-    }, []);
+    // Dev branch: logout-on-refresh disabled for easier development
 
     // Show loading state while Clerk is initializing
     if (!isLoaded) {

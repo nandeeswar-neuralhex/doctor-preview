@@ -280,8 +280,13 @@ def _process_frame_binary(jpeg_bytes: bytes, audio_pcm: bytes, audio_sr: int,
                     face_crop = result[y1:y2, x1:x2]
                     synced = lip_syncer_ref.infer(face_crop, mel)
                     if synced is not None:
+                        # Pass 68-point landmarks for precise mouth masking
+                        face_lm68 = None
+                        if hasattr(face, 'landmark_3d_68') and face.landmark_3d_68 is not None:
+                            face_lm68 = face.landmark_3d_68[:, :2].astype(np.float32)
                         result = lip_syncer_ref.apply_mouth_only(
-                            result, (x1, y1, x2, y2), synced
+                            result, (x1, y1, x2, y2), synced,
+                            landmarks_68=face_lm68
                         )
         except Exception as e:
             pass  # Don't break frame pipeline on lip sync error
@@ -296,7 +301,7 @@ def _process_frame_binary(jpeg_bytes: bytes, audio_pcm: bytes, audio_sr: int,
     out_h, out_w = result.shape[:2]
     if out_w > MAX_OUTPUT_WIDTH:
         scale = MAX_OUTPUT_WIDTH / out_w
-        result = cv2.resize(result, (MAX_OUTPUT_WIDTH, int(out_h * scale)), interpolation=cv2.INTER_LINEAR)
+        result = cv2.resize(result, (MAX_OUTPUT_WIDTH, int(out_h * scale)), interpolation=cv2.INTER_AREA)
 
     # Encode BGR → JPEG
     if _tj:

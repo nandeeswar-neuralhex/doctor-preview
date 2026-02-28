@@ -83,16 +83,15 @@ class FaceSwapper:
         self.face_analyzer.prepare(ctx_id=0, det_size=(640, 640))
         print(f"  Full analyzer: {len(self.face_analyzer.models)} models at 640×640 (for target upload)")
         
-        # ── Step 4b: FAST face analyzer for real-time webcam (320×320, detection only) ──
-        # KEY INSIGHT: INSwapper.get() only needs bbox + kps (5-point) from detection.
-        # Landmark_3d_68 and landmark_2d_106 are NOT used by the swapper — they were
-        # only needed for our custom _paste_back (which paste_back=True bypasses).
-        # Dropping them saves ~10-15ms CPU per frame.
+        # ── Step 4b: FAST face analyzer for real-time webcam (320×320) ──
+        # Detection + landmark_3d_68: detection gives bbox+kps for INSwapper,
+        # landmark_3d_68 enables contour-based masking and better expression matching.
+        # Cost: ~5ms extra per face, but dramatically improves blending quality.
         self.face_analyzer_fast = FaceAnalysis(
             name="buffalo_l",
             root=MODELS_DIR,
             providers=providers,
-            allowed_modules=["detection"]
+            allowed_modules=["detection", "landmark_3d_68"]
         )
         self.face_analyzer_fast.prepare(ctx_id=0, det_size=(320, 320))
         print(f"  Fast analyzer: {len(self.face_analyzer_fast.models)} models at 320×320 (for real-time)")
@@ -545,6 +544,19 @@ class FaceSwapper:
                 return frame
             bgr_fake, M = res  # bgr_fake: (128,128,3), M: (2,3) affine frame→128px
 
+            # ── GFPGAN face enhancement on aligned 128x128 ──
+            # Restores skin texture, pores, and fine detail lost by INSwapper's
+            # low-resolution (128px) output. ~8-12ms on GPU.
+            if self.enhancer is not None:
+                try:
+                    _, _, enhanced = self.enhancer.enhance(
+                        bgr_fake, has_aligned=True, only_center_face=True, paste_back=True
+                    )
+                    if enhanced is not None:
+                        bgr_fake = enhanced
+                except Exception:
+                    pass
+
             h, w = frame.shape[:2]
 
             # ── Build face ROI (bounding box + padding) ──
@@ -559,30 +571,62 @@ class FaceSwapper:
                 return frame
 
             # ── ROI-direct warp: adjust M_inv translation by ROI origin ──
-            # M_inv maps: 128px → (x, y) in full frame
-            # M_roi_inv maps: 128px → (x - roi_x1, y - roi_y1) in ROI
-            # No full-frame allocation needed — warp directly to ~300x300 ROI.
             M_inv = cv2.invertAffineTransform(M)
             M_roi_inv = M_inv.copy()
-            M_roi_inv[0, 2] -= roi_x1   # shift x translation
-            M_roi_inv[1, 2] -= roi_y1   # shift y translation
+            M_roi_inv[0, 2] -= roi_x1
+            M_roi_inv[1, 2] -= roi_y1
 
-            # Warp 128×128 swapped face → ROI-sized (not 1080p!)
+            # Warp 128×128 swapped face → ROI-sized
             roi_warped = cv2.warpAffine(bgr_fake, M_roi_inv, (roi_w, roi_h),
                                         borderMode=cv2.BORDER_REPLICATE)
 
-            # Warp 128×128 SOFT OVAL mask → ROI-sized
-            # Using a solid square creates a visible box artifact at the edges.
-            # A Gaussian-blurred ellipse warps into a smooth face oval with no hard boundary.
-            aimg_mask = np.zeros((128, 128), dtype=np.float32)
-            cv2.ellipse(aimg_mask, (64, 64), (52, 58), 0, 0, 360, 1.0, -1)
-            aimg_mask = cv2.GaussianBlur(aimg_mask, (31, 31), 0)
-            aimg_mask = (aimg_mask * 255).astype(np.uint8)
-            roi_mask = cv2.warpAffine(aimg_mask, M_roi_inv, (roi_w, roi_h))
+            # ── Unsharp mask: restore sharpness lost during warp interpolation ──
+            usm_blur = cv2.GaussianBlur(roi_warped, (0, 0), 1.5)
+            roi_warped = cv2.addWeighted(roi_warped, 1.3, usm_blur, -0.3, 0)
+
+            # ── Build face mask: landmark contour or fallback oval ──
+            lm68 = None
+            if hasattr(source_face, 'landmark_3d_68') and source_face.landmark_3d_68 is not None:
+                lm68 = source_face.landmark_3d_68[:, :2].astype(np.float32)
+                if ENABLE_TEMPORAL_SMOOTHING:
+                    lm68 = self._smooth_landmarks_68(session_id, lm68)
+
+            roi_mask = None
+            if lm68 is not None:
+                try:
+                    jaw = lm68[0:17]
+                    left_brow = lm68[17:22]
+                    right_brow = lm68[22:27]
+                    brow_y = (left_brow[:, 1].mean() + right_brow[:, 1].mean()) / 2.0
+                    jaw_y = jaw[:, 1].max()
+                    forehead_shift = (jaw_y - brow_y) * 0.65
+                    brow_pts = np.vstack([left_brow[::-1], right_brow[::-1]])
+                    forehead = brow_pts.copy()
+                    forehead[:, 1] -= forehead_shift
+                    contour = np.vstack([jaw, forehead])
+                    # Shift to ROI coordinates
+                    contour_roi = contour.copy()
+                    contour_roi[:, 0] -= roi_x1
+                    contour_roi[:, 1] -= roi_y1
+                    hull = cv2.convexHull(contour_roi.astype(np.int32))
+                    roi_mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
+                    cv2.fillConvexPoly(roi_mask, hull, 255)
+                    if roi_mask.sum() < 100:
+                        roi_mask = None  # trigger oval fallback
+                except Exception:
+                    roi_mask = None
+
+            if roi_mask is None:
+                # Fallback: soft oval mask warped from 128×128
+                aimg_mask = np.zeros((128, 128), dtype=np.float32)
+                cv2.ellipse(aimg_mask, (64, 64), (52, 58), 0, 0, 360, 1.0, -1)
+                aimg_mask = cv2.GaussianBlur(aimg_mask, (31, 31), 0)
+                aimg_mask = (aimg_mask * 255).astype(np.uint8)
+                roi_mask = cv2.warpAffine(aimg_mask, M_roi_inv, (roi_w, roi_h))
 
             roi_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2].copy()
 
-            # ── Color match (if enabled) for skin-tone correction at boundary ──
+            # ── Color match with eroded sampling for cleaner skin-tone transfer ──
             if ENABLE_SEAMLESS_CLONE and roi_mask.sum() > 0:
                 try:
                     roi_warped = self._color_match(roi_warped, roi_frame, roi_mask)
@@ -635,7 +679,15 @@ class FaceSwapper:
                     bbox = (f.bbox * inv_scale).astype(np.float32)
                     kps = (f.kps * inv_scale).astype(np.float32)
                     det_score = getattr(f, 'det_score', 0.9)
-                    mapped.append(SimpleNamespace(bbox=bbox, kps=kps, det_score=det_score))
+                    ns = SimpleNamespace(bbox=bbox, kps=kps, det_score=det_score)
+                    # Scale 68-point landmarks if available (for contour masking)
+                    if hasattr(f, 'landmark_3d_68') and f.landmark_3d_68 is not None:
+                        lm68 = f.landmark_3d_68.copy()
+                        lm68[:, :2] *= inv_scale
+                        ns.landmark_3d_68 = lm68
+                    else:
+                        ns.landmark_3d_68 = None
+                    mapped.append(ns)
                 except Exception:
                     continue
             return mapped
@@ -854,16 +906,24 @@ class FaceSwapper:
         return smoothed
 
     def _color_match(self, source: np.ndarray, target: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Histogram-based color matching in LAB space for ~95% accurate color transfer.
+        """Histogram-based color matching in LAB space with improved skin-tone accuracy.
         
-        Uses per-channel CDF lookup tables instead of simple mean/std.
-        This preserves the full tonal range and handles non-Gaussian
-        color distributions (shadows, highlights) much better.
+        Improvements over basic CDF matching:
+        - Eroded sampling mask excludes boundary pixels (hair/background contamination)
+        - Partial-strength application (75%) prevents over-correction artifacts
+        - Preserves natural skin tone variation while matching overall tone
         """
         try:
             if mask is None or mask.sum() < 10:
                 return source
-            mask_bool = mask > 0
+
+            # Erode mask to sample only interior face pixels (exclude hair/bg at boundary)
+            erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+            sample_mask = cv2.erode(mask, erode_kernel)
+            if sample_mask.sum() < 10:
+                sample_mask = mask  # fallback if erosion removed everything
+            sample_bool = sample_mask > 0
+            apply_bool = mask > 0
 
             # Work in LAB uint8 (all channels 0-255 in OpenCV)
             src_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB)
@@ -871,8 +931,9 @@ class FaceSwapper:
             matched = src_lab.copy()
 
             for c in range(3):
-                src_ch = src_lab[..., c][mask_bool].ravel()
-                tgt_ch = tgt_lab[..., c][mask_bool].ravel()
+                # Sample from eroded interior only (cleaner histograms)
+                src_ch = src_lab[..., c][sample_bool].ravel()
+                tgt_ch = tgt_lab[..., c][sample_bool].ravel()
                 if len(src_ch) == 0 or len(tgt_ch) == 0:
                     continue
 
@@ -884,12 +945,17 @@ class FaceSwapper:
                 tgt_cdf = np.cumsum(tgt_hist)
                 tgt_cdf /= tgt_cdf[-1] if tgt_cdf[-1] > 0 else 1
 
-                # Build 256-entry LUT: for each source level, find target level with closest CDF
+                # Build 256-entry LUT
                 lut = np.searchsorted(tgt_cdf, src_cdf).clip(0, 255).astype(np.uint8)
 
-                # Apply LUT only within the mask
+                # Apply at 75% strength to prevent over-correction
+                # Preserves natural skin tone variation while matching overall tone
                 channel = matched[..., c].copy()
-                channel[mask_bool] = lut[src_lab[..., c][mask_bool]]
+                original = src_lab[..., c][apply_bool]
+                corrected = lut[original]
+                channel[apply_bool] = np.round(
+                    0.75 * corrected.astype(np.float32) + 0.25 * original.astype(np.float32)
+                ).clip(0, 255).astype(np.uint8)
                 matched[..., c] = channel
 
             return cv2.cvtColor(matched, cv2.COLOR_LAB2BGR)

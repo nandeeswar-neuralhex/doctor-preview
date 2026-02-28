@@ -1,6 +1,15 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 
-function useWebcam(withAudio = false, audioDelayMs = 300) {
+/**
+ * Adaptive webcam capture hook.
+ *
+ * Key improvements:
+ * - Accepts captureWidth/captureHeight from hardware profile (no hardcoded 1280x720)
+ * - Cross-platform virtual audio: detects BlackHole (macOS), VB-Audio (Windows),
+ *   PulseAudio null sinks (Linux), and gracefully degrades if none found
+ * - Audio delay node for lip-sync compensation
+ */
+function useWebcam(withAudio = false, audioDelayMs = 300, captureWidth = 1280, captureHeight = 720) {
     const [stream, setStream] = useState(null);
     const [error, setError] = useState(null);
     const virtualAudioRef = useRef(null);
@@ -17,38 +26,57 @@ function useWebcam(withAudio = false, audioDelayMs = 300) {
 
     const startWebcam = useCallback(async () => {
         try {
+            // Adaptive capture: request resolution matching hardware tier
+            // cheap webcams that only do 480p won't be forced to upscale
             const mediaStream = await navigator.mediaDevices.getUserMedia({
                 video: {
-                    width: { ideal: 1280 },
-                    height: { ideal: 720 },
+                    width: { ideal: captureWidth, max: 1920 },
+                    height: { ideal: captureHeight, max: 1080 },
+                    frameRate: { ideal: 30, max: 30 },
                     facingMode: 'user'
                 },
                 audio: withAudio
             });
 
+            // Log actual capture resolution
+            const vTrack = mediaStream.getVideoTracks()[0];
+            if (vTrack) {
+                const settings = vTrack.getSettings();
+                console.log(`[Webcam] Capturing at ${settings.width}x${settings.height} @ ${settings.frameRate}fps`);
+            }
+
             if (withAudio) {
-                // Enumerate all devices and log them for debugging
                 const devices = await navigator.mediaDevices.enumerateDevices();
                 console.log('[VirtualMic] All audio devices:');
                 devices.filter(d => d.kind.startsWith('audio')).forEach(d => {
                     console.log(`  [${d.kind}] ${d.label} (${d.deviceId})`);
                 });
 
-                // Look for BlackHole as an audio OUTPUT (for setSinkId routing)
-                const virtualOutput = devices.find(device =>
-                    device.kind === 'audiooutput' &&
-                    (device.label.toLowerCase().includes('vb-audio') || device.label.toLowerCase().includes('blackhole'))
-                );
+                // Cross-platform virtual audio output detection
+                const virtualOutput = devices.find(device => {
+                    if (device.kind !== 'audiooutput') return false;
+                    const label = device.label.toLowerCase();
+                    return (
+                        label.includes('blackhole') ||        // macOS
+                        label.includes('vb-audio') ||         // Windows (VB-Cable)
+                        label.includes('cable input') ||      // Windows (VB-Cable alternative name)
+                        label.includes('virtual') ||          // Generic virtual audio devices
+                        label.includes('null output') ||      // Linux PulseAudio
+                        label.includes('loopback')            // Various loopback drivers
+                    );
+                });
 
                 if (!virtualOutput) {
-                    console.warn('[VirtualMic] BlackHole/VB-Audio not found as audiooutput. Audio delay for lip-sync will not be active.');
+                    console.warn('[VirtualMic] No virtual audio output found. Audio delay inactive.');
+                    console.warn('  macOS: Install BlackHole (brew install blackhole-2ch)');
+                    console.warn('  Windows: Install VB-Audio Virtual Cable (https://vb-audio.com/Cable/)');
                 } else {
-                    // Set up Web Audio API to delay the mic
+                    // Set up Web Audio API to delay the mic for lip-sync
                     const audioCtx = new AudioContext();
                     audioCtxRef.current = audioCtx;
                     const source = audioCtx.createMediaStreamSource(mediaStream);
 
-                    const delayNode = audioCtx.createDelay(2.0); // max delay 2s
+                    const delayNode = audioCtx.createDelay(2.0);
                     delayNode.delayTime.value = audioDelayMs / 1000;
                     delayNodeRef.current = delayNode;
 
@@ -57,7 +85,6 @@ function useWebcam(withAudio = false, audioDelayMs = 300) {
                     source.connect(delayNode);
                     delayNode.connect(destination);
 
-                    // Create hidden audio element to pipe the delayed stream to the Virtual Mic
                     const audioEl = new Audio();
                     audioEl.srcObject = destination.stream;
                     audioEl.muted = true;
@@ -86,7 +113,7 @@ function useWebcam(withAudio = false, audioDelayMs = 300) {
             console.error('Webcam error:', err);
             return null;
         }
-    }, [withAudio, audioDelayMs]);
+    }, [withAudio, audioDelayMs, captureWidth, captureHeight]);
 
     const stopWebcam = useCallback(() => {
         if (stream) {

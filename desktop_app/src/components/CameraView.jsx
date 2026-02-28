@@ -2,6 +2,8 @@ import React, { useRef, useEffect, useState, useCallback } from 'react';
 import useWebcam from '../hooks/useWebcam';
 import useWebRTC from '../hooks/useWebRTC';
 import useWebSocket from '../hooks/useWebSocket';
+import { getHardwareProfile, getCachedProfile } from '../hooks/useHardwareProfile';
+import { FrameEncoder } from '../hooks/FrameEncoder';
 
 function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setIsStreaming }) {
     const originalVideoRef = useRef(null);
@@ -12,21 +14,43 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     const audioCtxRef = useRef(null);
     const audioBufferRef = useRef(new Int16Array(0));
     const audioSampleRateRef = useRef(16000);
+    const frameEncoderRef = useRef(null); // Off-main-thread JPEG encoder
 
     const [fps, setFps] = useState(0);
     const [latency, setLatency] = useState(0);
     const [sessionId] = useState(() => `session-${Date.now()}`);
     const [lipSyncEnabled, setLipSyncEnabled] = useState(true);
     const [audioDelayMs, setAudioDelayMs] = useState(300);
+    const [hwProfile, setHwProfile] = useState(null); // Hardware detection result
     const [diagnostics, setDiagnostics] = useState({
         health: null,
         upload: null,
         settings: null,
         webrtc: null,
         localMedia: null,
-        remoteMedia: null
+        remoteMedia: null,
+        hardware: null
     });
     const [fullScreenView, setFullScreenView] = useState(null); // 'original' | 'processed' | null
+
+    // ── Run hardware detection on mount ──
+    useEffect(() => {
+        getHardwareProfile().then(profile => {
+            setHwProfile(profile);
+            setDiagnostics(prev => ({
+                ...prev,
+                hardware: `${profile.tier.toUpperCase()} — ${profile.cores} cores, ${profile.memory}GB RAM, encode=${profile.encodeMsAvg}ms`
+            }));
+        });
+        // Initialize frame encoder
+        frameEncoderRef.current = new FrameEncoder();
+        return () => {
+            if (frameEncoderRef.current) {
+                frameEncoderRef.current.dispose();
+                frameEncoderRef.current = null;
+            }
+        };
+    }, []);
 
     // Function to mask MJPEG URL - shows only last 2 digits of IP and session timestamp
     const getMaskedMjpegUrl = (url) => {
@@ -46,8 +70,10 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         setFullScreenView(prev => prev === view ? null : view);
     };
 
-    // Custom hooks for webcam and WebSocket
-    const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true, audioDelayMs);
+    // Custom hooks for webcam and WebSocket — adaptive capture resolution
+    const captureW = hwProfile?.capture?.width || 1280;
+    const captureH = hwProfile?.capture?.height || 720;
+    const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true, audioDelayMs, captureW, captureH);
     // WebSocket hook – render into the dedicated <img> ref
     const handleWsFrame = useCallback((frameData, wsLatency, isBinary) => {
         // Direct canvas painting: decode blob → drawImage → done.
@@ -107,8 +133,19 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         disconnect: disconnectWs,
         sendFrame: sendWsFrame,
         isConnected: isWsConnected,
-        error: wsError
+        error: wsError,
+        networkQuality,
+        configureFromProfile,
+        adaptSendRate,
+        getAdaptiveParams,
     } = useWebSocket(serverUrl, sessionId, handleWsFrame);
+
+    // Configure WebSocket adaptive sender when hardware profile is ready
+    useEffect(() => {
+        if (hwProfile) {
+            configureFromProfile(hwProfile);
+        }
+    }, [hwProfile, configureFromProfile]);
 
     const {
         isConnected,
@@ -138,46 +175,61 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         }
     }, [isStreaming, isConnected, connectionState, isWsConnected, connectWs]);
 
-    // Send frames via WebSocket if connected – throttled to ~24 FPS
+    // ── ADAPTIVE frame send loop (Google-Meet-grade) ──
+    // Uses FrameEncoder (off-main-thread JPEG) + adaptive FPS/quality from backpressure
     useEffect(() => {
         if (!isStreaming || !isWsConnected || !originalVideoRef.current) return;
 
-        const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d');
         const video = originalVideoRef.current;
-
-        // PIPELINED frame sending: send at fixed rate, don't wait for responses.
-        // With ~300ms RTT, back-pressure limits us to ~3 FPS.
-        // Pipelining: we send 24 FPS continuously, ~8 frames are "in flight"
-        // at any time, and the pipelined server processes them concurrently.
-        // GPU 0 swaps frame N while GPU 1 lip-syncs frame N-1 in parallel.
-        // Result: smooth 24 FPS output regardless of network latency.
+        const encoder = frameEncoderRef.current;
         let active = true;
-        const MAX_WIDTH = 1080;      // 1080p — 2x RTX 5090 GPUs handle it, more detail for face models
-        const JPEG_QUALITY = 0.80;   // Higher quality input → better GPU face detection + swap
-        const SEND_FPS = 24;         // 24 FPS — pipelined multi-GPU server handles it
-        const INTERVAL = 1000 / SEND_FPS;
+        let encoding = false; // Prevent overlapping encodes
 
-        const sendLoop = () => {
+        const sendLoop = async () => {
             if (!active) return;
-            if (video.readyState === video.HAVE_ENOUGH_DATA) {
-                const scale = Math.min(1, MAX_WIDTH / video.videoWidth);
-                canvas.width = Math.round(video.videoWidth * scale);
-                canvas.height = Math.round(video.videoHeight * scale);
 
-                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            // Run adaptive backpressure engine — adjusts FPS + quality each tick
+            adaptSendRate();
+            const params = getAdaptiveParams();
+            const interval = 1000 / params.currentFps;
 
-                canvas.toBlob((blob) => {
-                    if (!active || !blob) return;
-                    sendWsFrame(blob, audioBufferRef.current, audioSampleRateRef.current);
-                }, 'image/jpeg', JPEG_QUALITY);
+            if (video.readyState === video.HAVE_ENOUGH_DATA && !encoding) {
+                encoding = true;
+                try {
+                    // Compute send dimensions: scale video down to profile width
+                    const maxW = hwProfile?.capture?.width || 854;
+                    const scale = Math.min(1, maxW / video.videoWidth);
+                    const w = Math.round(video.videoWidth * scale);
+                    const h = Math.round(video.videoHeight * scale);
+
+                    // Encode JPEG off-main-thread via FrameEncoder
+                    const blob = encoder
+                        ? await encoder.encode(video, w, h, params.currentQuality)
+                        : await new Promise(resolve => {
+                            // Ultimate fallback: inline canvas.toBlob
+                            const c = document.createElement('canvas');
+                            c.width = w; c.height = h;
+                            c.getContext('2d').drawImage(video, 0, 0, w, h);
+                            c.toBlob(resolve, 'image/jpeg', params.currentQuality);
+                        });
+
+                    if (active && blob) {
+                        sendWsFrame(blob, audioBufferRef.current, audioSampleRateRef.current);
+                    }
+                } catch (err) {
+                    // Don't break the loop on a single encode error
+                    console.warn('[SendLoop] Encode error:', err.message);
+                } finally {
+                    encoding = false;
+                }
             }
-            setTimeout(sendLoop, INTERVAL);
+
+            if (active) setTimeout(sendLoop, interval);
         };
         sendLoop();
 
         return () => { active = false; };
-    }, [isStreaming, isWsConnected, sendWsFrame]);
+    }, [isStreaming, isWsConnected, sendWsFrame, adaptSendRate, getAdaptiveParams, hwProfile]);
 
     // Auto re-upload ALL target images when the user adds/removes images mid-stream
     // Track previous images to prevent redundant upload on start (when isStreaming flips to true)
@@ -544,7 +596,12 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         setFps(0);
         setLatency(0);
         audioBufferRef.current = new Int16Array(0);
-        setDiagnostics({ health: null, upload: null, settings: null, webrtc: null, localMedia: null, remoteMedia: null });
+        setDiagnostics(prev => ({
+            ...prev,
+            health: null, upload: null, settings: null, webrtc: null,
+            localMedia: null, remoteMedia: null
+            // Keep hardware diagnostics — they don't change per session
+        }));
     };
 
     const handleHealthCheck = async () => {
@@ -644,13 +701,40 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                             <span className="text-gray-400">Latency:</span>
                             <span className="font-mono text-blue-400 font-semibold">{latency}ms</span>
                         </div>
+                        {/* Network quality indicator — like Google Meet's signal bars */}
+                        <div className="flex items-center gap-1.5" title={`Network: ${networkQuality}`}>
+                            {['poor', 'fair', 'good', 'excellent'].map((level, i) => {
+                                const active = ['poor', 'fair', 'good', 'excellent'].indexOf(networkQuality) >= i;
+                                const colors = ['bg-red-500', 'bg-yellow-500', 'bg-green-400', 'bg-green-400'];
+                                return (
+                                    <div
+                                        key={level}
+                                        className={`rounded-sm ${active ? colors[i] : 'bg-gray-600'}`}
+                                        style={{ width: 4, height: 6 + i * 4 }}
+                                    />
+                                );
+                            })}
+                            <span className="text-gray-400 text-xs ml-1">
+                                {networkQuality === 'excellent' ? '' : networkQuality === 'good' ? '' : networkQuality}
+                            </span>
+                        </div>
                         <div className="flex items-center gap-2">
                             <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500 animate-pulse' : isWsConnected ? 'bg-blue-500 animate-pulse' : 'bg-red-500'}`}></span>
                             <span className="text-gray-400">
                                 {isConnected ? 'WebRTC' : isWsConnected ? 'WebSocket' : 'Disconnected'}
-                                ({isConnected ? connectionState : isWsConnected ? 'connected' : 'failed'})
                             </span>
                         </div>
+                        {hwProfile && (
+                            <div className="flex items-center gap-1">
+                                <span className={`text-xs font-semibold px-1.5 py-0.5 rounded ${
+                                    hwProfile.tier === 'high' ? 'bg-green-900 text-green-300' :
+                                    hwProfile.tier === 'medium' ? 'bg-yellow-900 text-yellow-300' :
+                                    'bg-red-900 text-red-300'
+                                }`}>
+                                    {hwProfile.tier.toUpperCase()}
+                                </span>
+                            </div>
+                        )}
                     </div>
                 )}
             </div>
@@ -769,6 +853,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
 
             {/* Diagnostics */}
             <div className="mt-4 p-4 bg-gray-800 border border-gray-700 rounded-lg text-xs text-gray-300 space-y-1">
+                <div><span className="text-gray-400">Hardware:</span> {diagnostics.hardware || '—'}</div>
                 <div><span className="text-gray-400">Health:</span> {diagnostics.health || '—'}</div>
                 <div><span className="text-gray-400">Upload:</span> {diagnostics.upload || '—'}</div>
                 <div><span className="text-gray-400">Settings:</span> {diagnostics.settings || '—'}</div>

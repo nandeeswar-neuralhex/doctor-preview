@@ -141,14 +141,15 @@ class LipSyncer:
         result: np.ndarray,
         face_bbox: tuple,
         lip_output: np.ndarray,
+        landmarks_68: np.ndarray = None,
     ) -> np.ndarray:
         """
         Blend Wav2Lip output into the mouth region only with feathered edges.
 
-        Instead of replacing the entire face crop (which destroys the
-        high-quality face-swap output), this preserves the upper face
-        (eyes, nose, forehead) and only modifies the mouth/chin area
-        using a vertical gradient mask with feathered edges.
+        Improvements:
+        - Optional 68-point landmarks for precise mouth contour masking
+        - Post-sharpening to counteract Wav2Lip's 96x96 resolution blur
+        - Adaptive blend zone based on actual lip positions
         """
         x1, y1, x2, y2 = [int(v) for v in face_bbox]
         x1, y1 = max(0, x1), max(0, y1)
@@ -161,27 +162,72 @@ class LipSyncer:
 
         lip_resized = cv2.resize(lip_output, (face_w, face_h))
 
-        # Build a vertical gradient mask:
-        #   0 at top (preserve face-swap output)
-        #   gradual blend from 48-62% of face height
-        #   1 at bottom (use Wav2Lip lip-synced output)
+        # ── Sharpen lip output to counteract Wav2Lip's 96x96 blur ──
+        usm_blur = cv2.GaussianBlur(lip_resized, (0, 0), 1.5)
+        lip_resized = cv2.addWeighted(lip_resized, 1.3, usm_blur, -0.3, 0)
+
         mask = np.zeros((face_h, face_w), dtype=np.float32)
-        blend_start = int(face_h * 0.48)
-        blend_end = int(face_h * 0.62)
+        used_landmarks = False
 
-        for y_idx in range(blend_start, face_h):
-            if y_idx < blend_end:
-                alpha = (y_idx - blend_start) / max(1, blend_end - blend_start)
-            else:
-                alpha = 1.0
-            mask[y_idx, :] = alpha
+        # ── PRIMARY: Landmark-based mouth mask ──
+        if landmarks_68 is not None:
+            try:
+                # Mouth landmarks (48-67) in frame coordinates → face ROI coordinates
+                mouth_pts = landmarks_68[48:68].copy()
+                mouth_pts[:, 0] -= x1
+                mouth_pts[:, 1] -= y1
 
-        # Feather horizontal edges to avoid hard vertical seams
-        edge = max(3, int(face_w * 0.08))
-        for x_idx in range(edge):
-            factor = x_idx / edge
-            mask[:, x_idx] *= factor
-            mask[:, face_w - 1 - x_idx] *= factor
+                mouth_min_y = mouth_pts[:, 1].min()
+                mouth_max_y = mouth_pts[:, 1].max()
+                mouth_h = max(1, mouth_max_y - mouth_min_y)
+
+                # Blend zone: from above mouth to below chin
+                blend_top = max(0, int(mouth_min_y - mouth_h * 1.2))
+                full_top = max(0, int(mouth_min_y - mouth_h * 0.3))
+                full_bottom = min(face_h, int(mouth_max_y + mouth_h * 0.4))
+                blend_bottom = min(face_h, int(mouth_max_y + mouth_h * 0.8))
+
+                for y_idx in range(blend_top, blend_bottom):
+                    if y_idx < full_top:
+                        alpha = (y_idx - blend_top) / max(1, full_top - blend_top)
+                    elif y_idx > full_bottom:
+                        alpha = 1.0 - (y_idx - full_bottom) / max(1, blend_bottom - full_bottom)
+                    else:
+                        alpha = 1.0
+                    mask[y_idx, :] = alpha
+
+                # Horizontal: fade based on mouth width + margin
+                mouth_left = max(0, int(mouth_pts[:, 0].min() - mouth_h * 0.5))
+                mouth_right = min(face_w, int(mouth_pts[:, 0].max() + mouth_h * 0.5))
+                if mouth_left > 0:
+                    for x_idx in range(mouth_left):
+                        mask[:, x_idx] *= x_idx / max(1, mouth_left)
+                if mouth_right < face_w:
+                    for x_idx in range(mouth_right, face_w):
+                        mask[:, x_idx] *= 1.0 - (x_idx - mouth_right) / max(1, face_w - mouth_right)
+
+                used_landmarks = True
+            except Exception:
+                used_landmarks = False
+
+        # ── FALLBACK: Vertical gradient mask ──
+        if not used_landmarks:
+            blend_start = int(face_h * 0.48)
+            blend_end = int(face_h * 0.62)
+
+            for y_idx in range(blend_start, face_h):
+                if y_idx < blend_end:
+                    alpha = (y_idx - blend_start) / max(1, blend_end - blend_start)
+                else:
+                    alpha = 1.0
+                mask[y_idx, :] = alpha
+
+            # Feather horizontal edges to avoid hard vertical seams
+            edge = max(3, int(face_w * 0.08))
+            for x_idx in range(edge):
+                factor = x_idx / edge
+                mask[:, x_idx] *= factor
+                mask[:, face_w - 1 - x_idx] *= factor
 
         # Gaussian blur for smooth transitions
         mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=3, sigmaY=3)

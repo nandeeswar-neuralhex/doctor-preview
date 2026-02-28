@@ -1,38 +1,64 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 
 /**
- * High-performance binary WebSocket for real-time face swap streaming.
+ * Adaptive binary WebSocket for real-time face swap streaming.
  *
  * Protocol (binary):
- *   Send: [4 bytes uint32 frame_id] + [raw JPEG bytes]
- *   Recv: [4 bytes uint32 frame_id] + [raw JPEG bytes]
+ *   Send: [4B frameId] + [8B timestamp] + [4B audioLen] + [4B sampleRate] + [audio PCM] + [JPEG]
+ *   Recv: [4B frameId] + [8B timestamp] + [raw JPEG bytes]
  *
- * Key design: PIPELINED sending — we do NOT wait for a response before sending
- * the next frame. This hides the network latency completely. The server processes
- * frames in order and we display responses as they arrive (latest wins).
- *
- * With ~300ms round-trip and pipelined sending at 20fps, there are always
- * ~6 frames "in flight". The user sees smooth 20fps output despite high RTT.
+ * Key improvements (Google-Meet-grade):
+ * 1. ADAPTIVE FPS — scales send rate based on bufferedAmount backpressure
+ * 2. ADAPTIVE QUALITY — lowers JPEG quality when bandwidth is constrained
+ * 3. PIPELINED sending — fires frames without waiting for responses
+ * 4. Exposes networkQuality for UI indicators
  */
 const useWebSocket = (serverUrl, sessionId, onFrame) => {
     const wsRef = useRef(null);
     const frameIdRef = useRef(0);
     const [isConnected, setIsConnected] = useState(false);
     const [error, setError] = useState(null);
+    // Network quality: 'excellent' | 'good' | 'fair' | 'poor'
+    const [networkQuality, setNetworkQuality] = useState('good');
+
+    // ── Adaptive send-rate state (refs for use in tight loops) ──
+    const adaptiveRef = useRef({
+        currentFps: 20,
+        currentQuality: 0.75,
+        targetFps: 20,
+        targetQuality: 0.75,
+        maxBuffered: 1_000_000,
+        avgBuffered: 0,
+        droppedFrames: 0,
+        sentFrames: 0,
+    });
+
+    /**
+     * Configure the adaptive sender from a hardware profile.
+     * Call this after getHardwareProfile() resolves.
+     */
+    const configureFromProfile = useCallback((profile) => {
+        if (!profile) return;
+        const a = adaptiveRef.current;
+        a.currentFps = profile.encode.sendFps;
+        a.targetFps = profile.encode.sendFps;
+        a.currentQuality = profile.encode.jpegQuality;
+        a.targetQuality = profile.encode.jpegQuality;
+        a.maxBuffered = profile.encode.maxBufferedBytes;
+        console.log(`[WS-Adaptive] Configured: ${a.currentFps}fps, q=${a.currentQuality}, maxBuf=${a.maxBuffered}`);
+    }, []);
 
     const connect = useCallback(() => {
         if (!serverUrl || !sessionId) return;
 
         const wsUrl = serverUrl.replace(/^http/, 'ws').replace(/\/$/, '') + `/ws/${sessionId}`;
 
-        // If already open or connecting, don't create a new socket
         if (wsRef.current) {
             const state = wsRef.current.readyState;
             if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) {
                 console.log('WebSocket already connected/connecting, skipping');
                 return;
             }
-            // Clean up dead socket
             try { wsRef.current.close(); } catch (_) { }
             wsRef.current = null;
         }
@@ -44,15 +70,18 @@ const useWebSocket = (serverUrl, sessionId, onFrame) => {
             wsRef.current = ws;
 
             ws.onopen = () => {
-                // Verify this is still the active socket (not replaced during handshake)
                 if (wsRef.current !== ws) {
                     ws.close();
                     return;
                 }
-                console.log('WebSocket Connected (binary pipeline mode)');
+                console.log('WebSocket Connected (adaptive binary pipeline)');
                 setIsConnected(true);
                 setError(null);
                 frameIdRef.current = 0;
+                const a = adaptiveRef.current;
+                a.droppedFrames = 0;
+                a.sentFrames = 0;
+                a.avgBuffered = 0;
             };
 
             ws.onmessage = (event) => {
@@ -60,17 +89,13 @@ const useWebSocket = (serverUrl, sessionId, onFrame) => {
                     const buf = event.data;
                     if (buf.byteLength < 12) return;
 
-                    // Header: 4 bytes frameId + 8 bytes float64 timestamp
                     const view = new DataView(buf);
                     const sentTs = view.getFloat64(4, true);
                     const latency = Date.now() - sentTs;
 
-                    // Pass raw Blob directly — CameraView uses createImageBitmap(blob)
-                    // No blob URL creation/revocation overhead
                     const jpegBlob = new Blob([buf.slice(12)], { type: 'image/jpeg' });
                     if (onFrame) onFrame(jpegBlob, latency, true);
                 } else if (typeof event.data === 'string') {
-                    // Legacy text fallback
                     if (event.data.startsWith('{')) {
                         try {
                             const data = JSON.parse(event.data);
@@ -103,51 +128,102 @@ const useWebSocket = (serverUrl, sessionId, onFrame) => {
     }, [serverUrl, sessionId, onFrame]);
 
     /**
-     * Send frame as binary with audio for lip sync:
-     * [4B frameId] + [8B timestamp] + [4B audioLen] + [4B sampleRate] + [audio PCM] + [JPEG]
-     * PIPELINED: does NOT wait for previous response — fires immediately.
+     * Adaptive backpressure engine — called before each frame send.
+     * Monitors bufferedAmount and adjusts FPS + quality in real time.
+     * This is the "Google Meet" adaptation — works on any network/hardware.
      */
-    const sendFrame = useCallback((frameData, audioData, sampleRate) => {
-        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    const adaptSendRate = useCallback(() => {
+        const ws = wsRef.current;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-        // Check bufferedAmount — if too much is queued, skip this frame
-        // 1MB threshold: allows ~5-6 frames in-flight over high-latency connections
-        // (India→US RunPod = ~300ms RTT; 200KB was too aggressive and starved the pipeline)
-        if (wsRef.current.bufferedAmount > 1_000_000) {
-            return;
+        const a = adaptiveRef.current;
+        const buffered = ws.bufferedAmount;
+
+        // Exponential moving average of buffered bytes
+        a.avgBuffered = a.avgBuffered * 0.7 + buffered * 0.3;
+
+        const utilization = a.avgBuffered / a.maxBuffered;
+
+        let quality;
+        if (utilization > 0.8) {
+            a.currentFps = Math.max(6, a.targetFps * 0.4);
+            quality = 'poor';
+        } else if (utilization > 0.5) {
+            a.currentFps = Math.max(8, a.targetFps * 0.65);
+            quality = 'fair';
+        } else if (utilization > 0.2) {
+            a.currentFps = Math.max(12, a.targetFps * 0.85);
+            quality = 'good';
+        } else {
+            a.currentFps = a.targetFps;
+            quality = 'excellent';
         }
 
+        // Scale JPEG quality with congestion
+        if (utilization > 0.6) {
+            a.currentQuality = Math.max(0.40, a.targetQuality - 0.20);
+        } else if (utilization > 0.3) {
+            a.currentQuality = Math.max(0.50, a.targetQuality - 0.10);
+        } else {
+            a.currentQuality = a.targetQuality;
+        }
+
+        setNetworkQuality(quality);
+    }, []);
+
+    /**
+     * Send frame as binary with audio for lip sync.
+     * PIPELINED: fires immediately, does NOT wait for response.
+     * Returns false if frame was dropped (backpressure).
+     */
+    const sendFrame = useCallback((frameData, audioData, sampleRate) => {
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return false;
+
+        const a = adaptiveRef.current;
+
+        // Backpressure gate — drop frame if buffer is overwhelmed
+        if (wsRef.current.bufferedAmount > a.maxBuffered) {
+            a.droppedFrames++;
+            return false;
+        }
+
+        a.sentFrames++;
         const fid = frameIdRef.current++;
 
         if (frameData instanceof Blob) {
             frameData.arrayBuffer().then((jpegBuf) => {
                 if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
-                // Audio PCM bytes (Int16Array → raw bytes)
                 const audioPcm = audioData instanceof Int16Array && audioData.length > 0
                     ? audioData : new Int16Array(0);
                 const audioBytes = new Uint8Array(
                     audioPcm.buffer, audioPcm.byteOffset, audioPcm.byteLength
                 );
 
-                // Header: 4B frameId + 8B timestamp + 4B audioLen + 4B sampleRate = 20 bytes
                 const headerSize = 20;
                 const totalSize = headerSize + audioBytes.length + jpegBuf.byteLength;
                 const combined = new Uint8Array(totalSize);
                 const view = new DataView(combined.buffer);
-                view.setUint32(0, fid, true);                // frameId
-                view.setFloat64(4, Date.now(), true);         // timestamp
-                view.setUint32(12, audioBytes.length, true);  // audio byte length
-                view.setUint32(16, sampleRate || 16000, true); // sample rate
+                view.setUint32(0, fid, true);
+                view.setFloat64(4, Date.now(), true);
+                view.setUint32(12, audioBytes.length, true);
+                view.setUint32(16, sampleRate || 16000, true);
                 combined.set(audioBytes, headerSize);
                 combined.set(new Uint8Array(jpegBuf), headerSize + audioBytes.length);
 
                 wsRef.current.send(combined.buffer);
             });
         } else if (typeof frameData === 'string') {
-            // Legacy text fallback
             wsRef.current.send(JSON.stringify({ image: frameData, ts: Date.now() }));
         }
+        return true;
+    }, []);
+
+    /**
+     * Get current adaptive parameters (for use in the send loop).
+     */
+    const getAdaptiveParams = useCallback(() => {
+        return adaptiveRef.current;
     }, []);
 
     const disconnect = useCallback(() => {
@@ -162,7 +238,17 @@ const useWebSocket = (serverUrl, sessionId, onFrame) => {
         return () => { disconnect(); };
     }, []);
 
-    return { connect, disconnect, sendFrame, isConnected, error };
+    return {
+        connect,
+        disconnect,
+        sendFrame,
+        isConnected,
+        error,
+        networkQuality,
+        configureFromProfile,
+        adaptSendRate,
+        getAdaptiveParams,
+    };
 };
 
 export default useWebSocket;
