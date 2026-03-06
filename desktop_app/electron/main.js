@@ -2,6 +2,15 @@ const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const { exec } = require('child_process');
 
+// Prevent Chromium from throttling timers, canvas, and the renderer process
+// when the window is minimized, hidden, or loses focus. Without these switches
+// setTimeout intervals get clamped to ~1000ms (from ~41ms) and AudioContext
+// gets suspended — both of which break the 24 FPS face-swap streaming loop.
+app.commandLine.appendSwitch('disable-renderer-backgrounding');
+app.commandLine.appendSwitch('disable-background-timer-throttling');
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
+app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
+
 let mainWindow;
 
 function createWindow() {
@@ -13,6 +22,7 @@ function createWindow() {
             contextIsolation: true,
             sandbox: false,
             webSecurity: false,          // Allow cross-origin requests (Vite HMR + RunPod)
+            backgroundThrottling: false, // Keep timers & canvas at full speed in background
             preload: path.join(__dirname, 'preload.js')
         },
         title: 'Doctor Preview',

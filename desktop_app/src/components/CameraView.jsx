@@ -18,6 +18,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     const [sessionId] = useState(() => `session-${Date.now()}`);
     const [lipSyncEnabled, setLipSyncEnabled] = useState(true);
     const [audioDelayMs, setAudioDelayMs] = useState(300);
+    const [exposureAdjust, setExposureAdjust] = useState(0);
     const [diagnostics, setDiagnostics] = useState({
         health: null,
         upload: null,
@@ -45,6 +46,8 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     const toggleFullScreen = (view) => {
         setFullScreenView(prev => prev === view ? null : view);
     };
+
+    const processedFrameFilter = `brightness(${Math.max(0.4, 1 + exposureAdjust / 100)})`;
 
     // Custom hooks for webcam and WebSocket
     const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true, audioDelayMs);
@@ -356,7 +359,17 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
 
         setupAudioCapture();
 
+        // Chromium auto-suspends AudioContext when the page loses visibility.
+        // Resume it immediately whenever the window comes back into view/focus.
+        const resumeAudioCtx = () => {
+            if (document.visibilityState === 'visible' && audioCtx && audioCtx.state === 'suspended') {
+                audioCtx.resume().catch(() => {});
+            }
+        };
+        document.addEventListener('visibilitychange', resumeAudioCtx);
+
         return () => {
+            document.removeEventListener('visibilitychange', resumeAudioCtx);
             disposed = true;
             if (audioCtx._captureInterval) clearInterval(audioCtx._captureInterval);
             try { source.disconnect(); } catch (_) { }
@@ -625,6 +638,21 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                         />
                         <span className="font-mono text-blue-400 font-semibold w-14 text-right">{audioDelayMs}ms</span>
                     </div>
+                    <div className="flex items-center gap-2 text-sm text-gray-300">
+                        <span className="whitespace-nowrap">Exposure:</span>
+                        <input
+                            type="range"
+                            min="-40"
+                            max="40"
+                            step="1"
+                            value={exposureAdjust}
+                            onChange={(e) => setExposureAdjust(Number(e.target.value))}
+                            className="w-24 accent-blue-500"
+                        />
+                        <span className="font-mono text-blue-400 font-semibold w-12 text-right">
+                            {exposureAdjust > 0 ? `+${exposureAdjust}` : exposureAdjust}
+                        </span>
+                    </div>
                     <button
                         onClick={handleHealthCheck}
                         className="px-3 py-2 text-xs bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors"
@@ -735,7 +763,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                                 <canvas
                                     ref={wsCanvasRef}
                                     className="w-full h-full object-contain"
-                                    style={{ imageRendering: 'auto' }}
+                                    style={{ imageRendering: 'auto', filter: processedFrameFilter }}
                                 />
                             ) : (
                                 <video
@@ -744,6 +772,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                                     playsInline
                                     muted
                                     className="w-full h-full object-contain"
+                                    style={{ filter: processedFrameFilter }}
                                 />
                             )
                         ) : (
