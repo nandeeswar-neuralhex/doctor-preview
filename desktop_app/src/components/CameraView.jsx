@@ -18,6 +18,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     const [sessionId] = useState(() => `session-${Date.now()}`);
     const [lipSyncEnabled, setLipSyncEnabled] = useState(true);
     const [audioDelayMs, setAudioDelayMs] = useState(300);
+    const [exposureAdjust, setExposureAdjust] = useState(0);
     const [diagnostics, setDiagnostics] = useState({
         health: null,
         upload: null,
@@ -45,6 +46,8 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     const toggleFullScreen = (view) => {
         setFullScreenView(prev => prev === view ? null : view);
     };
+
+    const processedFrameFilter = `brightness(${Math.max(0.4, 1 + exposureAdjust / 100)})`;
 
     // Custom hooks for webcam and WebSocket
     const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true, audioDelayMs);
@@ -146,6 +149,13 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         const ctx = canvas.getContext('2d');
         const video = originalVideoRef.current;
 
+        // Grab the video track directly from the camera — ImageCapture reads from
+        // the hardware driver, NOT the <video> element. This keeps working when
+        // the Electron window is hidden / unfocused (where drawImage(video, …)
+        // would return a black frame because Chromium pauses video rendering).
+        const videoTrack = video.srcObject?.getVideoTracks()[0];
+        const imageCapture = videoTrack ? new ImageCapture(videoTrack) : null;
+
         // PIPELINED frame sending: send at fixed rate, don't wait for responses.
         // With ~300ms RTT, back-pressure limits us to ~3 FPS.
         // Pipelining: we send 24 FPS continuously, ~8 frames are "in flight"
@@ -158,21 +168,54 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         const SEND_FPS = 24;         // 24 FPS — pipelined multi-GPU server handles it
         const INTERVAL = 1000 / SEND_FPS;
 
+        const grabAndSend = (bitmap) => {
+            const scale = Math.min(1, MAX_WIDTH / bitmap.width);
+            canvas.width = Math.round(bitmap.width * scale);
+            canvas.height = Math.round(bitmap.height * scale);
+            ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+            bitmap.close();
+            canvas.toBlob((blob) => {
+                if (!active || !blob) return;
+                sendWsFrame(blob, audioBufferRef.current, audioSampleRateRef.current);
+            }, 'image/jpeg', JPEG_QUALITY);
+        };
+
         const sendLoop = () => {
             if (!active) return;
-            if (video.readyState === video.HAVE_ENOUGH_DATA) {
-                const scale = Math.min(1, MAX_WIDTH / video.videoWidth);
-                canvas.width = Math.round(video.videoWidth * scale);
-                canvas.height = Math.round(video.videoHeight * scale);
 
-                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-                canvas.toBlob((blob) => {
-                    if (!active || !blob) return;
-                    sendWsFrame(blob, audioBufferRef.current, audioSampleRateRef.current);
-                }, 'image/jpeg', JPEG_QUALITY);
+            if (imageCapture) {
+                // Primary path: grab frame directly from camera hardware.
+                // Works even when the window is in the background.
+                imageCapture.grabFrame()
+                    .then(bitmap => { if (active) grabAndSend(bitmap); })
+                    .catch(() => {
+                        // Fallback: if grabFrame fails, try the video element
+                        if (active && video.readyState === video.HAVE_ENOUGH_DATA) {
+                            const scale = Math.min(1, MAX_WIDTH / video.videoWidth);
+                            canvas.width = Math.round(video.videoWidth * scale);
+                            canvas.height = Math.round(video.videoHeight * scale);
+                            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                            canvas.toBlob((blob) => {
+                                if (!active || !blob) return;
+                                sendWsFrame(blob, audioBufferRef.current, audioSampleRateRef.current);
+                            }, 'image/jpeg', JPEG_QUALITY);
+                        }
+                    })
+                    .finally(() => { if (active) setTimeout(sendLoop, INTERVAL); });
+            } else {
+                // No ImageCapture support: fall back to video element (foreground only)
+                if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                    const scale = Math.min(1, MAX_WIDTH / video.videoWidth);
+                    canvas.width = Math.round(video.videoWidth * scale);
+                    canvas.height = Math.round(video.videoHeight * scale);
+                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                    canvas.toBlob((blob) => {
+                        if (!active || !blob) return;
+                        sendWsFrame(blob, audioBufferRef.current, audioSampleRateRef.current);
+                    }, 'image/jpeg', JPEG_QUALITY);
+                }
+                setTimeout(sendLoop, INTERVAL);
             }
-            setTimeout(sendLoop, INTERVAL);
         };
         sendLoop();
 
@@ -356,7 +399,17 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
 
         setupAudioCapture();
 
+        // Chromium auto-suspends AudioContext when the page loses visibility.
+        // Resume it immediately whenever the window comes back into view/focus.
+        const resumeAudioCtx = () => {
+            if (document.visibilityState === 'visible' && audioCtx && audioCtx.state === 'suspended') {
+                audioCtx.resume().catch(() => {});
+            }
+        };
+        document.addEventListener('visibilitychange', resumeAudioCtx);
+
         return () => {
+            document.removeEventListener('visibilitychange', resumeAudioCtx);
             disposed = true;
             if (audioCtx._captureInterval) clearInterval(audioCtx._captureInterval);
             try { source.disconnect(); } catch (_) { }
@@ -625,6 +678,21 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                         />
                         <span className="font-mono text-blue-400 font-semibold w-14 text-right">{audioDelayMs}ms</span>
                     </div>
+                    <div className="flex items-center gap-2 text-sm text-gray-300">
+                        <span className="whitespace-nowrap">Exposure:</span>
+                        <input
+                            type="range"
+                            min="-40"
+                            max="40"
+                            step="1"
+                            value={exposureAdjust}
+                            onChange={(e) => setExposureAdjust(Number(e.target.value))}
+                            className="w-24 accent-blue-500"
+                        />
+                        <span className="font-mono text-blue-400 font-semibold w-12 text-right">
+                            {exposureAdjust > 0 ? `+${exposureAdjust}` : exposureAdjust}
+                        </span>
+                    </div>
                     <button
                         onClick={handleHealthCheck}
                         className="px-3 py-2 text-xs bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors"
@@ -735,7 +803,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                                 <canvas
                                     ref={wsCanvasRef}
                                     className="w-full h-full object-contain"
-                                    style={{ imageRendering: 'auto' }}
+                                    style={{ imageRendering: 'auto', filter: processedFrameFilter }}
                                 />
                             ) : (
                                 <video
@@ -744,6 +812,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                                     playsInline
                                     muted
                                     className="w-full h-full object-contain"
+                                    style={{ filter: processedFrameFilter }}
                                 />
                             )
                         ) : (
