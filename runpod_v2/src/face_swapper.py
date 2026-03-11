@@ -572,27 +572,25 @@ class FaceSwapper:
                                         borderMode=cv2.BORDER_REPLICATE)
 
             # Warp 128×128 SOFT OVAL mask → ROI-sized
-            # Using a solid square creates a visible box artifact at the edges.
-            # A Gaussian-blurred ellipse warps into a smooth face oval with no hard boundary.
+            # FACE_MASK_SCALE expands the ellipse beyond the default (52,58) to cover
+            # the chin and beard area; without scaling the lower face bleeds through.
+            # A single Gaussian blur (FACE_MASK_BLUR) provides edge softness.
             aimg_mask = np.zeros((128, 128), dtype=np.float32)
-            cv2.ellipse(aimg_mask, (64, 64), (52, 58), 0, 0, 360, 1.0, -1)
-            aimg_mask = cv2.GaussianBlur(aimg_mask, (31, 31), 0)
+            semi_x = min(self._MASK_SEMI_MAX, int(self._MASK_SEMI_X * FACE_MASK_SCALE))
+            semi_y = min(self._MASK_SEMI_MAX, int(self._MASK_SEMI_Y * FACE_MASK_SCALE))
+            cv2.ellipse(aimg_mask, (64, 64), (semi_x, semi_y), 0, 0, 360, 1.0, -1)
+            blur_k = FACE_MASK_BLUR if FACE_MASK_BLUR % 2 == 1 else FACE_MASK_BLUR + 1
+            aimg_mask = cv2.GaussianBlur(aimg_mask, (blur_k, blur_k), 0)
             aimg_mask = (aimg_mask * 255).astype(np.uint8)
             roi_mask = cv2.warpAffine(aimg_mask, M_roi_inv, (roi_w, roi_h))
 
             roi_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2].copy()
 
-            # ── Color match (if enabled) for skin-tone correction at boundary ──
-            if ENABLE_SEAMLESS_CLONE and roi_mask.sum() > 0:
-                try:
-                    roi_warped = self._color_match(roi_warped, roi_frame, roi_mask)
-                except Exception:
-                    pass
-
-            # ── Smooth alpha blend on ROI ──
-            blur_k = FACE_MASK_BLUR if FACE_MASK_BLUR % 2 == 1 else FACE_MASK_BLUR + 1
-            blurred_mask = cv2.GaussianBlur(roi_mask, (blur_k, blur_k), 0) if blur_k > 1 else roi_mask
-            alpha = (blurred_mask.astype(np.float32) / 255.0)[..., None]
+            # ── Alpha blend on ROI ──
+            # NOTE: Color matching (roi_warped → roi_frame) is intentionally omitted.
+            # Mapping the target face's colours to match the live face would suppress
+            # intentional appearance changes (e.g. lighter skin previews).
+            alpha = (roi_mask.astype(np.float32) / 255.0)[..., None]
             blended_roi = (roi_frame * (1 - alpha) + roi_warped * alpha).astype(np.uint8)
 
             result = frame.copy()
@@ -650,6 +648,16 @@ class FaceSwapper:
         [41.5493, 92.3655],
         [70.7299, 92.2041]
     ], dtype=np.float32)
+
+    # Base ellipse semi-axes (in the 128×128 aligned-face space) used for the paste-back
+    # mask.  These cover ~81% horizontally and ~91% vertically of the 128-px canvas,
+    # which maps to roughly the full face oval before chin/beard area.
+    # FACE_MASK_SCALE (default 1.1) expands both axes at runtime to close that gap.
+    _MASK_SEMI_X = 52   # horizontal semi-axis before scaling
+    _MASK_SEMI_Y = 58   # vertical semi-axis before scaling
+    # Maximum semi-axis: mask centre is at pixel 64, so semi-axis 63 keeps a 1-px
+    # margin from the canvas edge to avoid wrap-around artefacts after warping.
+    _MASK_SEMI_MAX = 63
 
     def _align_face(self, frame: np.ndarray, kps: np.ndarray) -> Optional[np.ndarray]:
         """Align face for model input using landmarks (full affine)."""
