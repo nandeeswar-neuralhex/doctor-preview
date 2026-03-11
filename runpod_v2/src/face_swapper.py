@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import onnxruntime as ort
 from insightface.app import FaceAnalysis
 
+from insightface.utils import face_align as _face_align
+
 from config import (
     MODELS_DIR,
     INSWAPPER_MODEL,
@@ -16,6 +18,8 @@ from config import (
     ENABLE_SEAMLESS_CLONE,
     FACE_MASK_BLUR,
     FACE_MASK_SCALE,
+    ENABLE_COLOR_TRANSFER,
+    COLOR_TRANSFER_STRENGTH,
     ENABLE_GFPGAN,
     GFPGAN_MODEL_PATH,
     ENABLE_TEMPORAL_SMOOTHING,
@@ -348,6 +352,17 @@ class FaceSwapper:
         # Use the largest face (most prominent)
         target_face = max(faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))
         
+        # Generate aligned 128×128 crop of the target photo for color reference.
+        # During real-time swap the INSwapper model inherits the camera's
+        # lighting/skin colour; we need the photo's actual colours to correct
+        # for that (see _color_transfer_to_target).
+        target_aligned_crop = None
+        try:
+            _crop, _M = _face_align.norm_crop2(resized, target_face.kps, 128)
+            target_aligned_crop = _crop
+        except Exception as _e:
+            print(f"  ⚠ Could not generate aligned crop for color reference: {_e}")
+
         # Extract expression features for matching:
         # - pose (yaw/pitch/roll) from bbox geometry
         # - landmark positions encode mouth open/smile/etc.
@@ -357,6 +372,7 @@ class FaceSwapper:
             "face": target_face,
             "embedding": target_face.embedding,
             "expression_features": expression_features,
+            "aligned_crop": target_aligned_crop,
             "index": index,
         }
         
@@ -497,7 +513,10 @@ class FaceSwapper:
             matched_target = self._match_best_target(session_id, best)
             _t3 = _t.time()
             if matched_target:
-                result = self._swap_single_face(result, best, matched_target["face"], session_id)
+                result = self._swap_single_face(
+                    result, best, matched_target["face"], session_id,
+                    target_crop=matched_target.get("aligned_crop"),
+                )
             _t4 = _t.time()
         else:
             source_faces.sort(key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]), reverse=True)
@@ -505,7 +524,10 @@ class FaceSwapper:
             for source_face in source_faces[:n_swap]:
                 matched_target = self._match_best_target(session_id, source_face)
                 if matched_target:
-                    result = self._swap_single_face(result, source_face, matched_target["face"], session_id)
+                    result = self._swap_single_face(
+                        result, source_face, matched_target["face"], session_id,
+                        target_crop=matched_target.get("aligned_crop"),
+                    )
             _t4 = _t.time()
 
         # Print per-step breakdown every 60 frames (every ~3 seconds at 20fps)
@@ -524,7 +546,8 @@ class FaceSwapper:
         frame: np.ndarray,
         source_face: Any,
         target_face: Any,
-        session_id: str
+        session_id: str,
+        target_crop: np.ndarray = None,
     ) -> np.ndarray:
         """
         Swap a single face using ROI-direct warping for maximum CPU efficiency.
@@ -544,6 +567,14 @@ class FaceSwapper:
             if res is None:
                 return frame
             bgr_fake, M = res  # bgr_fake: (128,128,3), M: (2,3) affine frame→128px
+
+            # ── Colour-correct toward the target photo's skin tone ──
+            # The model output inherits the camera's lighting; shift it toward
+            # the target photo so the preview reflects the desired appearance.
+            if ENABLE_COLOR_TRANSFER and target_crop is not None:
+                bgr_fake = self._color_transfer_to_target(
+                    bgr_fake, target_crop, strength=COLOR_TRANSFER_STRENGTH
+                )
 
             h, w = frame.shape[:2]
 
@@ -860,6 +891,62 @@ class FaceSwapper:
         smoothed = SMOOTHING_ALPHA * prev + (1.0 - SMOOTHING_ALPHA) * bbox
         self._smooth_bbox[key] = smoothed
         return smoothed
+
+    def _color_transfer_to_target(
+        self,
+        swapped: np.ndarray,
+        target_crop: np.ndarray,
+        strength: float = 0.85,
+    ) -> np.ndarray:
+        """Shift the swapped face's skin colour toward the target photo's tone.
+
+        The INSwapper model produces a face with the *identity* of the target
+        photo but the *lighting and skin colour* of the camera frame.  This
+        method applies Reinhard colour transfer in LAB space so the output
+        reflects the target photo's actual skin tone.
+
+        Chrominance (A/B) channels are transferred at full ``strength`` to
+        shift the hue.  Luminance (L) is transferred at half strength to
+        preserve some of the camera's natural lighting.
+
+        Both ``swapped`` and ``target_crop`` must be 128×128 BGR uint8.
+        """
+        try:
+            if strength <= 0:
+                return swapped
+
+            # Circular mask covering the central face region
+            mask = np.zeros((128, 128), dtype=np.uint8)
+            cv2.ellipse(mask, (64, 64), (50, 56), 0, 0, 360, 255, -1)
+            mask_bool = mask > 0
+
+            src_lab = cv2.cvtColor(swapped, cv2.COLOR_BGR2LAB).astype(np.float32)
+            tgt_lab = cv2.cvtColor(target_crop, cv2.COLOR_BGR2LAB).astype(np.float32)
+            result = src_lab.copy()
+
+            # Per-channel strengths: mild L (preserve lighting), strong A/B (shift hue)
+            ch_strength = [strength * 0.5, strength, strength]
+
+            for c in range(3):
+                s = ch_strength[c]
+                src_vals = src_lab[..., c][mask_bool]
+                tgt_vals = tgt_lab[..., c][mask_bool]
+
+                src_mean = src_vals.mean()
+                src_std = src_vals.std() + 1e-6
+                tgt_mean = tgt_vals.mean()
+                tgt_std = tgt_vals.std() + 1e-6
+
+                # Reinhard transfer: normalise → rescale → re-centre
+                transferred = (src_lab[..., c] - src_mean) * (tgt_std / src_std) + tgt_mean
+                # Blend with original at the per-channel strength
+                result[..., c] = src_lab[..., c] * (1.0 - s) + transferred * s
+
+            result = np.clip(result, 0, 255).astype(np.uint8)
+            return cv2.cvtColor(result, cv2.COLOR_LAB2BGR)
+        except Exception as e:
+            print(f"Color transfer error: {e}")
+            return swapped
 
     def _color_match(self, source: np.ndarray, target: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """Histogram-based color matching in LAB space for ~95% accurate color transfer.

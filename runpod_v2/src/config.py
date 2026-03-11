@@ -30,6 +30,15 @@ FACE_MASK_BLUR = int(os.getenv("FACE_MASK_BLUR", "15"))
 # Scale > 1.0 expands the oval mask so the chin/beard area is fully covered.
 FACE_MASK_SCALE = float(os.getenv("FACE_MASK_SCALE", "1.1"))
 
+# Color transfer: the INSwapper model inherently produces output tinted toward
+# the camera frame's lighting/skin colour.  Enabling this shifts the swapped
+# face's tone toward the TARGET PHOTO so the preview reflects the desired look.
+ENABLE_COLOR_TRANSFER = os.getenv("ENABLE_COLOR_TRANSFER", "true").lower() == "true"
+# 0.0 = no correction, 1.0 = full correction.  0.85 is a good balance:
+# strong enough to show the target's skin tone, mild enough to keep natural
+# lighting from the camera.
+COLOR_TRANSFER_STRENGTH = float(os.getenv("COLOR_TRANSFER_STRENGTH", "0.85"))
+
 # Optional face enhancement
 ENABLE_GFPGAN = os.getenv("ENABLE_GFPGAN", "true").lower() == "true"
 _GFPGAN_PATH_ENV = os.getenv("GFPGAN_MODEL_PATH", "")
