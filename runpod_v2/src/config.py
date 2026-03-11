@@ -24,7 +24,10 @@ EXECUTION_PROVIDER = os.getenv("EXECUTION_PROVIDER", "CUDAExecutionProvider")
 
 # Quality/Blending settings
 ENABLE_SEAMLESS_CLONE = os.getenv("ENABLE_SEAMLESS_CLONE", "true").lower() == "true"
-FACE_MASK_BLUR = int(os.getenv("FACE_MASK_BLUR", "25"))
+# Reduced from 25 → 15: a single blur pass is now used (no more double-blur),
+# so 15 px gives good edge softness without blurring away the chin/beard region.
+FACE_MASK_BLUR = int(os.getenv("FACE_MASK_BLUR", "15"))
+# Scale > 1.0 expands the oval mask so the chin/beard area is fully covered.
 FACE_MASK_SCALE = float(os.getenv("FACE_MASK_SCALE", "1.1"))
 
 # Optional face enhancement
