@@ -18,6 +18,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx \
     libglib2.0-0 \
     libturbojpeg \
+    libavcodec-dev \
+    libavformat-dev \
+    libavutil-dev \
+    libopus-dev \
+    libvpx-dev \
+    libsrtp2-dev \
     wget \
     curl \
     && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
@@ -39,8 +45,9 @@ RUN python3 -c "import onnxruntime as ort; providers = ort.get_available_provide
 # Copy source code
 COPY src/ ./src/
 
-# Expose port
+# Expose port (HTTP signaling + WebRTC UDP)
 EXPOSE 8765
+EXPOSE 40000-60000/udp
 
 # Command to run the application
 CMD ["python", "src/server.py"]

@@ -10,14 +10,18 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 import uvicorn
 
 import io
 from PIL import Image, ImageOps
 from face_swapper import FaceSwapper
 from lip_syncer import LipSyncer
-from config import JPEG_QUALITY, EXECUTION_PROVIDER, ENABLE_LIPSYNC
+from config import JPEG_QUALITY, EXECUTION_PROVIDER, ENABLE_LIPSYNC, ENABLE_WEBRTC
 from download_models import download_models
+
+# WebRTC manager (lazy init — only if ENABLE_WEBRTC=true)
+webrtc_manager = None
 
 # ── TurboJPEG: 3-5x faster JPEG encode/decode than cv2 ──
 try:
@@ -99,10 +103,27 @@ async def startup_event():
     else:
         print("LipSyncer disabled by config.")
 
+    # Initialize WebRTC if enabled
+    global webrtc_manager
+    if ENABLE_WEBRTC:
+        try:
+            from webrtc import WebRTCManager
+            webrtc_manager = WebRTCManager(swapper, lip_syncer)
+            print("✅ WebRTC enabled")
+        except ImportError as e:
+            print(f"⚠️ WebRTC disabled (aiortc not installed): {e}")
+    else:
+        print("WebRTC disabled by config (ENABLE_WEBRTC=false).")
+
 @app.get("/health")
 async def health_check():
     gpu = swapper.gpu_status() if swapper else {}
-    return {"status": "healthy", "mode": "simple-flip", "gpu_active": gpu.get("gpu_active", False)}
+    return {
+        "status": "healthy",
+        "mode": "simple-flip",
+        "gpu_active": gpu.get("gpu_active", False),
+        "webrtc_enabled": webrtc_manager is not None
+    }
 
 @app.get("/")
 async def root():
@@ -218,18 +239,40 @@ async def upload_targets(
         print(f"Error in upload_targets: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+class SessionSettings(BaseModel):
+    enable_lipsync: bool = True
+
 @app.post("/session/settings")
-async def update_settings(session_id: str = Query(...)):
-    # Dummy endpoint to satisfy client
-    return {"status": "success", "message": "Settings ignored"}
+async def update_settings(session_id: str = Query(...), settings: SessionSettings = None):
+    if webrtc_manager and settings:
+        webrtc_manager.set_session_settings(session_id, settings.model_dump())
+    return {"status": "success", "message": "Settings applied"}
+
+class WebRTCOffer(BaseModel):
+    sdp: str
+    type: str
 
 @app.post("/webrtc/offer")
-async def webrtc_offer(session_id: str = Query(...)):
-    # Force fallback to WebSocket by rejecting WebRTC
-    return JSONResponse(
-        status_code=400, 
-        content={"error": "WebRTC disabled in simple mode. Use WebSocket."}
-    )
+async def webrtc_offer(session_id: str = Query(...), offer: WebRTCOffer = None):
+    if not webrtc_manager:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "WebRTC not enabled on this server. Use WebSocket."}
+        )
+    if not offer or not offer.sdp:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Missing SDP offer"}
+        )
+    try:
+        answer = await webrtc_manager.handle_offer(session_id, offer.sdp, offer.type)
+        return {"sdp": answer.sdp, "type": answer.type}
+    except Exception as e:
+        print(f"WebRTC offer error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"WebRTC negotiation failed: {str(e)}"}
+        )
 
 def _process_frame_binary(jpeg_bytes: bytes, audio_pcm: bytes, audio_sr: int,
                           session_id: str, swapper_ref, lip_syncer_ref):
@@ -500,6 +543,8 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
 async def delete_session(session_id: str):
     if swapper:
         swapper.cleanup_session(session_id)
+    if webrtc_manager:
+        await webrtc_manager.cleanup_session(session_id)
     print(f"Session {session_id} cleaned up")
     return {"status": "success", "message": "Session cleaned up"}
 

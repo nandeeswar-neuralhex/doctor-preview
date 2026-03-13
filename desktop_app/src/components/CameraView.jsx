@@ -579,9 +579,27 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                 throw new Error('Unable to access webcam/microphone');
             }
 
-            // Connect via WebSocket directly (runpod_v2 doesn't support WebRTC)
-            setDiagnostics(prev => ({ ...prev, webrtc: 'Connecting via WebSocket...' }));
-            connectWs();
+            // Try WebRTC first for lower latency, fall back to WebSocket.
+            // Probe the server to check if WebRTC is supported before attempting SDP exchange.
+            let useWebRTC = false;
+            try {
+                setDiagnostics(prev => ({ ...prev, webrtc: 'Checking WebRTC support...' }));
+                const probe = await fetch(`${serverUrl}/health`);
+                const probeBody = await probe.json().catch(() => ({}));
+                // Server will report webrtc_enabled in health if we add it; for now
+                // attempt the connection and let it fail fast if unsupported.
+                setDiagnostics(prev => ({ ...prev, webrtc: 'Trying WebRTC connection...' }));
+                await connect(mediaStream);
+                useWebRTC = true;
+                setDiagnostics(prev => ({ ...prev, webrtc: 'WebRTC connected!' }));
+            } catch (rtcErr) {
+                console.log('WebRTC unavailable, falling back to WebSocket:', rtcErr.message);
+                setDiagnostics(prev => ({ ...prev, webrtc: `WebRTC failed: ${rtcErr.message}. Using WebSocket.` }));
+            }
+
+            if (!useWebRTC) {
+                connectWs();
+            }
             setIsStreaming(true);
         } catch (error) {
             setDiagnostics(prev => ({ ...prev, webrtc: `Connection error: ${error.message}` }));

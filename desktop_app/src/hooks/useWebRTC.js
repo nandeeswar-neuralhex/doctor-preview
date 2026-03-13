@@ -80,6 +80,7 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream) {
             setError(e.message || 'WebRTC error');
             setIsConnected(false);
             setConnectionState('failed');
+            throw e; // Re-throw so callers can catch and fall back
         }
     }, [serverUrl, sessionId, onRemoteStream]);
 
