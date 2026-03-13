@@ -10,7 +10,7 @@ from typing import Dict, Optional
 
 import cv2
 import numpy as np
-from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
+from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack, RTCConfiguration, RTCIceServer
 from aiortc.contrib.media import MediaRelay
 from av import VideoFrame, AudioFrame
 
@@ -119,9 +119,9 @@ class WebRTCManager:
             await self.pcs[session_id].close()
             del self.pcs[session_id]
 
-        pc = RTCPeerConnection(configuration={
-            "iceServers": [{"urls": "stun:stun.l.google.com:19302"}]
-        })
+        pc = RTCPeerConnection(configuration=RTCConfiguration(
+            iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
+        ))
         self.pcs[session_id] = pc
 
         audio_buffer = AudioBuffer()
