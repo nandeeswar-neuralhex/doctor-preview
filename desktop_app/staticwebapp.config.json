@@ -1,0 +1,19 @@
+{
+  "navigationFallback": {
+    "rewrite": "/index.html",
+    "exclude": ["/assets/*", "*.{css,js,png,jpg,jpeg,svg,ico,woff,woff2,ttf}"]
+  },
+  "responseOverrides": {
+    "404": {
+      "rewrite": "/index.html",
+      "statusCode": 200
+    }
+  },
+  "globalHeaders": {
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Permissions-Policy": "camera=(*), microphone=(*)"
+  },
+  "mimeTypes": {
+    ".json": "text/json"
+  }
+}
