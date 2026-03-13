@@ -9,6 +9,9 @@ WORKDIR /app
 # System dependencies (devel image has build-essential already)
 # Added WebRTC codec libs: libavcodec, libopus, libvpx, libsrtp2
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
     python3.11 python3.11-dev python3.11-venv python3-pip \
     libgl1-mesa-glx libglib2.0-0 libturbojpeg \
     libavcodec-dev libavformat-dev libavutil-dev \
