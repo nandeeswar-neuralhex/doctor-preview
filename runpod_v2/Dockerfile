@@ -42,6 +42,7 @@ RUN python3 -m pip install --no-cache-dir \
 RUN python3 -m pip install --no-cache-dir insightface==0.7.3
 
 # Step 4: onnxruntime-gpu — MUST be 1.18.1 for cuDNN 8 compatibility
+# Install here first, then reinstall after GFPGAN (which pulls CPU onnxruntime)
 RUN python3 -m pip uninstall -y onnxruntime onnxruntime-gpu 2>/dev/null || true \
     && python3 -m pip install --no-cache-dir onnxruntime-gpu==1.18.1
 
@@ -50,6 +51,10 @@ RUN python3 -m pip install --no-cache-dir gfpgan>=1.3.8 basicsr>=1.4.2 realesrga
 
 # Step 6: WebRTC (aiortc + av)
 RUN python3 -m pip install --no-cache-dir aiortc>=1.7.0 av>=11.0.0
+
+# Step 7: CRITICAL — reinstall onnxruntime-gpu AFTER gfpgan (which pulls CPU onnxruntime)
+RUN python3 -m pip uninstall -y onnxruntime 2>/dev/null || true \
+    && python3 -m pip install --no-cache-dir --force-reinstall onnxruntime-gpu==1.18.1
 
 # Verify critical imports
 RUN python3 -c "\
