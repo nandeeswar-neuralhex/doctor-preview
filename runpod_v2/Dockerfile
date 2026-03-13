@@ -49,6 +49,9 @@ RUN python3 -m pip uninstall -y onnxruntime onnxruntime-gpu 2>/dev/null || true 
 # Step 5: Face enhancement
 RUN python3 -m pip install --no-cache-dir gfpgan>=1.3.8 basicsr>=1.4.2 realesrgan>=0.3.0
 
+# Fix GFPGAN: torchvision >= 0.19 removed functional_tensor, create shim
+RUN python3 -c "import torchvision, os; p=os.path.join(os.path.dirname(torchvision.__file__), 'transforms', 'functional_tensor.py'); open(p,'w').write('from torchvision.transforms.functional import *\n')"
+
 # Step 6: WebRTC (aiortc + av)
 RUN python3 -m pip install --no-cache-dir aiortc>=1.7.0 av>=11.0.0
 
