@@ -332,14 +332,9 @@ def _process_frame_binary(jpeg_bytes: bytes, audio_pcm: bytes, audio_sr: int,
 
     t3 = time.time()
 
-    # ── Output downscale: cap at 720p to reduce bandwidth ──
-    # At 1080x608, JPEG@90 = ~200KB/frame = 4MB/s at 20fps.
-    # At 720p, it's ~80KB/frame = 1.6MB/s — prevents FPS drop on India→US links.
-    MAX_OUTPUT_WIDTH = 1280  # 720p wide = 1280px, reduce to 854 for even less bandwidth
-    out_h, out_w = result.shape[:2]
-    if out_w > MAX_OUTPUT_WIDTH:
-        scale = MAX_OUTPUT_WIDTH / out_w
-        result = cv2.resize(result, (MAX_OUTPUT_WIDTH, int(out_h * scale)), interpolation=cv2.INTER_LINEAR)
+    # ── Output: send at the resolution the client sent ──
+    # The client controls resolution via quality presets (360p–1080p).
+    # We respect whatever they sent — no server-side downscale.
 
     # Encode BGR → JPEG
     if _tj:

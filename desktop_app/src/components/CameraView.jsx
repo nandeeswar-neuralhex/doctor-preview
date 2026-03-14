@@ -2,6 +2,9 @@ import React, { useRef, useEffect, useState, useCallback } from 'react';
 import useWebcam from '../hooks/useWebcam';
 import useWebRTC from '../hooks/useWebRTC';
 import useWebSocket from '../hooks/useWebSocket';
+import useWorkerTimer from '../hooks/useWorkerTimer';
+import QualitySelector from './QualitySelector';
+import QUALITY_PRESETS, { DEFAULT_QUALITY } from '../qualityPresets';
 
 function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setIsStreaming }) {
     const originalVideoRef = useRef(null);
@@ -16,6 +19,9 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     const [fps, setFps] = useState(0);
     const [latency, setLatency] = useState(0);
     const [sessionId] = useState(() => `session-${Date.now()}`);
+    const [transportMode, setTransportMode] = useState('webrtc'); // 'webrtc' | 'websocket'
+    const [qualityPreset, setQualityPreset] = useState(DEFAULT_QUALITY);
+    const qualityRef = useRef(QUALITY_PRESETS[DEFAULT_QUALITY]);
     const [lipSyncEnabled, setLipSyncEnabled] = useState(true);
     const [audioDelayMs, setAudioDelayMs] = useState(300);
     const [exposureAdjust, setExposureAdjust] = useState(0);
@@ -67,12 +73,12 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                     if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
                         canvas.width = bitmap.width;
                         canvas.height = bitmap.height;
+                        // Log response resolution once when it changes
+                        console.log(`[WS-RECV] Server response: ${bitmap.width}×${bitmap.height}`);
+                        setDiagnostics(prev => ({ ...prev, remoteMedia: `Receiving ${bitmap.width}×${bitmap.height}` }));
                     }
                     ctx.drawImage(bitmap, 0, 0);
                     bitmap.close();
-                    if (diagnostics.remoteMedia === null) {
-                        setDiagnostics(prev => ({ ...prev, remoteMedia: 'Receiving frames' }));
-                    }
                 })
                 .catch((err) => {
                     console.error('Canvas paint error:', err);
@@ -113,13 +119,17 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         error: wsError
     } = useWebSocket(serverUrl, sessionId, handleWsFrame);
 
+    const remoteStreamRef = useRef(null);
+
     const {
         isConnected,
         error: rtcError,
         connectionState,
         connect,
-        disconnect
+        disconnect,
+        applyQuality
     } = useWebRTC(serverUrl, sessionId, (remoteStream) => {
+        remoteStreamRef.current = remoteStream;
         if (processedVideoRef.current) {
             processedVideoRef.current.srcObject = remoteStream;
         }
@@ -132,6 +142,14 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         }));
     });
 
+    // Attach remote stream to video element once it renders (WebRTC ontrack
+    // fires before isStreaming flips to true, so the <video> doesn't exist yet)
+    useEffect(() => {
+        if (isStreaming && isConnected && processedVideoRef.current && remoteStreamRef.current) {
+            processedVideoRef.current.srcObject = remoteStreamRef.current;
+        }
+    }, [isStreaming, isConnected]);
+
     // Fallback logic: If WebRTC fails or disconnects, try WebSocket
     useEffect(() => {
         if (isStreaming && !isConnected && connectionState === 'failed' && !isWsConnected) {
@@ -141,7 +159,18 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         }
     }, [isStreaming, isConnected, connectionState, isWsConnected, connectWs]);
 
-    // Send frames via WebSocket if connected – throttled to ~24 FPS
+    // Web Worker timer — immune to browser background-tab throttling.
+    // Browsers clamp setTimeout to ≥1 s for hidden tabs; Worker threads keep
+    // their own event-loop at full speed, so FPS stays steady even when the
+    // doctor switches to another tab or app.
+    const workerTimer = useWorkerTimer();
+
+    // Background-mode debug logger — logs once per second so we can verify
+    // ticks are arriving even when the tab is hidden. Open DevTools Console
+    // then switch tabs to check.
+    const bgDebugRef = useRef({ ticks: 0, sends: 0, errors: 0, lastLog: 0 });
+
+    // Send frames via WebSocket if connected – throttled by quality preset FPS
     useEffect(() => {
         if (!isStreaming || !isWsConnected || !originalVideoRef.current) return;
 
@@ -151,76 +180,147 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
 
         // Grab the video track directly from the camera — ImageCapture reads from
         // the hardware driver, NOT the <video> element. This keeps working when
-        // the Electron window is hidden / unfocused (where drawImage(video, …)
-        // would return a black frame because Chromium pauses video rendering).
+        // the browser tab is hidden (where drawImage(video, …) returns a black
+        // frame because Chromium pauses video rendering).
         const videoTrack = video.srcObject?.getVideoTracks()[0];
         const imageCapture = videoTrack ? new ImageCapture(videoTrack) : null;
 
-        // PIPELINED frame sending: send at fixed rate, don't wait for responses.
-        // With ~300ms RTT, back-pressure limits us to ~3 FPS.
-        // Pipelining: we send 24 FPS continuously, ~8 frames are "in flight"
-        // at any time, and the pipelined server processes them concurrently.
-        // GPU 0 swaps frame N while GPU 1 lip-syncs frame N-1 in parallel.
-        // Result: smooth 24 FPS output regardless of network latency.
+        console.log('[BG-DEBUG] Send loop started.', {
+            hasImageCapture: !!imageCapture,
+            hasVideoTrack: !!videoTrack,
+            videoReadyState: video.readyState,
+            hidden: document.hidden,
+        });
+
         let active = true;
-        const MAX_WIDTH = 1080;      // 1080p — 2x RTX 5090 GPUs handle it, more detail for face models
-        const JPEG_QUALITY = 0.80;   // Higher quality input → better GPU face detection + swap
-        const SEND_FPS = 24;         // 24 FPS — pipelined multi-GPU server handles it
-        const INTERVAL = 1000 / SEND_FPS;
+        let grabInFlight = false;
+        let loggedResolution = false;
+
+        const getQuality = () => qualityRef.current;
 
         const grabAndSend = (bitmap) => {
-            const scale = Math.min(1, MAX_WIDTH / bitmap.width);
+            const q = getQuality();
+            // Downscale to match preset (never upscale — camera should match)
+            const scale = Math.min(1, q.width / bitmap.width);
             canvas.width = Math.round(bitmap.width * scale);
             canvas.height = Math.round(bitmap.height * scale);
+            if (!loggedResolution) {
+                loggedResolution = true;
+                console.log(`[WS-SEND] Camera=${bitmap.width}×${bitmap.height} → Sending=${canvas.width}×${canvas.height} (preset=${q.width}×${q.height}, jpegQ=${q.jpegQuality})`);
+            }
             ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
             bitmap.close();
             canvas.toBlob((blob) => {
                 if (!active || !blob) return;
+                bgDebugRef.current.sends++;
                 sendWsFrame(blob, audioBufferRef.current, audioSampleRateRef.current);
-            }, 'image/jpeg', JPEG_QUALITY);
+            }, 'image/jpeg', q.jpegQuality);
         };
 
-        const sendLoop = () => {
-            if (!active) return;
+        const onTick = () => {
+            if (!active || grabInFlight) return;
+
+            bgDebugRef.current.ticks++;
+            // Log once per second so we can see the ticker in DevTools even when backgrounded
+            const now = Date.now();
+            if (now - bgDebugRef.current.lastLog > 1000) {
+                console.log(`[BG-DEBUG] ticks=${bgDebugRef.current.ticks} sends=${bgDebugRef.current.sends} errors=${bgDebugRef.current.errors} hidden=${document.hidden}`);
+                bgDebugRef.current.lastLog = now;
+            }
+
+            grabInFlight = true;
 
             if (imageCapture) {
-                // Primary path: grab frame directly from camera hardware.
-                // Works even when the window is in the background.
                 imageCapture.grabFrame()
                     .then(bitmap => { if (active) grabAndSend(bitmap); })
-                    .catch(() => {
-                        // Fallback: if grabFrame fails, try the video element
+                    .catch((err) => {
+                        bgDebugRef.current.errors++;
                         if (active && video.readyState === video.HAVE_ENOUGH_DATA) {
-                            const scale = Math.min(1, MAX_WIDTH / video.videoWidth);
+                            const q2 = getQuality();
+                            const scale = Math.min(1, q2.width / video.videoWidth);
                             canvas.width = Math.round(video.videoWidth * scale);
                             canvas.height = Math.round(video.videoHeight * scale);
                             ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
                             canvas.toBlob((blob) => {
                                 if (!active || !blob) return;
+                                bgDebugRef.current.sends++;
                                 sendWsFrame(blob, audioBufferRef.current, audioSampleRateRef.current);
-                            }, 'image/jpeg', JPEG_QUALITY);
+                            }, 'image/jpeg', q2.jpegQuality);
                         }
                     })
-                    .finally(() => { if (active) setTimeout(sendLoop, INTERVAL); });
+                    .finally(() => { grabInFlight = false; });
             } else {
-                // No ImageCapture support: fall back to video element (foreground only)
                 if (video.readyState === video.HAVE_ENOUGH_DATA) {
-                    const scale = Math.min(1, MAX_WIDTH / video.videoWidth);
+                    const q2 = getQuality();
+                    const scale = Math.min(1, q2.width / video.videoWidth);
                     canvas.width = Math.round(video.videoWidth * scale);
                     canvas.height = Math.round(video.videoHeight * scale);
                     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
                     canvas.toBlob((blob) => {
                         if (!active || !blob) return;
+                        bgDebugRef.current.sends++;
                         sendWsFrame(blob, audioBufferRef.current, audioSampleRateRef.current);
-                    }, 'image/jpeg', JPEG_QUALITY);
+                    }, 'image/jpeg', q2.jpegQuality);
                 }
-                setTimeout(sendLoop, INTERVAL);
+                grabInFlight = false;
             }
         };
-        sendLoop();
 
-        return () => { active = false; };
-    }, [isStreaming, isWsConnected, sendWsFrame]);
+        // Start the Worker-based interval — NOT throttled in background tabs.
+        // Combined with Web Lock (inside useWorkerTimer), Chrome won't freeze us.
+        const intervalMs = Math.round(1000 / getQuality().fps);
+        workerTimer.start(intervalMs, onTick);
+
+        return () => {
+            active = false;
+            workerTimer.stop();
+            console.log('[BG-DEBUG] Send loop stopped. Final stats:', { ...bgDebugRef.current });
+            bgDebugRef.current = { ticks: 0, sends: 0, errors: 0, lastLog: 0 };
+        };
+    }, [isStreaming, isWsConnected, sendWsFrame, workerTimer]);
+
+    // Keep quality ref in sync and apply live to WebRTC senders
+    const handleQualityChange = useCallback((newPreset) => {
+        setQualityPreset(newPreset);
+        qualityRef.current = QUALITY_PRESETS[newPreset];
+        // Update Worker timer interval to match new FPS
+        const preset = QUALITY_PRESETS[newPreset];
+        if (preset) workerTimer.setInterval(Math.round(1000 / preset.fps));
+        // Apply to WebRTC senders if connected
+        if (isConnected) {
+            applyQuality(newPreset);
+        }
+    }, [isConnected, applyQuality, workerTimer]);
+
+    // Keep video/audio alive when the browser tab goes to background.
+    // Browsers suspend AudioContext and may pause video tracks—resume them
+    // immediately when the page becomes visible again. WebRTC peer connections
+    // keep RTP flowing in the background but the <video> element freezes, so
+    // re-set srcObject to wake it up.
+    useEffect(() => {
+        if (!isStreaming) return;
+
+        const onVisibilityChange = () => {
+            if (document.visibilityState === 'visible') {
+                // Resume AudioContext if browser suspended it
+                if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
+                    audioCtxRef.current.resume().catch(() => {});
+                }
+                // Re-attach remote stream to wake up the frozen <video> element
+                if (processedVideoRef.current && remoteStreamRef.current && isConnected) {
+                    processedVideoRef.current.srcObject = remoteStreamRef.current;
+                    processedVideoRef.current.play().catch(() => {});
+                }
+                // Ensure camera track is still enabled
+                if (originalVideoRef.current?.srcObject) {
+                    originalVideoRef.current.srcObject.getVideoTracks().forEach(t => { t.enabled = true; });
+                }
+            }
+        };
+
+        document.addEventListener('visibilitychange', onVisibilityChange);
+        return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+    }, [isStreaming, isConnected]);
 
     // Auto re-upload ALL target images when the user adds/removes images mid-stream
     // Track previous images to prevent redundant upload on start (when isStreaming flips to true)
@@ -422,9 +522,13 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
 
     // FPS from processed video – count actual decoded frames
     useEffect(() => {
-        if (!isStreaming || !processedVideoRef.current) return;
+        if (!isStreaming) return;
 
+        // For WebRTC: count via the video element
         const video = processedVideoRef.current;
+        // For WebSocket: FPS is counted in handleWsFrame, skip this effect
+        if (isWsConnected || !video) return;
+
         let frameCount = 0;
         let lastTime = performance.now();
         let active = true;
@@ -461,7 +565,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         }
 
         return () => { active = false; };
-    }, [isStreaming]);
+    }, [isStreaming, isConnected, isWsConnected]);
 
     // Measure round-trip latency via WebRTC stats
     useEffect(() => {
@@ -573,31 +677,39 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                 setDiagnostics(prev => ({ ...prev, settings: 'Settings failed (non-critical)' }));
             });
 
-            // Start webcam
-            const mediaStream = await startWebcam();
+            // Start webcam at the resolution matching the quality preset
+            const preset = QUALITY_PRESETS[qualityPreset] || QUALITY_PRESETS['720p'];
+            const mediaStream = await startWebcam(preset.width, preset.height);
             if (!mediaStream) {
                 throw new Error('Unable to access webcam/microphone');
             }
 
-            // Try WebRTC first for lower latency, fall back to WebSocket.
-            // Probe the server to check if WebRTC is supported before attempting SDP exchange.
-            let useWebRTC = false;
-            try {
-                setDiagnostics(prev => ({ ...prev, webrtc: 'Checking WebRTC support...' }));
-                const probe = await fetch(`${serverUrl}/health`);
-                const probeBody = await probe.json().catch(() => ({}));
-                // Server will report webrtc_enabled in health if we add it; for now
-                // attempt the connection and let it fail fast if unsupported.
-                setDiagnostics(prev => ({ ...prev, webrtc: 'Trying WebRTC connection...' }));
-                await connect(mediaStream);
-                useWebRTC = true;
-                setDiagnostics(prev => ({ ...prev, webrtc: 'WebRTC connected!' }));
-            } catch (rtcErr) {
-                console.log('WebRTC unavailable, falling back to WebSocket:', rtcErr.message);
-                setDiagnostics(prev => ({ ...prev, webrtc: `WebRTC failed: ${rtcErr.message}. Using WebSocket.` }));
+            // Log actual camera resolution for diagnostics
+            const camTrack = mediaStream.getVideoTracks()[0];
+            if (camTrack) {
+                const s = camTrack.getSettings();
+                setDiagnostics(prev => ({
+                    ...prev,
+                    localMedia: {
+                        videoTracks: mediaStream.getVideoTracks().length,
+                        audioTracks: mediaStream.getAudioTracks().length,
+                        resolution: `${s.width}×${s.height}`,
+                    }
+                }));
             }
 
-            if (!useWebRTC) {
+            if (transportMode === 'webrtc') {
+                try {
+                    setDiagnostics(prev => ({ ...prev, webrtc: 'Trying WebRTC...' }));
+                    await connect(mediaStream, qualityPreset);
+                    setDiagnostics(prev => ({ ...prev, webrtc: 'WebRTC connected!' }));
+                } catch (rtcErr) {
+                    console.log('WebRTC failed, falling back to WebSocket:', rtcErr.message);
+                    setDiagnostics(prev => ({ ...prev, webrtc: `WebRTC failed: ${rtcErr.message} → using WebSocket` }));
+                    connectWs();
+                }
+            } else {
+                setDiagnostics(prev => ({ ...prev, webrtc: 'Using WebSocket (manual)' }));
                 connectWs();
             }
             setIsStreaming(true);
@@ -646,15 +758,15 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     return (
         <div className="h-full flex flex-col">
             {/* Controls */}
-            <div className="mb-4 flex items-center justify-between">
-                <div className="flex items-center gap-4">
+            <div className="mb-3 md:mb-4 flex flex-wrap items-center gap-3 md:gap-4">
+                <div className="flex items-center gap-3">
                     {!isStreaming ? (
                         <button
                             onClick={handleStart}
                             disabled={!serverUrl || !targetImage}
-                            className="px-6 py-3 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors flex items-center gap-2"
+                            className="px-4 py-2 md:px-6 md:py-3 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors flex items-center gap-2 text-sm md:text-base"
                         >
-                            <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
+                            <svg className="w-4 h-4 md:w-5 md:h-5" fill="currentColor" viewBox="0 0 20 20">
                                 <path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z" />
                             </svg>
                             Start Preview
@@ -662,87 +774,113 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                     ) : (
                         <button
                             onClick={handleStop}
-                            className="px-6 py-3 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition-colors flex items-center gap-2"
+                            className="px-4 py-2 md:px-6 md:py-3 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition-colors flex items-center gap-2 text-sm md:text-base"
                         >
-                            <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
+                            <svg className="w-4 h-4 md:w-5 md:h-5" fill="currentColor" viewBox="0 0 20 20">
                                 <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 00-1 1v4a1 1 0 001 1h4a1 1 0 001-1V8a1 1 0 00-1-1H8z" clipRule="evenodd" />
                             </svg>
-                            Stop Preview
+                            Stop
                         </button>
                     )}
-                </div>
-
-                {/* Settings quick toggles */}
-                <div className="flex items-center gap-4">
-                    <label className="flex items-center gap-2 text-sm text-gray-300">
-                        <input
-                            type="checkbox"
-                            checked={lipSyncEnabled}
-                            onChange={(e) => setLipSyncEnabled(e.target.checked)}
-                            disabled={isStreaming}
-                        />
-                        Lip Sync
-                    </label>
-                    <div className="flex items-center gap-2 text-sm text-gray-300">
-                        <span className="whitespace-nowrap">Audio Delay:</span>
-                        <input
-                            type="range"
-                            min="0"
-                            max="1000"
-                            step="50"
-                            value={audioDelayMs}
-                            onChange={(e) => setAudioDelayMs(Number(e.target.value))}
-                            className="w-24 accent-blue-500"
-                        />
-                        <span className="font-mono text-blue-400 font-semibold w-14 text-right">{audioDelayMs}ms</span>
-                    </div>
-                    <div className="flex items-center gap-2 text-sm text-gray-300">
-                        <span className="whitespace-nowrap">Exposure:</span>
-                        <input
-                            type="range"
-                            min="-40"
-                            max="40"
-                            step="1"
-                            value={exposureAdjust}
-                            onChange={(e) => setExposureAdjust(Number(e.target.value))}
-                            className="w-24 accent-blue-500"
-                        />
-                        <span className="font-mono text-blue-400 font-semibold w-12 text-right">
-                            {exposureAdjust > 0 ? `+${exposureAdjust}` : exposureAdjust}
-                        </span>
-                    </div>
                     <button
                         onClick={handleHealthCheck}
                         className="px-3 py-2 text-xs bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors"
                     >
-                        Check /health
+                        Health
                     </button>
                 </div>
 
-                {/* Stats */}
+                {/* Transport mode selector */}
+                {!isStreaming && (
+                    <div className="flex items-center gap-2">
+                        <span className="text-xs text-gray-400">Transport:</span>
+                        <select
+                            value={transportMode}
+                            onChange={(e) => setTransportMode(e.target.value)}
+                            className="bg-gray-700 border border-gray-600 text-white text-xs rounded-lg px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                            <option value="webrtc">⚡ WebRTC (low latency)</option>
+                            <option value="websocket">🔌 WebSocket (stable)</option>
+                        </select>
+                    </div>
+                )}
                 {isStreaming && (
-                    <div className="flex gap-6 text-sm">
-                        <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-1.5">
+                        <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-purple-400 animate-pulse' : isWsConnected ? 'bg-blue-400 animate-pulse' : 'bg-gray-500'}`}></span>
+                        <span className="text-xs text-gray-300">{isConnected ? '⚡ WebRTC' : isWsConnected ? '🔌 WebSocket' : 'disconnected'}</span>
+                    </div>
+                )}
+
+                {/* Stats (inline with controls on mobile) */}
+                {isStreaming && (
+                    <div className="flex flex-wrap gap-3 md:gap-6 text-xs md:text-sm">
+                        <div className="flex items-center gap-1">
                             <span className="text-gray-400">FPS:</span>
                             <span className="font-mono text-green-400 font-semibold">{fps}</span>
                         </div>
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-1">
                             <span className="text-gray-400">Latency:</span>
                             <span className="font-mono text-blue-400 font-semibold">{latency}ms</span>
                         </div>
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-1">
                             <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500 animate-pulse' : isWsConnected ? 'bg-blue-500 animate-pulse' : 'bg-red-500'}`}></span>
                             <span className="text-gray-400">
-                                {isConnected ? 'WebRTC' : isWsConnected ? 'WebSocket' : 'Disconnected'}
-                                ({isConnected ? connectionState : isWsConnected ? 'connected' : 'failed'})
+                                {isConnected ? 'WebRTC' : isWsConnected ? 'WS' : 'Off'}
                             </span>
                         </div>
                     </div>
                 )}
+
+                {/* YouTube-style quality selector — works during stream */}
+                <QualitySelector
+                    quality={qualityPreset}
+                    onChange={handleQualityChange}
+                />
+            </div>
+
+            {/* Settings quick toggles */}
+            <div className="mb-3 md:mb-4 flex flex-wrap items-center gap-3 md:gap-4">
+                <label className="flex items-center gap-2 text-xs md:text-sm text-gray-300">
+                    <input
+                        type="checkbox"
+                        checked={lipSyncEnabled}
+                        onChange={(e) => setLipSyncEnabled(e.target.checked)}
+                        disabled={isStreaming}
+                    />
+                    Lip Sync
+                </label>
+                <div className="flex items-center gap-2 text-xs md:text-sm text-gray-300">
+                    <span className="whitespace-nowrap">Delay:</span>
+                    <input
+                        type="range"
+                        min="0"
+                        max="1000"
+                        step="50"
+                        value={audioDelayMs}
+                        onChange={(e) => setAudioDelayMs(Number(e.target.value))}
+                        className="w-16 md:w-24 accent-blue-500"
+                    />
+                    <span className="font-mono text-blue-400 font-semibold text-right">{audioDelayMs}ms</span>
+                </div>
+                <div className="flex items-center gap-2 text-xs md:text-sm text-gray-300">
+                    <span className="whitespace-nowrap">Exposure:</span>
+                    <input
+                        type="range"
+                        min="-40"
+                        max="40"
+                        step="1"
+                        value={exposureAdjust}
+                        onChange={(e) => setExposureAdjust(Number(e.target.value))}
+                        className="w-16 md:w-24 accent-blue-500"
+                    />
+                    <span className="font-mono text-blue-400 font-semibold text-right">
+                        {exposureAdjust > 0 ? `+${exposureAdjust}` : exposureAdjust}
+                    </span>
+                </div>
             </div>
 
             {/* Session Info */}
-            <div className="mb-4 grid grid-cols-2 gap-4 text-sm">
+            <div className="mb-3 md:mb-4 grid grid-cols-1 md:grid-cols-2 gap-2 md:gap-4 text-xs md:text-sm">
                 <div className="bg-gray-800 border border-gray-700 rounded-lg p-3">
                     <div className="text-gray-400">Session ID</div>
                     <div className="text-white font-mono break-all">...{sessionId.slice(-6)}</div>
@@ -756,7 +894,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
             </div>
 
             {/* Video Display */}
-            <div className="flex-1 grid grid-cols-2 gap-4">
+            <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-3 md:gap-4">
                 {/* Original Feed */}
                 <div
                     className={`bg-gray-800 rounded-lg overflow-hidden border border-gray-700 transition-all duration-300 ${fullScreenView === 'original' ? 'fixed inset-0 z-50 !rounded-none m-0' : ''} ${fullScreenView === 'processed' ? 'hidden' : ''}`}
@@ -787,10 +925,10 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                             />
                         ) : (
                             <div className="text-center text-gray-500">
-                                <svg className="w-16 h-16 mx-auto mb-4 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <svg className="w-10 h-10 md:w-16 md:h-16 mx-auto mb-2 md:mb-4 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
                                 </svg>
-                                <p>Camera not active</p>
+                                <p className="text-sm">Camera not active</p>
                             </div>
                         )}
                     </div>
@@ -835,10 +973,10 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                             )
                         ) : (
                             <div className="text-center text-gray-500">
-                                <svg className="w-16 h-16 mx-auto mb-4 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <svg className="w-10 h-10 md:w-16 md:h-16 mx-auto mb-2 md:mb-4 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
                                 </svg>
-                                <p>AI processing inactive</p>
+                                <p className="text-sm">AI processing inactive</p>
                             </div>
                         )}
                     </div>
@@ -847,15 +985,15 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
 
             {/* Errors */}
             {(webcamError || rtcError) && (
-                <div className="mt-4 p-4 bg-red-900/50 border border-red-700 rounded-lg">
-                    <p className="text-red-200">
+                <div className="mt-3 md:mt-4 p-3 md:p-4 bg-red-900/50 border border-red-700 rounded-lg">
+                    <p className="text-red-200 text-sm">
                         {webcamError || rtcError}
                     </p>
                 </div>
             )}
 
             {/* Diagnostics */}
-            <div className="mt-4 p-4 bg-gray-800 border border-gray-700 rounded-lg text-xs text-gray-300 space-y-1">
+            <div className="mt-3 md:mt-4 p-3 md:p-4 bg-gray-800 border border-gray-700 rounded-lg text-[10px] md:text-xs text-gray-300 space-y-1">
                 <div><span className="text-gray-400">Health:</span> {diagnostics.health || '—'}</div>
                 <div><span className="text-gray-400">Upload:</span> {diagnostics.upload || '—'}</div>
                 <div><span className="text-gray-400">Settings:</span> {diagnostics.settings || '—'}</div>
@@ -863,7 +1001,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                 <div>
                     <span className="text-gray-400">Local media:</span>{' '}
                     {diagnostics.localMedia
-                        ? `video=${diagnostics.localMedia.videoTracks}, audio=${diagnostics.localMedia.audioTracks}`
+                        ? `video=${diagnostics.localMedia.videoTracks}, audio=${diagnostics.localMedia.audioTracks}${diagnostics.localMedia.resolution ? ` (${diagnostics.localMedia.resolution})` : ''}`
                         : '—'}
                 </div>
                 <div>

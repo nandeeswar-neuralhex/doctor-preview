@@ -51,10 +51,10 @@ function BookingCheck({ onSuccess }) {
     };
 
     return (
-        <div className="flex flex-col items-center justify-center h-screen bg-gray-900 text-white">
-            <div className="w-full max-w-md p-8 bg-gray-800 rounded-lg shadow-lg">
-                <h2 className="text-3xl font-bold text-center mb-2">Doctor Preview</h2>
-                <p className="text-center text-gray-400 mb-8 text-sm">Enter your booking code to continue</p>
+        <div className="flex flex-col items-center justify-center h-screen bg-gray-900 text-white px-4">
+            <div className="w-full max-w-md p-6 md:p-8 bg-gray-800 rounded-lg shadow-lg">
+                <h2 className="text-2xl md:text-3xl font-bold text-center mb-2">Doctor Preview</h2>
+                <p className="text-center text-gray-400 mb-6 md:mb-8 text-sm">Enter your booking code to continue</p>
 
                 {error && (
                     <div className="bg-red-500 bg-opacity-20 border border-red-500 text-red-200 px-4 py-3 rounded mb-6 text-sm text-center">

@@ -595,7 +595,7 @@ class FaceSwapper:
             alpha = (blurred_mask.astype(np.float32) / 255.0)[..., None]
             blended_roi = (roi_frame * (1 - alpha) + roi_warped * alpha).astype(np.uint8)
 
-            result = frame.copy()
+            result = frame  # modify in-place — caller doesn't reuse the input
             result[roi_y1:roi_y2, roi_x1:roi_x2] = blended_roi
             return result
 

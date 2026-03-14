@@ -15,16 +15,23 @@ function useWebcam(withAudio = false, audioDelayMs = 300) {
         }
     }, [audioDelayMs]);
 
-    const startWebcam = useCallback(async () => {
+    const startWebcam = useCallback(async (requestWidth = 1280, requestHeight = 720) => {
         try {
             const mediaStream = await navigator.mediaDevices.getUserMedia({
                 video: {
-                    width: { ideal: 1280 },
-                    height: { ideal: 720 },
+                    width: { ideal: requestWidth },
+                    height: { ideal: requestHeight },
                     facingMode: 'user'
                 },
                 audio: withAudio
             });
+
+            // Log actual camera resolution for debugging
+            const vTrack = mediaStream.getVideoTracks()[0];
+            if (vTrack) {
+                const s = vTrack.getSettings();
+                console.log(`[Webcam] Requested ${requestWidth}×${requestHeight}, got ${s.width}×${s.height} @ ${s.frameRate}fps`);
+            }
 
             if (withAudio) {
                 // Enumerate all devices and log them for debugging
