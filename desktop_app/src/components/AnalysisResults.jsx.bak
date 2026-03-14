@@ -1,0 +1,262 @@
+import React, { useState } from 'react';
+import HeatmapOverlay from './HeatmapOverlay';
+import FaceMeasurements from './FaceMeasurements';
+
+/**
+ * AnalysisResults — Dashboard view showing all analysis scores, heatmaps, and detections.
+ */
+
+const SCORE_COLORS = {
+    excellent: '#22c55e',
+    good: '#84cc16',
+    fair: '#eab308',
+    poor: '#ef4444',
+};
+
+function getScoreColor(score) {
+    if (score >= 85) return SCORE_COLORS.excellent;
+    if (score >= 70) return SCORE_COLORS.good;
+    if (score >= 50) return SCORE_COLORS.fair;
+    return SCORE_COLORS.poor;
+}
+
+function getScoreLabel(score) {
+    if (score >= 85) return 'Excellent';
+    if (score >= 70) return 'Good';
+    if (score >= 50) return 'Fair';
+    return 'Needs Attention';
+}
+
+export default function AnalysisResults({ result }) {
+    const [activeHeatmap, setActiveHeatmap] = useState(null);
+    const [showMeasurements, setShowMeasurements] = useState(false);
+
+    if (!result) return null;
+
+    const {
+        overall_score = 0,
+        skin_age,
+        zone_scores = {},
+        conditions = [],
+        symmetry = {},
+        measurements = {},
+        heatmaps = {},
+        recommendations = [],
+        processing_time_ms = 0,
+        analyzer_scores = {},
+    } = result;
+
+    const scoreColor = getScoreColor(overall_score);
+
+    return (
+        <div className="p-6 space-y-6 max-w-6xl mx-auto">
+            {/* Overall Score Card */}
+            <div className="bg-gradient-to-br from-gray-900 to-gray-800 rounded-2xl p-8 text-center border border-gray-700">
+                <h2 className="text-gray-400 text-sm font-medium mb-4">Overall Skin Health</h2>
+                <div className="relative inline-block">
+                    <svg width="180" height="180" className="transform -rotate-90">
+                        <circle cx="90" cy="90" r="78" fill="none" stroke="#374151" strokeWidth="12" />
+                        <circle
+                            cx="90" cy="90" r="78" fill="none"
+                            stroke={scoreColor}
+                            strokeWidth="12"
+                            strokeLinecap="round"
+                            strokeDasharray={`${overall_score * 4.9} 490`}
+                        />
+                    </svg>
+                    <div className="absolute inset-0 flex flex-col items-center justify-center">
+                        <span className="text-4xl font-bold" style={{ color: scoreColor }}>
+                            {overall_score.toFixed(0)}
+                        </span>
+                        <span className="text-gray-400 text-xs">/ 100</span>
+                    </div>
+                </div>
+                <div className="mt-4">
+                    <span className="text-lg font-medium" style={{ color: scoreColor }}>
+                        {getScoreLabel(overall_score)}
+                    </span>
+                    {skin_age && (
+                        <p className="text-gray-500 text-sm mt-1">Estimated Skin Age: <strong className="text-white">{skin_age}</strong></p>
+                    )}
+                    <p className="text-gray-600 text-xs mt-1">Analyzed in {processing_time_ms.toFixed(0)}ms</p>
+                </div>
+            </div>
+
+            {/* Analyzer Score Bars */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                {Object.entries(analyzer_scores).map(([key, score]) => (
+                    <div key={key} className="bg-gray-900 rounded-xl p-4 border border-gray-800">
+                        <div className="flex justify-between items-center mb-2">
+                            <span className="text-xs text-gray-400 capitalize">{key}</span>
+                            <span className="text-sm font-bold" style={{ color: getScoreColor(score) }}>
+                                {score.toFixed(0)}
+                            </span>
+                        </div>
+                        <div className="h-2 bg-gray-800 rounded-full overflow-hidden">
+                            <div
+                                className="h-full rounded-full transition-all duration-500"
+                                style={{ width: `${score}%`, background: getScoreColor(score) }}
+                            />
+                        </div>
+                    </div>
+                ))}
+            </div>
+
+            {/* Heatmaps */}
+            {Object.keys(heatmaps).length > 0 && (
+                <div className="bg-gray-900 rounded-2xl p-6 border border-gray-800">
+                    <h3 className="text-sm font-semibold text-gray-400 mb-4">🗺️ Analysis Heatmaps</h3>
+                    <div className="flex gap-2 mb-4 flex-wrap">
+                        {Object.keys(heatmaps).map(key => (
+                            <button
+                                key={key}
+                                onClick={() => setActiveHeatmap(activeHeatmap === key ? null : key)}
+                                className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                                    activeHeatmap === key
+                                        ? 'bg-indigo-600 text-white'
+                                        : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                                }`}
+                            >
+                                {key.charAt(0).toUpperCase() + key.slice(1)}
+                            </button>
+                        ))}
+                    </div>
+                    {activeHeatmap && (
+                        <HeatmapOverlay
+                            imageBase64={heatmaps[activeHeatmap]}
+                            label={activeHeatmap}
+                        />
+                    )}
+                </div>
+            )}
+
+            {/* Zone Scores Table */}
+            {Object.keys(zone_scores).length > 0 && (
+                <div className="bg-gray-900 rounded-2xl p-6 border border-gray-800 overflow-auto">
+                    <h3 className="text-sm font-semibold text-gray-400 mb-4">📏 Zone-by-Zone Scoring</h3>
+                    <table className="w-full text-sm">
+                        <thead>
+                            <tr className="text-gray-500 border-b border-gray-800">
+                                <th className="text-left py-2 px-3">Zone</th>
+                                <th className="py-2 px-2">Wrinkles</th>
+                                <th className="py-2 px-2">Pores</th>
+                                <th className="py-2 px-2">Pigment</th>
+                                <th className="py-2 px-2">Redness</th>
+                                <th className="py-2 px-2">Texture</th>
+                                <th className="py-2 px-2 font-bold">Overall</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {Object.entries(zone_scores).map(([zone, scores]) => (
+                                <tr key={zone} className="border-b border-gray-800/50 hover:bg-gray-800/30">
+                                    <td className="py-2 px-3 text-gray-300 capitalize">
+                                        {zone.replace(/_/g, ' ')}
+                                    </td>
+                                    {['wrinkle', 'pore', 'pigmentation', 'redness', 'texture', 'overall'].map(k => (
+                                        <td key={k} className="py-2 px-2 text-center">
+                                            <span style={{ color: getScoreColor(scores[k] || 0) }}>
+                                                {(scores[k] || 0).toFixed(0)}
+                                            </span>
+                                        </td>
+                                    ))}
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+            )}
+
+            {/* Symmetry */}
+            {symmetry?.overall_score > 0 && (
+                <div className="bg-gray-900 rounded-2xl p-6 border border-gray-800">
+                    <h3 className="text-sm font-semibold text-gray-400 mb-4">🔄 Symmetry Analysis</h3>
+                    <div className="space-y-3">
+                        {[
+                            ['Overall', symmetry.overall_score],
+                            ['Eyes', symmetry.eye_alignment],
+                            ['Cheeks', symmetry.cheek_balance],
+                            ['Jawline', symmetry.jawline_symmetry],
+                            ['Lips', symmetry.lip_symmetry],
+                        ].map(([label, val]) => (
+                            <div key={label} className="flex items-center gap-3">
+                                <span className="w-20 text-xs text-gray-400">{label}</span>
+                                <div className="flex-1 h-2.5 bg-gray-800 rounded-full overflow-hidden">
+                                    <div
+                                        className="h-full rounded-full"
+                                        style={{ width: `${val || 0}%`, background: getScoreColor(val || 0) }}
+                                    />
+                                </div>
+                                <span className="w-12 text-right text-sm font-medium" style={{ color: getScoreColor(val || 0) }}>
+                                    {(val || 0).toFixed(0)}%
+                                </span>
+                            </div>
+                        ))}
+                        {symmetry.midline_deviation_mm > 0 && (
+                            <p className="text-xs text-gray-500 mt-2">
+                                Midline deviation: {symmetry.midline_deviation_mm.toFixed(1)}mm
+                            </p>
+                        )}
+                    </div>
+                </div>
+            )}
+
+            {/* Measurements Toggle */}
+            {Object.keys(measurements).length > 0 && (
+                <div className="bg-gray-900 rounded-2xl border border-gray-800 overflow-hidden">
+                    <button
+                        onClick={() => setShowMeasurements(!showMeasurements)}
+                        className="w-full p-4 text-left flex justify-between items-center hover:bg-gray-800/50"
+                    >
+                        <h3 className="text-sm font-semibold text-gray-400">📐 Facial Measurements</h3>
+                        <span className="text-gray-500">{showMeasurements ? '▲' : '▼'}</span>
+                    </button>
+                    {showMeasurements && <FaceMeasurements measurements={measurements} />}
+                </div>
+            )}
+
+            {/* Conditions */}
+            {conditions.length > 0 && (
+                <div className="bg-gray-900 rounded-2xl p-6 border border-gray-800">
+                    <h3 className="text-sm font-semibold text-gray-400 mb-4">🎯 Conditions Detected</h3>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        {conditions.map((c, i) => {
+                            const icon = c.severity === 'severe' ? '🔴' : c.severity === 'moderate' ? '🟡' : '🟢';
+                            return (
+                                <div key={i} className="flex items-start gap-3 bg-gray-800/50 rounded-lg p-3">
+                                    <span className="text-lg">{icon}</span>
+                                    <div>
+                                        <p className="text-sm font-medium text-gray-200 capitalize">
+                                            {c.type?.replace(/_/g, ' ')}
+                                        </p>
+                                        <p className="text-xs text-gray-500">
+                                            {c.severity} · {c.zone?.replace(/_/g, ' ')}
+                                            {c.count > 0 && ` · ${c.count} detected`}
+                                        </p>
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+            )}
+
+            {/* Recommendations */}
+            {recommendations.length > 0 && (
+                <div className="bg-gray-900 rounded-2xl p-6 border border-gray-800">
+                    <h3 className="text-sm font-semibold text-gray-400 mb-4">💡 Recommendations</h3>
+                    <div className="space-y-3">
+                        {recommendations.map((r, i) => (
+                            <div key={i} className="flex gap-3 bg-indigo-900/20 border border-indigo-800/30 rounded-lg p-4">
+                                <span className="text-sm font-bold text-indigo-400">#{r.priority}</span>
+                                <div>
+                                    <p className="text-sm font-medium text-gray-200">{r.area}</p>
+                                    <p className="text-xs text-gray-400 mt-1">{r.suggestion}</p>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}

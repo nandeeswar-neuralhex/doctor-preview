@@ -1,0 +1,157 @@
+import React, { useState, useEffect } from 'react';
+
+/**
+ * BeforeAfter — Compare two analysis sessions side-by-side.
+ */
+
+export default function BeforeAfter({ sessions, serverUrl, onLoadSession }) {
+    const [beforeId, setBeforeId] = useState('');
+    const [afterId, setAfterId] = useState('');
+    const [comparison, setComparison] = useState(null);
+    const [loading, setLoading] = useState(false);
+
+    const compare = async () => {
+        if (!beforeId || !afterId) return;
+        setLoading(true);
+        try {
+            const res = await fetch(`${serverUrl}/compare/${beforeId}/${afterId}`);
+            if (res.ok) {
+                const data = await res.json();
+                setComparison(data);
+            }
+        } catch (err) {
+            console.error('Compare failed:', err);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const getScoreColor = (score) => {
+        if (score >= 80) return '#22c55e';
+        if (score >= 60) return '#eab308';
+        return '#ef4444';
+    };
+
+    return (
+        <div className="p-6 max-w-5xl mx-auto space-y-6">
+            {/* Session Selector */}
+            <div className="bg-gray-900 rounded-2xl p-6 border border-gray-800">
+                <h3 className="text-sm font-semibold text-gray-400 mb-4">Select Sessions to Compare</h3>
+                <div className="flex gap-4 items-end">
+                    <div className="flex-1">
+                        <label className="text-xs text-gray-500 block mb-1">Before (Earlier Session)</label>
+                        <select
+                            value={beforeId}
+                            onChange={e => setBeforeId(e.target.value)}
+                            className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                        >
+                            <option value="">Select session...</option>
+                            {sessions.map(s => (
+                                <option key={s.session_id} value={s.session_id}>
+                                    {s.patient?.name || 'Unknown'} — Score: {s.overall_score?.toFixed(0) || '?'}
+                                </option>
+                            ))}
+                        </select>
+                    </div>
+                    <span className="text-gray-500 text-2xl pb-2">→</span>
+                    <div className="flex-1">
+                        <label className="text-xs text-gray-500 block mb-1">After (Later Session)</label>
+                        <select
+                            value={afterId}
+                            onChange={e => setAfterId(e.target.value)}
+                            className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm"
+                        >
+                            <option value="">Select session...</option>
+                            {sessions.map(s => (
+                                <option key={s.session_id} value={s.session_id}>
+                                    {s.patient?.name || 'Unknown'} — Score: {s.overall_score?.toFixed(0) || '?'}
+                                </option>
+                            ))}
+                        </select>
+                    </div>
+                    <button
+                        onClick={compare}
+                        disabled={!beforeId || !afterId || loading}
+                        className="px-6 py-2 bg-indigo-600 hover:bg-indigo-700 rounded-lg text-sm font-medium disabled:opacity-40"
+                    >
+                        {loading ? '⏳' : '🔍 Compare'}
+                    </button>
+                </div>
+            </div>
+
+            {/* Comparison Results */}
+            {comparison && (
+                <>
+                    {/* Overall Delta */}
+                    <div className="bg-gray-900 rounded-2xl p-6 border border-gray-800 text-center">
+                        <p className="text-gray-400 text-sm mb-2">Overall Change</p>
+                        <div className="flex items-center justify-center gap-8">
+                            <div>
+                                <p className="text-3xl font-bold" style={{ color: getScoreColor(comparison.session_before?.overall_score || 0) }}>
+                                    {(comparison.session_before?.overall_score || 0).toFixed(0)}
+                                </p>
+                                <p className="text-xs text-gray-500">Before</p>
+                            </div>
+                            <span className="text-4xl text-gray-500">→</span>
+                            <div>
+                                <p className="text-3xl font-bold" style={{ color: getScoreColor(comparison.session_after?.overall_score || 0) }}>
+                                    {(comparison.session_after?.overall_score || 0).toFixed(0)}
+                                </p>
+                                <p className="text-xs text-gray-500">After</p>
+                            </div>
+                            <div className={`text-2xl font-bold ${comparison.overall_delta > 0 ? 'text-green-400' : comparison.overall_delta < 0 ? 'text-red-400' : 'text-gray-400'}`}>
+                                {comparison.overall_delta > 0 ? '+' : ''}{comparison.overall_delta?.toFixed(1)}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Improvements */}
+                    {comparison.improvements?.length > 0 && (
+                        <div className="bg-gray-900 rounded-2xl p-6 border border-gray-800">
+                            <h3 className="text-sm font-semibold text-green-400 mb-3">✅ Improvements</h3>
+                            <div className="space-y-2">
+                                {comparison.improvements.map((item, i) => (
+                                    <div key={i} className="flex items-center gap-3 bg-green-900/20 rounded-lg p-3">
+                                        <span className="text-green-400 font-bold text-sm">+{item.delta?.toFixed(1)}</span>
+                                        <span className="text-gray-300 text-sm capitalize">{item.zone?.replace(/_/g, ' ')}</span>
+                                        <span className="text-gray-500 text-xs capitalize">{item.metric}</span>
+                                        <span className="ml-auto text-gray-500 text-xs">
+                                            {item.before?.toFixed(0)} → {item.after?.toFixed(0)}
+                                        </span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Regressions */}
+                    {comparison.regressions?.length > 0 && (
+                        <div className="bg-gray-900 rounded-2xl p-6 border border-gray-800">
+                            <h3 className="text-sm font-semibold text-red-400 mb-3">⚠️ Needs Attention</h3>
+                            <div className="space-y-2">
+                                {comparison.regressions.map((item, i) => (
+                                    <div key={i} className="flex items-center gap-3 bg-red-900/20 rounded-lg p-3">
+                                        <span className="text-red-400 font-bold text-sm">{item.delta?.toFixed(1)}</span>
+                                        <span className="text-gray-300 text-sm capitalize">{item.zone?.replace(/_/g, ' ')}</span>
+                                        <span className="text-gray-500 text-xs capitalize">{item.metric}</span>
+                                        <span className="ml-auto text-gray-500 text-xs">
+                                            {item.before?.toFixed(0)} → {item.after?.toFixed(0)}
+                                        </span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                </>
+            )}
+
+            {!comparison && (
+                <div className="text-center text-gray-500 mt-16">
+                    <p className="text-5xl mb-4">📈</p>
+                    <p>Select two sessions above to compare results</p>
+                    <p className="text-sm text-gray-600 mt-1">Track improvements over multiple visits</p>
+                </div>
+            )}
+        </div>
+    );
+}

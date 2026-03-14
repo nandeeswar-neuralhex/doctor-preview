@@ -1,0 +1,28 @@
+# Doctor Face Analysis — Backend Dependencies
+
+# Core
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+python-multipart==0.0.9
+pydantic==2.8.0
+
+# Computer Vision
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+scipy==1.13.0
+mediapipe==0.10.14
+
+# Image Processing
+Pillow==10.3.0
+
+# Report Generation (optional — fallback to HTML if not available)
+# weasyprint==62.0
+
+# GPU Support (install separately based on environment)
+# torch==2.3.0
+# onnxruntime-gpu==1.18.0
+
+# Testing
+pytest==8.2.0
+pytest-asyncio==0.23.0
+httpx==0.27.0

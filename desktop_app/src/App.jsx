@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useAuth, useClerk } from '@clerk/clerk-react';
 import ImageUpload from './components/ImageUpload';
 import CameraView from './components/CameraView';
+import FaceAnalysis from './components/FaceAnalysis';
 import Login from './components/Login';
 
 const SESSION_DURATION_MS = 90 * 60 * 1000; // 90 minutes
@@ -33,6 +34,7 @@ function App() {
     const [selectedImageIndex, setSelectedImageIndex] = useState(0);
     const [isStreaming, setIsStreaming] = useState(false);
     const [sessionMinsLeft, setSessionMinsLeft] = useState(null);
+    const [activeTab, setActiveTab] = useState('preview'); // 'preview' | 'analysis'
 
     const handleLogin = () => {
         // This is handled by Clerk now, but kept for compatibility
@@ -195,6 +197,29 @@ function App() {
                         <h1 className="text-2xl font-bold text-white">Doctor Preview</h1>
                         <p className="text-sm text-gray-400">Real-time Surgery Preview System</p>
                     </div>
+                    {/* Module Tabs */}
+                    <div className="flex gap-1 bg-gray-900 rounded-lg p-1">
+                        <button
+                            onClick={() => setActiveTab('preview')}
+                            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                                activeTab === 'preview'
+                                    ? 'bg-indigo-600 text-white'
+                                    : 'text-gray-400 hover:text-white hover:bg-gray-700'
+                            }`}
+                        >
+                            🎥 Live Preview
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('analysis')}
+                            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                                activeTab === 'analysis'
+                                    ? 'bg-indigo-600 text-white'
+                                    : 'text-gray-400 hover:text-white hover:bg-gray-700'
+                            }`}
+                        >
+                            🔬 Face Analysis
+                        </button>
+                    </div>
                     <div className="flex items-center gap-4">
                         {sessionMinsLeft !== null && (
                             <span className="text-xs text-gray-500">
@@ -213,27 +238,35 @@ function App() {
 
             {/* Main Content */}
             <div className="flex-1 flex overflow-hidden">
-                {/* Left Sidebar - Image Upload */}
-                <aside className="w-80 bg-gray-800 border-r border-gray-700 p-6 overflow-y-auto">
-                    <ImageUpload
-                        targetImages={targetImages}
-                        setTargetImages={setTargetImages}
-                        selectedImageIndex={selectedImageIndex}
-                        setSelectedImageIndex={setSelectedImageIndex}
-                        serverUrl={serverUrl}
-                    />
-                </aside>
+                {activeTab === 'preview' ? (
+                    <>
+                        {/* Left Sidebar - Image Upload */}
+                        <aside className="w-80 bg-gray-800 border-r border-gray-700 p-6 overflow-y-auto">
+                            <ImageUpload
+                                targetImages={targetImages}
+                                setTargetImages={setTargetImages}
+                                selectedImageIndex={selectedImageIndex}
+                                setSelectedImageIndex={setSelectedImageIndex}
+                                serverUrl={serverUrl}
+                            />
+                        </aside>
 
-                {/* Main Area - Camera View */}
-                <main className="flex-1 p-6">
-                    <CameraView
-                        serverUrl={serverUrl}
-                        targetImage={targetImages[selectedImageIndex]}
-                        allTargetImages={targetImages}
-                        isStreaming={isStreaming}
-                        setIsStreaming={setIsStreaming}
-                    />
-                </main>
+                        {/* Main Area - Camera View */}
+                        <main className="flex-1 p-6">
+                            <CameraView
+                                serverUrl={serverUrl}
+                                targetImage={targetImages[selectedImageIndex]}
+                                allTargetImages={targetImages}
+                                isStreaming={isStreaming}
+                                setIsStreaming={setIsStreaming}
+                            />
+                        </main>
+                    </>
+                ) : (
+                    <main className="flex-1 overflow-y-auto">
+                        <FaceAnalysis serverUrl={serverUrl} />
+                    </main>
+                )}
             </div>
 
             {/* Footer */}

@@ -1,0 +1,43 @@
+import React from 'react';
+
+/**
+ * HeatmapOverlay — Displays analysis heatmap images with legend.
+ */
+
+export default function HeatmapOverlay({ imageBase64, label }) {
+    if (!imageBase64) return null;
+
+    return (
+        <div className="space-y-3">
+            <div className="relative rounded-xl overflow-hidden border border-gray-700">
+                <img
+                    src={`data:image/png;base64,${imageBase64}`}
+                    alt={`${label} heatmap`}
+                    className="w-full max-h-[500px] object-contain bg-gray-950"
+                />
+                <div className="absolute top-3 left-3 bg-black/70 px-3 py-1 rounded-lg text-xs font-medium capitalize">
+                    {label} Map
+                </div>
+            </div>
+            {/* Color Legend */}
+            <div className="flex items-center justify-center gap-6 text-xs text-gray-400">
+                <div className="flex items-center gap-1.5">
+                    <div className="w-4 h-2.5 rounded-sm bg-blue-500" />
+                    <span>Healthy</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                    <div className="w-4 h-2.5 rounded-sm bg-green-500" />
+                    <span>Mild</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                    <div className="w-4 h-2.5 rounded-sm bg-yellow-500" />
+                    <span>Moderate</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                    <div className="w-4 h-2.5 rounded-sm bg-red-500" />
+                    <span>Concern</span>
+                </div>
+            </div>
+        </div>
+    );
+}

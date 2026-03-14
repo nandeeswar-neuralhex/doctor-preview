@@ -1,0 +1,33 @@
+apiVersion: '2021-10-01'
+location: eastus
+name: face-analysis-gpu-instance
+properties:
+  containers:
+  - name: face-analysis
+    properties:
+      image: doctorpreviewacr.azurecr.io/face-analysis-gpu:latest
+      resources:
+        requests:
+          cpu: 4.0
+          memoryInGB: 16.0
+          gpu:
+            count: 1
+            sku: V100
+      ports:
+      - port: 8766
+        protocol: TCP
+      environmentVariables:
+      - name: PORT
+        value: '8766'
+  imageRegistryCredentials:
+  - server: doctorpreviewacr.azurecr.io
+    username: doctorpreviewacr
+  osType: Linux
+  ipAddress:
+    type: Public
+    ports:
+    - port: 8766
+      protocol: TCP
+    dnsNameLabel: face-analysis-service
+  restartPolicy: Always
+type: Microsoft.ContainerInstance/containerGroups
