@@ -53,6 +53,68 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         setFullScreenView(prev => prev === view ? null : view);
     };
 
+    const [isPoppedOut, setIsPoppedOut] = useState(false);
+    const popoutWindowRef = useRef(null);
+    const broadcastRef = useRef(null);
+
+    // Open/close a regular resizable popup window that the user can place anywhere.
+    // Frames are pushed via BroadcastChannel — the popup renders them on its own canvas.
+    // Unlike PiP this does NOT float on top of everything.
+    const handlePopOut = () => {
+        // Close if already open
+        if (popoutWindowRef.current && !popoutWindowRef.current.closed) {
+            popoutWindowRef.current.close();
+            popoutWindowRef.current = null;
+            setIsPoppedOut(false);
+            return;
+        }
+
+        const w = window.open(
+            '',
+            'doctor-preview-output',
+            'width=720,height=540,resizable=yes,scrollbars=no,toolbar=no,menubar=no,location=no,status=no'
+        );
+        if (!w) {
+            alert('Pop-out blocked. Please allow pop-ups for this site in your browser settings.');
+            return;
+        }
+
+        // Write a self-contained canvas page into the popup
+        w.document.write(`<!DOCTYPE html>
+<html><head><title>AI Preview</title><style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#000; display:flex; align-items:center; justify-content:center; width:100vw; height:100vh; overflow:hidden; }
+canvas { max-width:100%; max-height:100%; }
+</style></head>
+<body><canvas id="c"></canvas><script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const bc = new BroadcastChannel('doctor-preview-frames');
+bc.onmessage = (e) => {
+  createImageBitmap(e.data).then(bmp => {
+    if (canvas.width !== bmp.width) canvas.width = bmp.width;
+    if (canvas.height !== bmp.height) canvas.height = bmp.height;
+    ctx.drawImage(bmp, 0, 0);
+    bmp.close();
+  });
+};
+window.addEventListener('beforeunload', () => bc.close());
+</script></body></html>`);
+        w.document.close();
+
+        popoutWindowRef.current = w;
+        setIsPoppedOut(true);
+
+        // Detect when user closes the popup manually
+        const pollClose = setInterval(() => {
+            if (w.closed) {
+                clearInterval(pollClose);
+                popoutWindowRef.current = null;
+                setIsPoppedOut(false);
+            }
+        }, 500);
+    };
+
     const processedFrameFilter = `brightness(${Math.max(0.4, 1 + exposureAdjust / 100)})`;
 
     // Custom hooks for webcam and WebSocket
@@ -79,6 +141,8 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                     }
                     ctx.drawImage(bitmap, 0, 0);
                     bitmap.close();
+                    // Mirror to popout window via BroadcastChannel
+                    if (broadcastRef.current) broadcastRef.current.postMessage(frameData);
                 })
                 .catch((err) => {
                     console.error('Canvas paint error:', err);
@@ -279,6 +343,101 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         };
     }, [isStreaming, isWsConnected, sendWsFrame, workerTimer]);
 
+    // ── Background Keepalive ──
+    // Prevents macOS App Nap + Chrome page freeze when switching applications.
+    // Three layers:
+    //  1. Web Lock — tells Chrome this page has critical background work
+    //  2. Silent audio oscillator — prevents macOS from napping the Chrome process
+    //  3. Silent 1×1 PiP — Chrome marks tab as "active media", highest privilege
+    //     (content doesn't matter — a black dot is enough to keep everything alive)
+    const keepaliveLockRef = useRef(null);
+    const keepaliveAudioRef = useRef(null);
+    const keepalivePipRef = useRef(null); // { video, canvas }
+    useEffect(() => {
+        if (!isStreaming) return;
+
+        // 1. Acquire Web Lock (prevents Chrome page freeze after 5 min)
+        let lockAc = null;
+        let lockResolve = null;
+        if (navigator.locks) {
+            lockAc = new AbortController();
+            navigator.locks.request(
+                'doctor-preview-stream-keepalive',
+                { signal: lockAc.signal },
+                () => new Promise((resolve) => { lockResolve = resolve; })
+            ).catch(() => {}); // AbortError on release — expected
+            console.log('[Keepalive] Web Lock acquired');
+        }
+        keepaliveLockRef.current = { lockAc, lockResolve };
+
+        // 2. Silent audio oscillator (prevents macOS App Nap)
+        let silentCtx = null;
+        try {
+            silentCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const osc = silentCtx.createOscillator();
+            const gain = silentCtx.createGain();
+            osc.frequency.value = 1; // 1 Hz — inaudible
+            gain.gain.value = 0.001; // essentially silent
+            osc.connect(gain);
+            gain.connect(silentCtx.destination);
+            osc.start();
+            console.log('[Keepalive] Silent audio oscillator started');
+            keepaliveAudioRef.current = { ctx: silentCtx, osc, gain };
+        } catch (e) {
+            console.warn('[Keepalive] Silent audio failed:', e.message);
+        }
+
+        // 3. Silent 1×1 PiP — the strongest keepalive signal.
+        // Chrome treats any tab with an active PiP as foreground-equivalent.
+        // The dot is 1×1 black — completely invisible in the corner of the screen.
+        // Start after a short delay so the user gesture (clicking Start) is still
+        // in scope for browsers that require a user gesture for PiP.
+        const pipTimer = setTimeout(async () => {
+            try {
+                if (!document.pictureInPictureEnabled) return;
+                if (document.pictureInPictureElement) return; // already have one
+                const canvas = document.createElement('canvas');
+                canvas.width = 1; canvas.height = 1;
+                const ctx = canvas.getContext('2d');
+                ctx.fillStyle = '#000';
+                ctx.fillRect(0, 0, 1, 1);
+                const stream = canvas.captureStream(1); // 1 fps — no real content
+                const vid = document.createElement('video');
+                vid.srcObject = stream;
+                vid.muted = true;
+                document.body.appendChild(vid);
+                await vid.play();
+                await vid.requestPictureInPicture();
+                keepalivePipRef.current = { vid, canvas };
+                console.log('[Keepalive] Silent PiP started — tab is now foreground-equivalent');
+            } catch (e) {
+                console.warn('[Keepalive] Silent PiP failed (will use Web Lock + audio only):', e.message);
+            }
+        }, 300);
+
+        return () => {
+            clearTimeout(pipTimer);
+            // Release Web Lock
+            if (lockResolve) lockResolve();
+            if (lockAc) lockAc.abort();
+            keepaliveLockRef.current = null;
+            console.log('[Keepalive] Web Lock released');
+            // Stop silent audio
+            if (keepaliveAudioRef.current) {
+                try { keepaliveAudioRef.current.osc.stop(); } catch (_) {}
+                try { keepaliveAudioRef.current.ctx.close(); } catch (_) {}
+                keepaliveAudioRef.current = null;
+            }
+            // Exit silent PiP
+            if (keepalivePipRef.current) {
+                try { document.exitPictureInPicture(); } catch (_) {}
+                try { keepalivePipRef.current.vid.remove(); } catch (_) {}
+                keepalivePipRef.current = null;
+                console.log('[Keepalive] Silent PiP stopped');
+            }
+        };
+    }, [isStreaming]);
+
     // Keep quality ref in sync and apply live to WebRTC senders
     const handleQualityChange = useCallback((newPreset) => {
         setQualityPreset(newPreset);
@@ -292,11 +451,36 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         }
     }, [isConnected, applyQuality, workerTimer]);
 
+    // Auto-reconnect WebRTC when the connection drops while streaming.
+    // aiortc closes the connection when DTLS/ICE keepalives stop (browser
+    // suspends them when the tab/app goes to background on macOS).
+    const reconnectTimerRef = useRef(null);
+    useEffect(() => {
+        if (!isStreaming || transportMode !== 'webrtc') return;
+        // Only reconnect when transitioning to a dead state
+        if (!['disconnected', 'failed', 'closed'].includes(connectionState)) return;
+        if (!stream) return;
+
+        console.log(`[WebRTC-RECONNECT] Connection ${connectionState} while streaming — will reconnect in 1.5s`);
+        reconnectTimerRef.current = setTimeout(async () => {
+            try {
+                console.log('[WebRTC-RECONNECT] Reconnecting...');
+                await connect(stream, qualityPreset);
+                console.log('[WebRTC-RECONNECT] Reconnected!');
+            } catch (err) {
+                console.error('[WebRTC-RECONNECT] Failed:', err.message);
+            }
+        }, 1500);
+
+        return () => {
+            if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+        };
+    }, [isStreaming, connectionState, transportMode, stream, qualityPreset, connect]);
+
     // Keep video/audio alive when the browser tab goes to background.
     // Browsers suspend AudioContext and may pause video tracks—resume them
-    // immediately when the page becomes visible again. WebRTC peer connections
-    // keep RTP flowing in the background but the <video> element freezes, so
-    // re-set srcObject to wake it up.
+    // immediately when the page becomes visible again. Also reconnect WebRTC
+    // if the connection died while backgrounded.
     useEffect(() => {
         if (!isStreaming) return;
 
@@ -315,12 +499,19 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                 if (originalVideoRef.current?.srcObject) {
                     originalVideoRef.current.srcObject.getVideoTracks().forEach(t => { t.enabled = true; });
                 }
+                // If WebRTC died while in background, reconnect immediately
+                if (transportMode === 'webrtc' && !isConnected && stream) {
+                    console.log('[WebRTC-RECONNECT] Visibility restored, connection dead — reconnecting');
+                    connect(stream, qualityPreset).catch((err) => {
+                        console.error('[WebRTC-RECONNECT] Reconnect on visibility failed:', err.message);
+                    });
+                }
             }
         };
 
         document.addEventListener('visibilitychange', onVisibilityChange);
         return () => document.removeEventListener('visibilitychange', onVisibilityChange);
-    }, [isStreaming, isConnected]);
+    }, [isStreaming, isConnected, transportMode, stream, qualityPreset, connect]);
 
     // Auto re-upload ALL target images when the user adds/removes images mid-stream
     // Track previous images to prevent redundant upload on start (when isStreaming flips to true)
@@ -564,6 +755,49 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
             };
         }
 
+        return () => { active = false; };
+    }, [isStreaming, isConnected, isWsConnected]);
+
+    // Create/destroy BroadcastChannel while streaming
+    useEffect(() => {
+        if (!isStreaming) return;
+        const bc = new BroadcastChannel('doctor-preview-frames');
+        broadcastRef.current = bc;
+        return () => {
+            bc.close();
+            broadcastRef.current = null;
+        };
+    }, [isStreaming]);
+
+    // WebRTC mode: copy video frames → BroadcastChannel for the popout window
+    useEffect(() => {
+        if (!isStreaming || !isConnected || isWsConnected) return;
+        const video = processedVideoRef.current;
+        if (!video) return;
+
+        const offscreen = document.createElement('canvas');
+        const ctx = offscreen.getContext('2d');
+        let active = true;
+
+        const postFrame = () => {
+            if (!active) return;
+            const bc = broadcastRef.current;
+            if (bc && !video.paused && video.videoWidth > 0) {
+                offscreen.width = video.videoWidth;
+                offscreen.height = video.videoHeight;
+                ctx.drawImage(video, 0, 0);
+                offscreen.toBlob((blob) => {
+                    if (blob && broadcastRef.current) broadcastRef.current.postMessage(blob);
+                }, 'image/jpeg', 0.85);
+            }
+            if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+                video.requestVideoFrameCallback(postFrame);
+            }
+        };
+
+        if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+            video.requestVideoFrameCallback(postFrame);
+        }
         return () => { active = false; };
     }, [isStreaming, isConnected, isWsConnected]);
 
@@ -941,17 +1175,36 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                 >
                     <div className="bg-gray-700 px-4 py-2 border-b border-gray-600 flex justify-between items-center">
                         <h3 className="font-semibold text-white flex-1">AI Preview (Post-Surgery)</h3>
-                        <button
-                            onClick={() => toggleFullScreen('processed')}
-                            className="p-1 hover:bg-gray-600 rounded text-gray-300 hover:text-white transition-colors"
-                            title={fullScreenView === 'processed' ? "Minimize" : "Maximize"}
-                        >
-                            {fullScreenView === 'processed' ? (
-                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-                            ) : (
-                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" /></svg>
+                        <div className="flex items-center gap-1">
+                            {/* Popout window — regular resizable window user can place anywhere */}
+                            {isStreaming && (
+                                <button
+                                    onClick={handlePopOut}
+                                    className={`px-2 py-1 text-xs rounded font-medium transition-colors flex items-center gap-1 ${
+                                        isPoppedOut
+                                            ? 'bg-blue-600 text-white hover:bg-blue-700'
+                                            : 'bg-gray-600 text-gray-200 hover:bg-gray-500'
+                                    }`}
+                                    title={isPoppedOut ? 'Close pop-out window' : 'Open in separate window — drag it anywhere, use as OBS Window Source'}
+                                >
+                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                                    </svg>
+                                    {isPoppedOut ? 'Close Window' : 'Open Window'}
+                                </button>
                             )}
-                        </button>
+                            <button
+                                onClick={() => toggleFullScreen('processed')}
+                                className="p-1 hover:bg-gray-600 rounded text-gray-300 hover:text-white transition-colors"
+                                title={fullScreenView === 'processed' ? "Minimize" : "Maximize"}
+                            >
+                                {fullScreenView === 'processed' ? (
+                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                                ) : (
+                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" /></svg>
+                                )}
+                            </button>
+                        </div>
                     </div>
                     <div className={`aspect-video bg-black flex items-center justify-center ${fullScreenView === 'processed' ? 'h-[calc(100%-40px)] w-full' : ''}`}>
                         {isStreaming ? (
@@ -991,6 +1244,8 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
                     </p>
                 </div>
             )}
+
+
 
             {/* Diagnostics */}
             <div className="mt-3 md:mt-4 p-3 md:p-4 bg-gray-800 border border-gray-700 rounded-lg text-[10px] md:text-xs text-gray-300 space-y-1">

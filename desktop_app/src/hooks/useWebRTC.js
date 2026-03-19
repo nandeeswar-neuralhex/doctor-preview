@@ -51,6 +51,13 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream) {
                 return;
             }
 
+            // Close any existing connection before creating a new one
+            // (safe reconnect — avoids leaked peer connections)
+            if (pcRef.current) {
+                try { pcRef.current.close(); } catch (_) {}
+                pcRef.current = null;
+            }
+
             const pc = new RTCPeerConnection({
                 iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
             });

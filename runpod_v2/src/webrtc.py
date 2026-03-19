@@ -13,6 +13,17 @@ Quality pipeline:
 from __future__ import annotations
 
 import asyncio
+
+# ── Extend ICE consent timeout ──
+# aioice defaults: CONSENT_INTERVAL=5s, CONSENT_FAILURES=6 → dies after 30s.
+# When the browser is backgrounded on macOS, App Nap may delay ICE keepalives.
+# Increase tolerance to 60 failures × 5s = 5 minutes before giving up.
+try:
+    import aioice.ice as _aioice_mod
+    _aioice_mod.CONSENT_FAILURES = 60  # was 6 → now survives 5 minutes of silence
+    print(f"[WebRTC] ICE consent timeout extended to {60 * 5}s (was 30s)")
+except Exception:
+    pass
 import re
 import threading
 import time
