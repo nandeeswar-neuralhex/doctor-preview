@@ -33,28 +33,36 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     curl \
     git \
+    libavcodec-dev libavformat-dev libavutil-dev \
+    libopus-dev libvpx-dev libsrtp2-dev \
     && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
     && ln -sf /usr/bin/python3.11 /usr/bin/python \
     && python3 -m ensurepip --upgrade \
-    && pip3 install --upgrade pip setuptools wheel \
+    && python3 -m pip install --upgrade pip setuptools wheel \
     && rm -rf /var/lib/apt/lists/*
 
 # Step 1: Install build dependencies FIRST (insightface needs Cython + numpy to compile)
-RUN pip3 install --no-cache-dir "Cython>=0.29,<3.0" "numpy>=1.24,<2.0"
+RUN python3 -m pip install --no-cache-dir "Cython>=0.29,<3.0" "numpy>=1.24,<2.0"
 
 # Step 2: Install insightface from source with --no-build-isolation so it uses our numpy
-RUN pip3 install --no-cache-dir --no-build-isolation --no-deps insightface==0.7.3
+RUN python3 -m pip install --no-cache-dir --no-build-isolation --no-deps insightface==0.7.3
 
-# Step 3: Install GPU onnxruntime (overwrites any CPU version)
-RUN pip3 install --no-cache-dir onnxruntime-gpu==1.20.1 \
-    --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
+# Step 3: Install GPU onnxruntime — MUST be 1.18.1 for cuDNN 8 compatibility
+# (1.20.x requires cuDNN 9, which is NOT present in the cudnn8 base image)
+RUN python3 -m pip uninstall -y onnxruntime onnxruntime-gpu 2>/dev/null || true \
+    && python3 -m pip install --no-cache-dir onnxruntime-gpu==1.18.1
 
 # Step 4: Install remaining dependencies
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN python3 -m pip install --no-cache-dir -r requirements.txt
 
-# Step 5: Pin numpy back to 1.x after all installs (avoid binary compat issues)
-RUN pip3 install --no-cache-dir "numpy>=1.24,<2.0"
+# Step 5: GFPGAN (via basicsr/facexlib) pulls in CPU onnxruntime and overwrites
+# the GPU version. Re-pin onnxruntime-gpu==1.18.1 AFTER requirements install.
+RUN python3 -m pip uninstall -y onnxruntime 2>/dev/null || true \
+    && python3 -m pip install --no-cache-dir --force-reinstall onnxruntime-gpu==1.18.1
+
+# Step 6: Pin numpy back to 1.x after all installs (avoid binary compat issues)
+RUN python3 -m pip install --no-cache-dir "numpy>=1.24,<2.0"
 
 # Copy application source
 COPY src/ ./src/
