@@ -9,6 +9,11 @@ ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+# onnxruntime-gpu 1.20.1 (CUDA 12) needs cuDNN 9 at runtime.
+# pip installs nvidia-cudnn-cu12 which puts the libs under dist-packages/nvidia/cudnn/lib/.
+# Add all nvidia pip lib dirs to LD_LIBRARY_PATH so ort can load them.
+ENV NV_PYLIB=/usr/local/lib/python3.11/dist-packages/nvidia
+ENV LD_LIBRARY_PATH=${NV_PYLIB}/cudnn/lib:${NV_PYLIB}/cublas/lib:${NV_PYLIB}/cuda_runtime/lib:${NV_PYLIB}/cufft/lib:${NV_PYLIB}/cusolver/lib:${NV_PYLIB}/cusparse/lib:/usr/local/cuda-12.1/lib64
 
 WORKDIR /app
 
