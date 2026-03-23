@@ -67,8 +67,9 @@ RUN python3 -m pip install --no-cache-dir "numpy>=1.24,<2.0"
 # Copy application source
 COPY src/ ./src/
 
-# Download AI models at build time (reduces startup time)
-RUN python3 src/download_models.py
+# NOTE: Models are NOT baked in — they download automatically on first startup
+# (server.py calls download_models() in the startup event handler).
+# This keeps the image ~1.5 GB smaller, avoiding disk space issues on 62 GB VMs.
 
 # Create non-root user for security
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
