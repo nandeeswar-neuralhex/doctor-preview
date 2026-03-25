@@ -595,6 +595,43 @@ class FaceSwapper:
             alpha = (blurred_mask.astype(np.float32) / 255.0)[..., None]
             blended_roi = (roi_frame * (1 - alpha) + roi_warped * alpha).astype(np.uint8)
 
+            # ── Mouth Interior Preservation ──
+            # INSwapper hallucinates blue/black pixels inside open mouths
+            # because the target photo is typically closed-mouth. Restore the
+            # original webcam mouth interior (teeth, tongue) with a soft mask.
+            if hasattr(source_face, 'kps') and source_face.kps is not None:
+                try:
+                    kps = source_face.kps
+                    mouth_left = kps[3]
+                    mouth_right = kps[4]
+                    mouth_center = (mouth_left + mouth_right) / 2.0
+                    mouth_w = np.linalg.norm(mouth_right - mouth_left)
+                    eye_dist = np.linalg.norm(kps[1] - kps[0])
+
+                    # Inner mouth ellipse — covers teeth/tongue but NOT outer lips
+                    ell_rx = int(mouth_w * 0.30)
+                    ell_ry = int(eye_dist * 0.15)
+
+                    # Shift center slightly below mouth corner line
+                    cx = mouth_center[0]
+                    cy = mouth_center[1] + eye_dist * 0.04
+
+                    # Convert to ROI coordinates
+                    cx_roi = int(cx) - roi_x1
+                    cy_roi = int(cy) - roi_y1
+
+                    if (ell_rx > 2 and ell_ry > 2 and
+                            0 < cx_roi < roi_w and 0 < cy_roi < roi_h):
+                        mouth_excl = np.zeros((roi_h, roi_w), dtype=np.float32)
+                        cv2.ellipse(mouth_excl, (cx_roi, cy_roi),
+                                    (ell_rx, ell_ry), 0, 0, 360, 1.0, -1)
+                        mouth_excl = cv2.GaussianBlur(mouth_excl, (15, 15), 0)
+                        m3 = mouth_excl[..., None]
+                        blended_roi = (blended_roi.astype(np.float32) * (1.0 - m3) +
+                                       roi_frame.astype(np.float32) * m3).astype(np.uint8)
+                except Exception:
+                    pass  # If landmark estimation fails, skip — swap still works
+
             result = frame.copy()
             result[roi_y1:roi_y2, roi_x1:roi_x2] = blended_roi
             return result

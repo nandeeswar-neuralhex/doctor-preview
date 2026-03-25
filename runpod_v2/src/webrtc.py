@@ -247,10 +247,14 @@ class VideoTransformTrack(MediaStreamTrack):
                 new_h = self.MAX_PROCESS_HEIGHT
                 img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
+            # Save original for lip sync (clean mouth pixels, no swap artifacts)
+            original_img = img.copy()
+
             # Face swap (GPU)
             result, faces = self.swapper.swap_face_with_faces(self.session_id, img)
 
-            # Lip sync
+            # Lip sync — use original frame for Wav2Lip input so it gets
+            # clean teeth/tongue instead of swapped artifacts
             settings = self.session_settings.get(self.session_id, {}) if self.session_settings else {}
             enable_lipsync = settings.get("enable_lipsync", ENABLE_LIPSYNC)
             if enable_lipsync and self.lip_syncer and self.lip_syncer.is_ready() and len(faces) > 0:
@@ -262,7 +266,7 @@ class VideoTransformTrack(MediaStreamTrack):
                     x1, y1 = max(0, x1), max(0, y1)
                     x2, y2 = min(result.shape[1], x2), min(result.shape[0], y2)
                     if x2 > x1 and y2 > y1:
-                        face_crop = result[y1:y2, x1:x2]
+                        face_crop = original_img[y1:y2, x1:x2]
                         synced = self.lip_syncer.infer(face_crop, mel)
                         if synced is not None:
                             result = self.lip_syncer.apply_mouth_only(
