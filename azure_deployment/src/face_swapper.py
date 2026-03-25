@@ -92,7 +92,7 @@ class FaceSwapper:
             name="buffalo_l",
             root=MODELS_DIR,
             providers=providers,
-            allowed_modules=["detection", "landmark_2d_106"]
+            allowed_modules=["detection"]
         )
         self.face_analyzer_fast.prepare(ctx_id=0, det_size=(320, 320))
         print(f"  Fast analyzer: {len(self.face_analyzer_fast.models)} models at 320×320 (for real-time)")
@@ -163,7 +163,6 @@ class FaceSwapper:
         self._smooth_kps: Dict[str, np.ndarray] = {}
         self._smooth_bbox: Dict[str, np.ndarray] = {}
         self._last_result: Dict[str, np.ndarray] = {}
-        self._mouth_open_ema: Dict[str, float] = {}  # EMA of mouth-open distance per session
         self._ready = True
         
         print("FaceSwapper initialized successfully!")
@@ -596,84 +595,42 @@ class FaceSwapper:
             alpha = (blurred_mask.astype(np.float32) / 255.0)[..., None]
             blended_roi = (roi_frame * (1 - alpha) + roi_warped * alpha).astype(np.uint8)
 
-            # ── Mouth Interior Preservation (106-point geometric gate) ──
-            # Uses landmark_2d_106 to measure actual mouth opening distance
-            # in pixels — purely geometric, unaffected by lighting/shadows.
-            # EMA-smoothed over frames to eliminate single-frame flicker.
-            # Exclusion only fires when EMA-smoothed opening > 4px.
-            # Polygon drawn from actual inner-lip landmark points, not a
-            # fixed ellipse, so the shape matches any face anatomy.
+            # ── Mouth Interior Preservation ──
+            # INSwapper hallucinates blue/black pixels inside open mouths
+            # because the target photo is typically closed-mouth. Restore the
+            # original webcam mouth interior (teeth, tongue) with a soft mask.
             if hasattr(source_face, 'kps') and source_face.kps is not None:
                 try:
                     kps = source_face.kps
-                    mouth_left  = kps[3]
+                    mouth_left = kps[3]
                     mouth_right = kps[4]
                     mouth_center = (mouth_left + mouth_right) / 2.0
-                    mouth_w_full = np.linalg.norm(mouth_right - mouth_left)
+                    mouth_w = np.linalg.norm(mouth_right - mouth_left)
+                    eye_dist = np.linalg.norm(kps[1] - kps[0])
+
+                    # Inner mouth ellipse — covers teeth/tongue but NOT outer lips
+                    ell_rx = int(mouth_w * 0.30)
+                    ell_ry = int(eye_dist * 0.15)
+
+                    # Shift center slightly below mouth corner line
                     cx = mouth_center[0]
-                    cy_corners = mouth_center[1]
+                    cy = mouth_center[1] + eye_dist * 0.04
+
+                    # Convert to ROI coordinates
                     cx_roi = int(cx) - roi_x1
-                    cy_roi = int(cy_corners) - roi_y1
+                    cy_roi = int(cy) - roi_y1
 
-                    # ── Measure mouth opening from 106-point landmarks ──
-                    mouth_open_px = 0.0
-                    inner_poly_pts = None
-                    lm106 = getattr(source_face, 'landmark_2d_106', None)
-                    if lm106 is not None and len(lm106) == 106:
-                        nose_y   = float(kps[2][1])
-                        mc_x1_f  = float(min(mouth_left[0], mouth_right[0]))
-                        mc_x2_f  = float(max(mouth_left[0], mouth_right[0]))
-                        margin_x = mouth_w_full * 0.12
-                        # Y window: from nose tip down to just below mouth corners
-                        lip_y_hi = cy_corners + (cy_corners - nose_y) * 0.8
-                        mx = ((lm106[:, 0] >= mc_x1_f - margin_x) &
-                              (lm106[:, 0] <= mc_x2_f + margin_x))
-                        my = ((lm106[:, 1] >= nose_y) &
-                              (lm106[:, 1] <= lip_y_hi))
-                        lip_pts = lm106[mx & my]
-                        if len(lip_pts) >= 4:
-                            upper = lip_pts[lip_pts[:, 1] <= cy_corners]
-                            lower = lip_pts[lip_pts[:, 1] >  cy_corners]
-                            if len(upper) > 0 and len(lower) > 0:
-                                upper_btm_y = float(upper[:, 1].max())
-                                lower_top_y = float(lower[:, 1].min())
-                                mouth_open_px = max(0.0, lower_top_y - upper_btm_y)
-                                # Build inner-lip polygon: bottommost upper + topmost lower pts
-                                inner_up  = upper[upper[:, 1] >= upper_btm_y - 2]
-                                inner_lo  = lower[lower[:, 1] <= lower_top_y + 2]
-                                if len(inner_up) >= 2 and len(inner_lo) >= 2:
-                                    poly = np.vstack([inner_up,
-                                                      inner_lo[::-1]]).astype(np.int32)
-                                    inner_poly_pts = poly
-
-                    # ── EMA smooth — prevents single-frame flicker ──
-                    ema_key = f"{session_id}_mouth_open"
-                    prev_ema = self._mouth_open_ema.get(ema_key, 0.0)
-                    ema_open = 0.5 * mouth_open_px + 0.5 * prev_ema
-                    self._mouth_open_ema[ema_key] = ema_open
-
-                    # ── Apply exclusion only when EMA confirms mouth is open ──
-                    # 4px threshold: closed-mouth noise < 2px, real open ~15-40px
-                    if ema_open > 4.0 and 0 < cx_roi < roi_w and 0 < cy_roi < roi_h:
+                    if (ell_rx > 2 and ell_ry > 2 and
+                            0 < cx_roi < roi_w and 0 < cy_roi < roi_h):
                         mouth_excl = np.zeros((roi_h, roi_w), dtype=np.float32)
-                        if inner_poly_pts is not None and len(inner_poly_pts) >= 3:
-                            # Accurate inner-lip polygon (convert to ROI coords)
-                            poly_roi = inner_poly_pts.copy()
-                            poly_roi[:, 0] -= roi_x1
-                            poly_roi[:, 1] -= roi_y1
-                            cv2.fillPoly(mouth_excl, [poly_roi], 1.0)
-                        else:
-                            # Fallback ellipse sized from measured opening
-                            ell_rx = int(mouth_w_full * 0.28)
-                            ell_ry = max(3, int(ema_open * 0.60))
-                            cv2.ellipse(mouth_excl, (cx_roi, cy_roi),
-                                        (ell_rx, ell_ry), 0, 0, 360, 1.0, -1)
-                        mouth_excl = cv2.GaussianBlur(mouth_excl, (11, 11), 0)
+                        cv2.ellipse(mouth_excl, (cx_roi, cy_roi),
+                                    (ell_rx, ell_ry), 0, 0, 360, 1.0, -1)
+                        mouth_excl = cv2.GaussianBlur(mouth_excl, (15, 15), 0)
                         m3 = mouth_excl[..., None]
                         blended_roi = (blended_roi.astype(np.float32) * (1.0 - m3) +
                                        roi_frame.astype(np.float32) * m3).astype(np.uint8)
                 except Exception:
-                    pass  # landmark failure — swap still works fine without exclusion
+                    pass  # If landmark estimation fails, skip — swap still works
 
             result = frame.copy()
             result[roi_y1:roi_y2, roi_x1:roi_x2] = blended_roi
@@ -992,7 +949,4 @@ class FaceSwapper:
             del self._smooth_bbox[bbox_key]
         if session_id in self._last_result:
             del self._last_result[session_id]
-        ema_key = f"{session_id}_mouth_open"
-        if ema_key in self._mouth_open_ema:
-            del self._mouth_open_ema[ema_key]
         print(f"Cleaned up session {session_id}")
