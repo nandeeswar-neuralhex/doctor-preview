@@ -582,14 +582,10 @@ class FaceSwapper:
 
             roi_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2].copy()
 
-            # ── Color match (partial 25%): preserve target skin identity, reduce jaw seam ──
-            # Full 100% match destroys the target's skin tone (maps white→dark webcam).
-            # 25% blend keeps ~75% of the target's natural skin while softening edge.
-            # The neck_tone_bridge below then bridges the remaining jaw→neck gap.
+            # ── Color match (if enabled) for skin-tone correction at boundary ──
             if ENABLE_SEAMLESS_CLONE and roi_mask.sum() > 0:
                 try:
-                    roi_warped_matched = self._color_match(roi_warped, roi_frame, roi_mask)
-                    roi_warped = cv2.addWeighted(roi_warped, 0.75, roi_warped_matched, 0.25, 0)
+                    roi_warped = self._color_match(roi_warped, roi_frame, roi_mask)
                 except Exception:
                     pass
 
@@ -638,10 +634,6 @@ class FaceSwapper:
 
             result = frame  # modify in-place — caller doesn't reuse the input
             result[roi_y1:roi_y2, roi_x1:roi_x2] = blended_roi
-
-            # ── Neck tone bridge: soften jaw→neck skin tone boundary ──
-            result = self._neck_tone_bridge(result, source_face)
-
             return result
 
         except Exception as e:
@@ -942,109 +934,6 @@ class FaceSwapper:
             print(f"Color match error: {e}")
             return source
     
-    def _neck_tone_bridge(
-        self,
-        result: np.ndarray,
-        source_face: Any,
-    ) -> np.ndarray:
-        """
-        Option 1 neck correction: gradient LAB shift below the jaw.
-
-        The face swap keeps the TARGET person's skin tone (we now only
-        blend 25% toward the webcam tone). This creates a hard seam at
-        the jawline when source (webcam) and target (image) tones differ.
-
-        Fix: sample the swapped face's skin LAB → sample the webcam neck
-        LAB → apply a vertical gradient shift to the neck strip so it
-        fades smoothly from target tone (at jaw) to original tone (below).
-        """
-        try:
-            h, w = result.shape[:2]
-            bbox = source_face.bbox.astype(int)
-            x1 = max(0, bbox[0])
-            y1 = max(0, bbox[1])
-            x2 = min(w, bbox[2])
-            y2 = min(h, bbox[3])
-            face_h = y2 - y1
-            face_w = x2 - x1
-            if face_h < 20 or face_w < 20:
-                return result
-
-            # ── Sample swapped face skin tone from cheek area ──
-            # Middle vertical band (35-65%), horizontal inset 20-80%
-            # Avoids eyes (top) and mouth (bottom)
-            samp_y1 = max(0, y1 + int(face_h * 0.35))
-            samp_y2 = min(h, y1 + int(face_h * 0.65))
-            samp_x1 = max(0, x1 + int(face_w * 0.20))
-            samp_x2 = min(w, x1 + int(face_w * 0.80))
-            face_sample = result[samp_y1:samp_y2, samp_x1:samp_x2]
-            if face_sample.size == 0:
-                return result
-            face_lab = cv2.cvtColor(face_sample, cv2.COLOR_BGR2LAB).astype(np.float32)
-            face_mean = face_lab.reshape(-1, 3).mean(axis=0)  # [L, a, b]
-
-            # ── Sample webcam neck skin tone from directly below jaw ──
-            neck_h = min(int(face_h * 0.60), h - y2)
-            if neck_h < 5:
-                return result
-            neck_y1 = y2
-            neck_y2 = y2 + neck_h
-            # Inset horizontally 15% each side to avoid shoulder edges
-            neck_x1 = max(0, x1 + int(face_w * 0.15))
-            neck_x2 = min(w, x2 - int(face_w * 0.15))
-            if neck_x2 <= neck_x1:
-                return result
-
-            neck_sample = result[neck_y1:neck_y2, neck_x1:neck_x2]
-            if neck_sample.size == 0:
-                return result
-            neck_lab_sample = cv2.cvtColor(neck_sample, cv2.COLOR_BGR2LAB).astype(np.float32)
-            neck_mean = neck_lab_sample.reshape(-1, 3).mean(axis=0)
-
-            # ── Delta: how much to shift neck pixels toward face tone ──
-            delta = face_mean - neck_mean
-            # Cap extreme shifts (e.g. white target vs black webcam is ~70L units)
-            # Allow up to ±50 so large tone gaps still get meaningful correction
-            delta = np.clip(delta, -50, 50)
-
-            # If tones are already close, nothing to do
-            if np.linalg.norm(delta) < 6:
-                return result
-
-            # ── Apply gradient correction to neck strip (full face width) ──
-            full_neck_x1 = max(0, x1)
-            full_neck_x2 = min(w, x2)
-            full_neck_w = full_neck_x2 - full_neck_x1
-            if full_neck_w < 5:
-                return result
-
-            neck_strip = result[neck_y1:neck_y2, full_neck_x1:full_neck_x2].copy()
-            strip_lab = cv2.cvtColor(neck_strip, cv2.COLOR_BGR2LAB).astype(np.float32)
-
-            # Vertical gradient: 1.0 at top of neck (jaw), 0.0 at bottom
-            vert = np.linspace(1.0, 0.0, neck_h, dtype=np.float32)[:, None, None]
-
-            # Horizontal feather: taper over outer 20% each side → no hard vertical seam
-            feather_px = max(3, int(full_neck_w * 0.20))
-            horiz = np.ones(full_neck_w, dtype=np.float32)
-            for i in range(feather_px):
-                t = i / feather_px
-                horiz[i] = t
-                horiz[full_neck_w - 1 - i] = t
-            horiz = horiz[None, :, None]
-
-            weight = vert * horiz  # (neck_h, full_neck_w, 1)
-            strip_lab += delta[None, None, :] * weight
-            strip_lab = np.clip(strip_lab, 0, 255)
-
-            result[neck_y1:neck_y2, full_neck_x1:full_neck_x2] = \
-                cv2.cvtColor(strip_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
-
-            return result
-        except Exception as e:
-            print(f"Neck tone bridge error: {e}")
-            return result
-
     def cleanup_session(self, session_id: str):
         """Clean up session data to free memory"""
         if session_id in self.target_faces:
