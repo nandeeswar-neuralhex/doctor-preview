@@ -70,6 +70,11 @@ RUN python3 -m pip uninstall -y onnxruntime 2>/dev/null || true \
     && python3 -m pip install --no-cache-dir --force-reinstall onnxruntime-gpu==1.20.1 \
     --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
 
+# Step 5b: onnxruntime-gpu may pull nvidia-cudnn-cu13 (CUDA 13) which is
+# incompatible with our CUDA 12.1 base. Force CUDA 12 versions.
+RUN python3 -m pip uninstall -y nvidia-cudnn-cu13 nvidia-cublas 2>/dev/null || true \
+    && python3 -m pip install --no-cache-dir nvidia-cudnn-cu12==9.1.0.70 nvidia-cublas-cu12
+
 # Step 6: Pin numpy back to 1.x after all installs (avoid binary compat issues)
 RUN python3 -m pip install --no-cache-dir "numpy>=1.24,<2.0"
 
