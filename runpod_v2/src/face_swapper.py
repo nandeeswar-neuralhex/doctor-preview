@@ -595,10 +595,17 @@ class FaceSwapper:
             alpha = (blurred_mask.astype(np.float32) / 255.0)[..., None]
             blended_roi = (roi_frame * (1 - alpha) + roi_warped * alpha).astype(np.uint8)
 
-            # ── Mouth Interior Preservation ──
-            # INSwapper hallucinates blue/black pixels inside open mouths
-            # because the target photo is typically closed-mouth. Restore the
-            # original webcam mouth interior (teeth, tongue) with a soft mask.
+            # ── Mouth Interior Preservation (artifact-gated) ──
+            # Only restore source webcam pixels inside the mouth when INSwapper
+            # has actually hallucinated artifacts there (open-mouth case).
+            # When mouth is closed the swapped lips look fine — we must NOT
+            # stamp a source-person oval on top of the target's closed lips.
+            #
+            # Gate: compare LAB lightness of the swapped mouth-center patch to
+            # the average cheek skin of the swapped face. If mouth center is
+            # significantly darker/more-blue = artifact detected = open mouth.
+            # Threshold 28 LAB-L units covers black+blue artifacts reliably
+            # while ignoring natural lip shadow on closed mouths (~10-15 units).
             if hasattr(source_face, 'kps') and source_face.kps is not None:
                 try:
                     kps = source_face.kps
@@ -608,19 +615,47 @@ class FaceSwapper:
                     mouth_w = np.linalg.norm(mouth_right - mouth_left)
                     eye_dist = np.linalg.norm(kps[1] - kps[0])
 
-                    # Inner mouth ellipse — covers teeth/tongue but NOT outer lips
-                    ell_rx = int(mouth_w * 0.30)
-                    ell_ry = int(eye_dist * 0.15)
-
-                    # Shift center slightly below mouth corner line
                     cx = mouth_center[0]
                     cy = mouth_center[1] + eye_dist * 0.04
-
-                    # Convert to ROI coordinates
                     cx_roi = int(cx) - roi_x1
                     cy_roi = int(cy) - roi_y1
 
-                    if (ell_rx > 2 and ell_ry > 2 and
+                    # ── Artifact detection ──
+                    # Sample a small patch (~12×8px) at the mouth centre in the
+                    # SWAPPED blended ROI and compare its LAB-L to the cheek skin.
+                    artifact_detected = False
+                    patch_r = max(4, int(eye_dist * 0.06))
+
+                    # Cheek skin reference: middle band 35-65% height, inset 20-80% width
+                    ck_y1 = max(0, int(y1 + (y2-y1)*0.35) - roi_y1)
+                    ck_y2 = max(0, int(y1 + (y2-y1)*0.65) - roi_y1)
+                    ck_x1 = max(0, int(x1 + (x2-x1)*0.20) - roi_x1)
+                    ck_x2 = max(0, int(x1 + (x2-x1)*0.80) - roi_x1)
+                    ck_y2 = min(roi_h, ck_y2); ck_x2 = min(roi_w, ck_x2)
+
+                    mp_y1 = max(0, cy_roi - patch_r)
+                    mp_y2 = min(roi_h, cy_roi + patch_r)
+                    mp_x1 = max(0, cx_roi - patch_r)
+                    mp_x2 = min(roi_w, cx_roi + patch_r)
+
+                    if (ck_y2 > ck_y1 + 4 and ck_x2 > ck_x1 + 4 and
+                            mp_y2 > mp_y1 and mp_x2 > mp_x1 and
+                            0 < cx_roi < roi_w and 0 < cy_roi < roi_h):
+                        cheek_patch = blended_roi[ck_y1:ck_y2, ck_x1:ck_x2]
+                        mouth_patch = blended_roi[mp_y1:mp_y2, mp_x1:mp_x2]
+                        if cheek_patch.size > 0 and mouth_patch.size > 0:
+                            cheek_lab = cv2.cvtColor(cheek_patch, cv2.COLOR_BGR2LAB)
+                            mouth_lab = cv2.cvtColor(mouth_patch, cv2.COLOR_BGR2LAB)
+                            cheek_L = float(cheek_lab[..., 0].mean())
+                            mouth_L = float(mouth_lab[..., 0].mean())
+                            # Artifact = mouth is significantly darker than cheek skin
+                            if cheek_L - mouth_L > 28:
+                                artifact_detected = True
+
+                    # ── Apply exclusion only when artifact confirmed ──
+                    ell_rx = int(mouth_w * 0.30)
+                    ell_ry = int(eye_dist * 0.15)
+                    if (artifact_detected and ell_rx > 2 and ell_ry > 2 and
                             0 < cx_roi < roi_w and 0 < cy_roi < roi_h):
                         mouth_excl = np.zeros((roi_h, roi_w), dtype=np.float32)
                         cv2.ellipse(mouth_excl, (cx_roi, cy_roi),
