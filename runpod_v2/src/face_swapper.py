@@ -92,7 +92,7 @@ class FaceSwapper:
             name="buffalo_l",
             root=MODELS_DIR,
             providers=providers,
-            allowed_modules=["detection"]
+            allowed_modules=["detection", "landmark_2d_106"]
         )
         self.face_analyzer_fast.prepare(ctx_id=0, det_size=(320, 320))
         print(f"  Fast analyzer: {len(self.face_analyzer_fast.models)} models at 320×320 (for real-time)")
@@ -163,6 +163,7 @@ class FaceSwapper:
         self._smooth_kps: Dict[str, np.ndarray] = {}
         self._smooth_bbox: Dict[str, np.ndarray] = {}
         self._last_result: Dict[str, np.ndarray] = {}
+        self._mouth_open_ema: Dict[str, float] = {}  # EMA of mouth-open distance per session
         self._ready = True
         
         print("FaceSwapper initialized successfully!")
@@ -595,77 +596,84 @@ class FaceSwapper:
             alpha = (blurred_mask.astype(np.float32) / 255.0)[..., None]
             blended_roi = (roi_frame * (1 - alpha) + roi_warped * alpha).astype(np.uint8)
 
-            # ── Mouth Interior Preservation (artifact-gated) ──
-            # Only restore source webcam pixels inside the mouth when INSwapper
-            # has actually hallucinated artifacts there (open-mouth case).
-            # When mouth is closed the swapped lips look fine — we must NOT
-            # stamp a source-person oval on top of the target's closed lips.
-            #
-            # Gate: compare LAB lightness of the swapped mouth-center patch to
-            # the average cheek skin of the swapped face. If mouth center is
-            # significantly darker/more-blue = artifact detected = open mouth.
-            # Threshold 28 LAB-L units covers black+blue artifacts reliably
-            # while ignoring natural lip shadow on closed mouths (~10-15 units).
+            # ── Mouth Interior Preservation (106-point geometric gate) ──
+            # Uses landmark_2d_106 to measure actual mouth opening distance
+            # in pixels — purely geometric, unaffected by lighting/shadows.
+            # EMA-smoothed over frames to eliminate single-frame flicker.
+            # Exclusion only fires when EMA-smoothed opening > 4px.
+            # Polygon drawn from actual inner-lip landmark points, not a
+            # fixed ellipse, so the shape matches any face anatomy.
             if hasattr(source_face, 'kps') and source_face.kps is not None:
                 try:
                     kps = source_face.kps
-                    mouth_left = kps[3]
+                    mouth_left  = kps[3]
                     mouth_right = kps[4]
                     mouth_center = (mouth_left + mouth_right) / 2.0
-                    mouth_w = np.linalg.norm(mouth_right - mouth_left)
-                    eye_dist = np.linalg.norm(kps[1] - kps[0])
-
+                    mouth_w_full = np.linalg.norm(mouth_right - mouth_left)
                     cx = mouth_center[0]
-                    cy = mouth_center[1] + eye_dist * 0.04
+                    cy_corners = mouth_center[1]
                     cx_roi = int(cx) - roi_x1
-                    cy_roi = int(cy) - roi_y1
+                    cy_roi = int(cy_corners) - roi_y1
 
-                    # ── Artifact detection ──
-                    # Sample a small patch (~12×8px) at the mouth centre in the
-                    # SWAPPED blended ROI and compare its LAB-L to the cheek skin.
-                    artifact_detected = False
-                    patch_r = max(4, int(eye_dist * 0.06))
+                    # ── Measure mouth opening from 106-point landmarks ──
+                    mouth_open_px = 0.0
+                    inner_poly_pts = None
+                    lm106 = getattr(source_face, 'landmark_2d_106', None)
+                    if lm106 is not None and len(lm106) == 106:
+                        nose_y   = float(kps[2][1])
+                        mc_x1_f  = float(min(mouth_left[0], mouth_right[0]))
+                        mc_x2_f  = float(max(mouth_left[0], mouth_right[0]))
+                        margin_x = mouth_w_full * 0.12
+                        # Y window: from nose tip down to just below mouth corners
+                        lip_y_hi = cy_corners + (cy_corners - nose_y) * 0.8
+                        mx = ((lm106[:, 0] >= mc_x1_f - margin_x) &
+                              (lm106[:, 0] <= mc_x2_f + margin_x))
+                        my = ((lm106[:, 1] >= nose_y) &
+                              (lm106[:, 1] <= lip_y_hi))
+                        lip_pts = lm106[mx & my]
+                        if len(lip_pts) >= 4:
+                            upper = lip_pts[lip_pts[:, 1] <= cy_corners]
+                            lower = lip_pts[lip_pts[:, 1] >  cy_corners]
+                            if len(upper) > 0 and len(lower) > 0:
+                                upper_btm_y = float(upper[:, 1].max())
+                                lower_top_y = float(lower[:, 1].min())
+                                mouth_open_px = max(0.0, lower_top_y - upper_btm_y)
+                                # Build inner-lip polygon: bottommost upper + topmost lower pts
+                                inner_up  = upper[upper[:, 1] >= upper_btm_y - 2]
+                                inner_lo  = lower[lower[:, 1] <= lower_top_y + 2]
+                                if len(inner_up) >= 2 and len(inner_lo) >= 2:
+                                    poly = np.vstack([inner_up,
+                                                      inner_lo[::-1]]).astype(np.int32)
+                                    inner_poly_pts = poly
 
-                    # Cheek skin reference: middle band 35-65% height, inset 20-80% width
-                    ck_y1 = max(0, int(y1 + (y2-y1)*0.35) - roi_y1)
-                    ck_y2 = max(0, int(y1 + (y2-y1)*0.65) - roi_y1)
-                    ck_x1 = max(0, int(x1 + (x2-x1)*0.20) - roi_x1)
-                    ck_x2 = max(0, int(x1 + (x2-x1)*0.80) - roi_x1)
-                    ck_y2 = min(roi_h, ck_y2); ck_x2 = min(roi_w, ck_x2)
+                    # ── EMA smooth — prevents single-frame flicker ──
+                    ema_key = f"{session_id}_mouth_open"
+                    prev_ema = self._mouth_open_ema.get(ema_key, 0.0)
+                    ema_open = 0.5 * mouth_open_px + 0.5 * prev_ema
+                    self._mouth_open_ema[ema_key] = ema_open
 
-                    mp_y1 = max(0, cy_roi - patch_r)
-                    mp_y2 = min(roi_h, cy_roi + patch_r)
-                    mp_x1 = max(0, cx_roi - patch_r)
-                    mp_x2 = min(roi_w, cx_roi + patch_r)
-
-                    if (ck_y2 > ck_y1 + 4 and ck_x2 > ck_x1 + 4 and
-                            mp_y2 > mp_y1 and mp_x2 > mp_x1 and
-                            0 < cx_roi < roi_w and 0 < cy_roi < roi_h):
-                        cheek_patch = blended_roi[ck_y1:ck_y2, ck_x1:ck_x2]
-                        mouth_patch = blended_roi[mp_y1:mp_y2, mp_x1:mp_x2]
-                        if cheek_patch.size > 0 and mouth_patch.size > 0:
-                            cheek_lab = cv2.cvtColor(cheek_patch, cv2.COLOR_BGR2LAB)
-                            mouth_lab = cv2.cvtColor(mouth_patch, cv2.COLOR_BGR2LAB)
-                            cheek_L = float(cheek_lab[..., 0].mean())
-                            mouth_L = float(mouth_lab[..., 0].mean())
-                            # Artifact = mouth is significantly darker than cheek skin
-                            if cheek_L - mouth_L > 28:
-                                artifact_detected = True
-
-                    # ── Apply exclusion only when artifact confirmed ──
-                    ell_rx = int(mouth_w * 0.30)
-                    ell_ry = int(eye_dist * 0.15)
-                    if (artifact_detected and ell_rx > 2 and ell_ry > 2 and
-                            0 < cx_roi < roi_w and 0 < cy_roi < roi_h):
+                    # ── Apply exclusion only when EMA confirms mouth is open ──
+                    # 4px threshold: closed-mouth noise < 2px, real open ~15-40px
+                    if ema_open > 4.0 and 0 < cx_roi < roi_w and 0 < cy_roi < roi_h:
                         mouth_excl = np.zeros((roi_h, roi_w), dtype=np.float32)
-                        cv2.ellipse(mouth_excl, (cx_roi, cy_roi),
-                                    (ell_rx, ell_ry), 0, 0, 360, 1.0, -1)
-                        mouth_excl = cv2.GaussianBlur(mouth_excl, (15, 15), 0)
+                        if inner_poly_pts is not None and len(inner_poly_pts) >= 3:
+                            # Accurate inner-lip polygon (convert to ROI coords)
+                            poly_roi = inner_poly_pts.copy()
+                            poly_roi[:, 0] -= roi_x1
+                            poly_roi[:, 1] -= roi_y1
+                            cv2.fillPoly(mouth_excl, [poly_roi], 1.0)
+                        else:
+                            # Fallback ellipse sized from measured opening
+                            ell_rx = int(mouth_w_full * 0.28)
+                            ell_ry = max(3, int(ema_open * 0.60))
+                            cv2.ellipse(mouth_excl, (cx_roi, cy_roi),
+                                        (ell_rx, ell_ry), 0, 0, 360, 1.0, -1)
+                        mouth_excl = cv2.GaussianBlur(mouth_excl, (11, 11), 0)
                         m3 = mouth_excl[..., None]
                         blended_roi = (blended_roi.astype(np.float32) * (1.0 - m3) +
                                        roi_frame.astype(np.float32) * m3).astype(np.uint8)
                 except Exception:
-                    pass  # If landmark estimation fails, skip — swap still works
+                    pass  # landmark failure — swap still works fine without exclusion
 
             result = frame  # modify in-place — caller doesn't reuse the input
             result[roi_y1:roi_y2, roi_x1:roi_x2] = blended_roi
@@ -984,4 +992,7 @@ class FaceSwapper:
             del self._smooth_bbox[bbox_key]
         if session_id in self._last_result:
             del self._last_result[session_id]
+        ema_key = f"{session_id}_mouth_open"
+        if ema_key in self._mouth_open_ema:
+            del self._mouth_open_ema[ema_key]
         print(f"Cleaned up session {session_id}")
