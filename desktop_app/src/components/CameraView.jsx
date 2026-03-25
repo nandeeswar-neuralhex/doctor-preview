@@ -345,14 +345,11 @@ window.addEventListener('beforeunload', () => bc.close());
 
     // ── Background Keepalive ──
     // Prevents macOS App Nap + Chrome page freeze when switching applications.
-    // Three layers:
+    // Two layers:
     //  1. Web Lock — tells Chrome this page has critical background work
     //  2. Silent audio oscillator — prevents macOS from napping the Chrome process
-    //  3. Silent 1×1 PiP — Chrome marks tab as "active media", highest privilege
-    //     (content doesn't matter — a black dot is enough to keep everything alive)
     const keepaliveLockRef = useRef(null);
     const keepaliveAudioRef = useRef(null);
-    const keepalivePipRef = useRef(null); // { video, canvas }
     useEffect(() => {
         if (!isStreaming) return;
 
@@ -387,36 +384,7 @@ window.addEventListener('beforeunload', () => bc.close());
             console.warn('[Keepalive] Silent audio failed:', e.message);
         }
 
-        // 3. Silent 1×1 PiP — the strongest keepalive signal.
-        // Chrome treats any tab with an active PiP as foreground-equivalent.
-        // The dot is 1×1 black — completely invisible in the corner of the screen.
-        // Start after a short delay so the user gesture (clicking Start) is still
-        // in scope for browsers that require a user gesture for PiP.
-        const pipTimer = setTimeout(async () => {
-            try {
-                if (!document.pictureInPictureEnabled) return;
-                if (document.pictureInPictureElement) return; // already have one
-                const canvas = document.createElement('canvas');
-                canvas.width = 1; canvas.height = 1;
-                const ctx = canvas.getContext('2d');
-                ctx.fillStyle = '#000';
-                ctx.fillRect(0, 0, 1, 1);
-                const stream = canvas.captureStream(1); // 1 fps — no real content
-                const vid = document.createElement('video');
-                vid.srcObject = stream;
-                vid.muted = true;
-                document.body.appendChild(vid);
-                await vid.play();
-                await vid.requestPictureInPicture();
-                keepalivePipRef.current = { vid, canvas };
-                console.log('[Keepalive] Silent PiP started — tab is now foreground-equivalent');
-            } catch (e) {
-                console.warn('[Keepalive] Silent PiP failed (will use Web Lock + audio only):', e.message);
-            }
-        }, 300);
-
         return () => {
-            clearTimeout(pipTimer);
             // Release Web Lock
             if (lockResolve) lockResolve();
             if (lockAc) lockAc.abort();
@@ -428,13 +396,7 @@ window.addEventListener('beforeunload', () => bc.close());
                 try { keepaliveAudioRef.current.ctx.close(); } catch (_) {}
                 keepaliveAudioRef.current = null;
             }
-            // Exit silent PiP
-            if (keepalivePipRef.current) {
-                try { document.exitPictureInPicture(); } catch (_) {}
-                try { keepalivePipRef.current.vid.remove(); } catch (_) {}
-                keepalivePipRef.current = null;
-                console.log('[Keepalive] Silent PiP stopped');
-            }
+
         };
     }, [isStreaming]);
 
