@@ -163,6 +163,24 @@ class FaceSwapper:
         self._smooth_kps: Dict[str, np.ndarray] = {}
         self._smooth_bbox: Dict[str, np.ndarray] = {}
         self._last_result: Dict[str, np.ndarray] = {}
+        # Fix #1: Affine matrix smoothing for sub-pixel face position stability
+        self._smooth_affine: Dict[str, np.ndarray] = {}
+        # Fix #1: Detection miss counter for graceful fade-out
+        self._miss_count: Dict[str, int] = {}
+        # Fix #2: Mouth MSE history for temporal averaging (removes noise)
+        self._mouth_mse_history: Dict[str, list] = {}
+        # Fix #2: Mouth mask activation state for hysteresis
+        self._mouth_mask_active: Dict[str, bool] = {}
+        # Fix #4: Target selection persistence
+        self._current_target_idx: Dict[str, int] = {}
+        self._target_hold_frames: Dict[str, int] = {}
+        # Fix #5: Color LUT temporal smoothing cache
+        self._color_lut_cache: Dict[str, np.ndarray] = {}
+        # Fix #6: Pre-compute and cache the 128x128 soft oval mask (identical every frame)
+        self._face_mask_128 = np.zeros((128, 128), dtype=np.float32)
+        cv2.ellipse(self._face_mask_128, (64, 64), (52, 58), 0, 0, 360, 1.0, -1)
+        self._face_mask_128 = cv2.GaussianBlur(self._face_mask_128, (31, 31), 0)
+        self._face_mask_128 = (self._face_mask_128 * 255).astype(np.uint8)
         self._ready = True
         
         print("FaceSwapper initialized successfully!")
@@ -422,6 +440,7 @@ class FaceSwapper:
         """
         Match the source face's expression to the best target face from the uploaded set.
         Returns the target face entry that best matches the current expression.
+        Uses hysteresis + hold timer to prevent rapid target switching (Fix #4).
         """
         target_list = self.target_faces.get(session_id, [])
         if not target_list:
@@ -433,10 +452,10 @@ class FaceSwapper:
         source_features = self._extract_expression_features(source_face)
         
         # Find the target with the most similar expression
-        best_match = None
+        best_match_idx = 0
         best_score = float('inf')
         
-        for entry in target_list:
+        for idx, entry in enumerate(target_list):
             target_features = entry.get("expression_features")
             if target_features is None:
                 continue
@@ -447,9 +466,29 @@ class FaceSwapper:
             dist = np.linalg.norm(source_features[:min_len] - target_features[:min_len])
             if dist < best_score:
                 best_score = dist
-                best_match = entry
+                best_match_idx = idx
         
-        return best_match if best_match else target_list[0]
+        # ── Fix #4: Target persistence with hysteresis ──
+        current_idx = self._current_target_idx.get(session_id)
+        hold_count = self._target_hold_frames.get(session_id, 0)
+        
+        if current_idx is not None and current_idx < len(target_list):
+            # Only switch if new match is significantly better (>30% lower distance)
+            # AND we've held the current target for at least 15 frames (~0.75s)
+            current_features = target_list[current_idx].get("expression_features")
+            if current_features is not None:
+                min_len_c = min(len(source_features), len(current_features))
+                if min_len_c > 0:
+                    current_dist = np.linalg.norm(source_features[:min_len_c] - current_features[:min_len_c])
+                    # Keep current unless new is 30% better OR held for 15+ frames
+                    if best_score > current_dist * 0.70 or hold_count < 15:
+                        self._target_hold_frames[session_id] = hold_count + 1
+                        return target_list[current_idx]
+        
+        # Switch to new target
+        self._current_target_idx[session_id] = best_match_idx
+        self._target_hold_frames[session_id] = 0
+        return target_list[best_match_idx]
     
     def has_target(self, session_id: str) -> bool:
         """Check if a session has at least one target face set"""
@@ -470,8 +509,13 @@ class FaceSwapper:
         result, _ = self.swap_face_with_faces(session_id, frame)
         return result
 
-    def swap_face_with_faces(self, session_id: str, frame: np.ndarray):
-        """Swap face using expression-matched target and return detected faces."""
+    def swap_face_with_faces(self, session_id: str, frame: np.ndarray, skip_mouth_preservation: bool = False):
+        """Swap face using expression-matched target and return detected faces.
+        
+        Args:
+            skip_mouth_preservation: If True, skip mouth interior preservation
+                                     (used when lip sync will run afterwards)
+        """
         import time as _t
         target_list = self.target_faces.get(session_id, [])
         if not target_list:
@@ -483,36 +527,49 @@ class FaceSwapper:
         _t1 = _t.time()
 
         if len(source_faces) == 0:
-            # Return last good result to avoid flashing raw frame
+            # ── Fix #1: Graceful fade-out on detection miss ──
+            miss_count = self._miss_count.get(session_id, 0) + 1
+            self._miss_count[session_id] = miss_count
             if session_id in self._last_result:
-                return self._last_result[session_id], []
+                if miss_count <= 10:
+                    # First 10 missed frames: return cached result (stable)
+                    return self._last_result[session_id], []
+                else:
+                    # After 10 misses: gradually blend toward raw frame (10% per frame)
+                    blend = min(1.0, (miss_count - 10) * 0.1)
+                    cached = self._last_result[session_id]
+                    if cached.shape == frame.shape:
+                        faded = cv2.addWeighted(cached, 1.0 - blend, frame, blend, 0)
+                        return faded, []
+                    return cached, []
             return frame, []
+        
+        # Reset miss counter on successful detection
+        self._miss_count[session_id] = 0
 
         result = frame
-        swap_succeeded = False
         n_swap = max(1, MAX_FACES)
 
         _t2 = _t.time()
         if n_swap == 1:
             best = max(source_faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))
+            # ── Fix #1: Smooth bounding box to prevent ROI jitter ──
+            best.bbox = self._smooth_bounding_box(session_id, best.bbox)
             matched_target = self._match_best_target(session_id, best)
             _t3 = _t.time()
             if matched_target:
-                swapped = self._swap_single_face(result, best, matched_target["face"], session_id)
-                if swapped is not result:
-                    result = swapped
-                    swap_succeeded = True
+                result = self._swap_single_face(result, best, matched_target["face"], session_id, skip_mouth_preservation)
             _t4 = _t.time()
         else:
             source_faces.sort(key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]), reverse=True)
             _t3 = _t.time()
-            for source_face in source_faces[:n_swap]:
+            for i, source_face in enumerate(source_faces[:n_swap]):
+                # Smooth bbox per face
+                face_key = f"{session_id}_f{i}"
+                source_face.bbox = self._smooth_bounding_box(face_key, source_face.bbox)
                 matched_target = self._match_best_target(session_id, source_face)
                 if matched_target:
-                    swapped = self._swap_single_face(result, source_face, matched_target["face"], session_id)
-                    if swapped is not result:
-                        result = swapped
-                        swap_succeeded = True
+                    result = self._swap_single_face(result, source_face, matched_target["face"], session_id, skip_mouth_preservation)
             _t4 = _t.time()
 
         # Print per-step breakdown every 60 frames (every ~3 seconds at 20fps)
@@ -522,15 +579,8 @@ class FaceSwapper:
         if self._dbg_count[session_id] % 60 == 0:
             print(f"  [PROFILE] detect={(_t1-_t0)*1000:.1f}ms  match={(_t3-_t2)*1000:.1f}ms  swap={(_t4-_t3)*1000:.1f}ms  total={(_t4-_t0)*1000:.1f}ms")
 
-        # Only cache when swap actually produced a new frame — prevents
-        # poisoning the cache with a raw unswapped frame on transient
-        # ONNX/GPU failures (which caused the rare 1-frame flicker).
-        if swap_succeeded:
-            self._last_result[session_id] = result
-        elif session_id in self._last_result:
-            # Swap failed despite face detection — use last known good frame
-            result = self._last_result[session_id]
-
+        # Cache last good result to avoid flashing on face-lost frames
+        self._last_result[session_id] = result
         return result, source_faces
 
     def _swap_single_face(
@@ -538,7 +588,8 @@ class FaceSwapper:
         frame: np.ndarray,
         source_face: Any,
         target_face: Any,
-        session_id: str
+        session_id: str,
+        skip_mouth_preservation: bool = False
     ) -> np.ndarray:
         """
         Swap a single face using ROI-direct warping for maximum CPU efficiency.
@@ -548,6 +599,12 @@ class FaceSwapper:
         - Instead of warpAffine over entire 1080p frame (657K pixels), we adjust
           M_inv's translation to warp DIRECTLY into the face ROI (~300x300 = 90K pixels)
         - This is a 7x CPU speedup for the paste-back step with identical quality
+
+        Smoothness fixes applied:
+        - Fix #1: Affine matrix M_inv is temporally smoothed → sub-pixel stable face position
+        - Fix #2: Mouth preservation uses heavy EMA + hysteresis → zero mouth flicker
+        - Fix #5: Color LUT is temporally smoothed → no skin-tone flicker
+        - Fix #6: Cached mask, larger padding, rounded ROI coords → stable boundaries
         """
         if ENABLE_TEMPORAL_SMOOTHING and hasattr(source_face, 'kps') and source_face.kps is not None:
             source_face.kps = self._smooth_landmarks(session_id, source_face.kps)
@@ -561,22 +618,27 @@ class FaceSwapper:
 
             h, w = frame.shape[:2]
 
-            # ── Build face ROI (bounding box + padding) ──
+            # ── Fix #1: Smooth the inverse affine matrix for sub-pixel stability ──
+            M_inv = cv2.invertAffineTransform(M)
+            affine_key = f"{session_id}_affine"
+            if affine_key in self._smooth_affine:
+                prev_M = self._smooth_affine[affine_key]
+                M_inv = SMOOTHING_ALPHA * prev_M + (1.0 - SMOOTHING_ALPHA) * M_inv
+            self._smooth_affine[affine_key] = M_inv.copy()
+
+            # ── Fix #6: Build face ROI with larger padding + rounded coords ──
             bbox = source_face.bbox.astype(int)
             x1 = max(0, bbox[0]); y1 = max(0, bbox[1])
             x2 = min(w, bbox[2]); y2 = min(h, bbox[3])
-            pad = 30
-            roi_y1 = max(0, y1 - pad); roi_y2 = min(h, y2 + pad)
-            roi_x1 = max(0, x1 - pad); roi_x2 = min(w, x2 + pad)
+            pad = 45  # Increased from 30 → wider boundary hides edge artifacts
+            # Round to even pixels to prevent 1px oscillation
+            roi_y1 = max(0, (y1 - pad) & ~1); roi_y2 = min(h, (y2 + pad + 1) & ~1)
+            roi_x1 = max(0, (x1 - pad) & ~1); roi_x2 = min(w, (x2 + pad + 1) & ~1)
             roi_h = roi_y2 - roi_y1; roi_w = roi_x2 - roi_x1
             if roi_h < 10 or roi_w < 10:
                 return frame
 
             # ── ROI-direct warp: adjust M_inv translation by ROI origin ──
-            # M_inv maps: 128px → (x, y) in full frame
-            # M_roi_inv maps: 128px → (x - roi_x1, y - roi_y1) in ROI
-            # No full-frame allocation needed — warp directly to ~300x300 ROI.
-            M_inv = cv2.invertAffineTransform(M)
             M_roi_inv = M_inv.copy()
             M_roi_inv[0, 2] -= roi_x1   # shift x translation
             M_roi_inv[1, 2] -= roi_y1   # shift y translation
@@ -585,21 +647,15 @@ class FaceSwapper:
             roi_warped = cv2.warpAffine(bgr_fake, M_roi_inv, (roi_w, roi_h),
                                         borderMode=cv2.BORDER_REPLICATE)
 
-            # Warp 128×128 SOFT OVAL mask → ROI-sized
-            # Using a solid square creates a visible box artifact at the edges.
-            # A Gaussian-blurred ellipse warps into a smooth face oval with no hard boundary.
-            aimg_mask = np.zeros((128, 128), dtype=np.float32)
-            cv2.ellipse(aimg_mask, (64, 64), (52, 58), 0, 0, 360, 1.0, -1)
-            aimg_mask = cv2.GaussianBlur(aimg_mask, (31, 31), 0)
-            aimg_mask = (aimg_mask * 255).astype(np.uint8)
-            roi_mask = cv2.warpAffine(aimg_mask, M_roi_inv, (roi_w, roi_h))
+            # ── Fix #6: Use cached 128×128 soft oval mask (identical every frame) ──
+            roi_mask = cv2.warpAffine(self._face_mask_128, M_roi_inv, (roi_w, roi_h))
 
             roi_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2].copy()
 
-            # ── Color match (if enabled) for skin-tone correction at boundary ──
+            # ── Fix #5: Color match with temporally-smoothed LUT ──
             if ENABLE_SEAMLESS_CLONE and roi_mask.sum() > 0:
                 try:
-                    roi_warped = self._color_match(roi_warped, roi_frame, roi_mask)
+                    roi_warped = self._color_match(roi_warped, roi_frame, roi_mask, session_id)
                 except Exception:
                     pass
 
@@ -609,15 +665,9 @@ class FaceSwapper:
             alpha = (blurred_mask.astype(np.float32) / 255.0)[..., None]
             blended_roi = (roi_frame * (1 - alpha) + roi_warped * alpha).astype(np.uint8)
 
-            # ── Mouth Interior Preservation (Color-Difference Adaptive) ──
-            # INSwapper hallucinates blue/black/grey pixels inside open mouths
-            # because the target photo typically has a closed mouth. We detect
-            # this by measuring the per-pixel color DIFFERENCE (MSE) between
-            # the swapped and original mouth region.
-            #   - Closed mouth: swapped ≈ original (both show skin/lips) → low MSE → skip
-            #   - Open mouth hallucination: swapped = blue/black, original = teeth → high MSE → restore
-            # The original webcam teeth/tongue are shown through — user confirmed this is OK.
-            if hasattr(source_face, 'kps') and source_face.kps is not None:
+            # ── Fix #2: Mouth Interior Preservation (Stabilized) ──
+            # Skip when lip sync is active (Fix #3) to avoid double-overwrite conflict
+            if not skip_mouth_preservation and hasattr(source_face, 'kps') and source_face.kps is not None:
                 try:
                     kps = source_face.kps
                     mouth_left = kps[3]
@@ -626,7 +676,6 @@ class FaceSwapper:
                     mouth_w = np.linalg.norm(mouth_right - mouth_left)
                     eye_dist = np.linalg.norm(kps[1] - kps[0])
 
-                    # Center the mask slightly below mouth corners (covers inner mouth)
                     cx = mouth_center[0]
                     cy = mouth_center[1] + eye_dist * 0.05
 
@@ -634,7 +683,7 @@ class FaceSwapper:
                     cx_roi = int(cx) - roi_x1
                     cy_roi = int(cy) - roi_y1
 
-                    # ── Step 1: Color-difference detection ──
+                    # ── Step 1: Color-difference detection with MSE averaging ──
                     sample_rx = max(6, int(mouth_w * 0.32))
                     sample_ry = max(6, int(eye_dist * 0.16))
                     sy1 = max(0, cy_roi - sample_ry)
@@ -647,47 +696,64 @@ class FaceSwapper:
                         swap_patch = blended_roi[sy1:sy2, sx1:sx2].astype(np.float32)
                         orig_patch = roi_frame[sy1:sy2, sx1:sx2].astype(np.float32)
 
-                        # Per-pixel color MSE (across all 3 channels)
                         mse = np.mean((swap_patch - orig_patch) ** 2)
-                        # Normalize: MSE of 500+ = very different, <100 = similar
-                        # Map to 0..1 range:  100→0, 400→0.6, 800+→1.0
+
+                        # Fix #2: Average MSE over last 5 frames to remove noise
+                        mse_key = f"{session_id}_mse"
+                        if mse_key not in self._mouth_mse_history:
+                            self._mouth_mse_history[mse_key] = []
+                        self._mouth_mse_history[mse_key].append(mse)
+                        if len(self._mouth_mse_history[mse_key]) > 5:
+                            self._mouth_mse_history[mse_key] = self._mouth_mse_history[mse_key][-5:]
+                        mse = np.mean(self._mouth_mse_history[mse_key])
+
                         mse_conf = np.clip((mse - 100.0) / 700.0, 0.0, 1.0)
 
-                        # Also check std of swapped patch — hallucinations are
-                        # unnaturally UNIFORM (flat color), real mouth has texture
                         swap_std = np.std(swap_patch)
                         orig_std = np.std(orig_patch)
-                        # If swapped is much more uniform than original → hallucination
                         uniformity_ratio = swap_std / max(orig_std, 1.0)
                         uniform_conf = np.clip((0.6 - uniformity_ratio) / 0.4, 0.0, 0.6)
 
                         mask_strength = min(1.0, mse_conf + uniform_conf)
 
-                    # ── Step 2: Temporal smoothing ──
+                    # ── Step 2: Heavy temporal smoothing (Fix #2) ──
                     smooth_key = f"{session_id}_mouth_str"
                     if smooth_key in self._smooth_bbox:
                         prev_str = self._smooth_bbox[smooth_key]
-                        # Fast rise to catch mouth opening, slow decay to prevent flicker
+                        # Slow rise (0.7/0.3) and very slow decay (0.92/0.08)
+                        # Takes ~10 frames to appear, ~25 frames to disappear → zero flicker
                         if mask_strength > prev_str:
-                            mask_strength = 0.3 * prev_str + 0.7 * mask_strength
+                            mask_strength = 0.7 * prev_str + 0.3 * mask_strength
                         else:
-                            mask_strength = 0.8 * prev_str + 0.2 * mask_strength
+                            mask_strength = 0.92 * prev_str + 0.08 * mask_strength
                     self._smooth_bbox[smooth_key] = mask_strength
 
-                    # ── Step 3: Apply mouth mask ──
-                    if mask_strength > 0.05:
-                        # Generous ellipse covering the inner mouth area
-                        scale_factor = 0.6 + 0.4 * mask_strength
-                        ell_rx = int(mouth_w * 0.38 * scale_factor)
-                        ell_ry = int(eye_dist * 0.20 * scale_factor)
+                    # ── Step 3: Hysteresis thresholds (Fix #2) ──
+                    active_key = f"{session_id}_mouth_active"
+                    is_active = self._mouth_mask_active.get(active_key, False)
+                    if is_active:
+                        # Deactivate only when strength drops well below threshold
+                        if mask_strength < 0.08:
+                            is_active = False
+                    else:
+                        # Activate only when strength is clearly above threshold
+                        if mask_strength > 0.20:
+                            is_active = True
+                    self._mouth_mask_active[active_key] = is_active
+
+                    # ── Step 4: Apply mouth mask (Fixed geometry — only alpha varies) ──
+                    if is_active and mask_strength > 0.05:
+                        # Fix #2: CONSTANT ellipse size — only blend intensity varies
+                        ell_rx = int(mouth_w * 0.38)
+                        ell_ry = int(eye_dist * 0.20)
 
                         if (ell_rx > 2 and ell_ry > 2 and
                                 0 < cx_roi < roi_w and 0 < cy_roi < roi_h):
                             mouth_excl = np.zeros((roi_h, roi_w), dtype=np.float32)
                             cv2.ellipse(mouth_excl, (cx_roi, cy_roi),
                                         (ell_rx, ell_ry), 0, 0, 360, 1.0, -1)
-                            # Very large blur → invisible edge transition
-                            blur_sz = max(41, int(max(ell_rx, ell_ry) * 2.2) | 1)
+                            # Fix #2: Larger blur for softer boundary
+                            blur_sz = max(61, int(max(ell_rx, ell_ry) * 2.8) | 1)
                             mouth_excl = cv2.GaussianBlur(mouth_excl, (blur_sz, blur_sz), 0)
                             mouth_excl *= mask_strength
                             m3 = mouth_excl[..., None]
@@ -696,7 +762,7 @@ class FaceSwapper:
                 except Exception:
                     pass  # If landmark estimation fails, skip — swap still works
 
-            result = frame.copy()
+            result = frame  # modify in-place — caller doesn't reuse the input
             result[roi_y1:roi_y2, roi_x1:roi_x2] = blended_roi
             return result
 
@@ -705,8 +771,11 @@ class FaceSwapper:
             return frame
 
     def _detect_faces_with_fallback(self, frame: np.ndarray):
-        """Detect faces using fast analyzer (det-only, 256×256) for real-time."""
+        """Detect faces using fast analyzer (det-only, 320×320) for real-time.
+        Fix #1: Filter low-confidence detections to avoid noisy kps → jitter."""
         faces = self.face_analyzer_fast.get(frame)
+        # Fix #1: Filter out low-confidence detections that give noisy landmarks
+        faces = [f for f in faces if getattr(f, 'det_score', 0.9) >= 0.4]
         if len(faces) > 0:
             return faces
 
@@ -954,12 +1023,11 @@ class FaceSwapper:
         self._smooth_bbox[key] = smoothed
         return smoothed
 
-    def _color_match(self, source: np.ndarray, target: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Histogram-based color matching in LAB space for ~95% accurate color transfer.
+    def _color_match(self, source: np.ndarray, target: np.ndarray, mask: np.ndarray, session_id: str = "") -> np.ndarray:
+        """Histogram-based color matching in LAB space with temporal LUT smoothing.
         
-        Uses per-channel CDF lookup tables instead of simple mean/std.
-        This preserves the full tonal range and handles non-Gaussian
-        color distributions (shadows, highlights) much better.
+        Fix #5: The CDF LUT is blended with the previous frame's LUT (70% old + 30% new)
+        to prevent frame-to-frame skin tone flicker caused by varying pixel populations.
         """
         try:
             if mask is None or mask.sum() < 10:
@@ -985,12 +1053,21 @@ class FaceSwapper:
                 tgt_cdf = np.cumsum(tgt_hist)
                 tgt_cdf /= tgt_cdf[-1] if tgt_cdf[-1] > 0 else 1
 
-                # Build 256-entry LUT: for each source level, find target level with closest CDF
-                lut = np.searchsorted(tgt_cdf, src_cdf).clip(0, 255).astype(np.uint8)
+                # Build 256-entry LUT
+                lut = np.searchsorted(tgt_cdf, src_cdf).clip(0, 255).astype(np.float64)
+
+                # Fix #5: Temporal smoothing of LUT (70% old + 30% new)
+                if session_id:
+                    lut_key = f"{session_id}_color_lut_{c}"
+                    if lut_key in self._color_lut_cache:
+                        lut = 0.7 * self._color_lut_cache[lut_key] + 0.3 * lut
+                    self._color_lut_cache[lut_key] = lut.copy()
+
+                lut_u8 = lut.clip(0, 255).astype(np.uint8)
 
                 # Apply LUT only within the mask
                 channel = matched[..., c].copy()
-                channel[mask_bool] = lut[src_lab[..., c][mask_bool]]
+                channel[mask_bool] = lut_u8[src_lab[..., c][mask_bool]]
                 matched[..., c] = channel
 
             return cv2.cvtColor(matched, cv2.COLOR_LAB2BGR)
@@ -1016,4 +1093,26 @@ class FaceSwapper:
             del self._smooth_bbox[mouth_key]
         if session_id in self._last_result:
             del self._last_result[session_id]
+        # Fix #1: Clean up affine smoothing
+        affine_key = f"{session_id}_affine"
+        if affine_key in self._smooth_affine:
+            del self._smooth_affine[affine_key]
+        # Fix #1: Clean up miss counter
+        self._miss_count.pop(session_id, None)
+        # Fix #2: Clean up mouth MSE history and activation state
+        mse_key = f"{session_id}_mse"
+        self._mouth_mse_history.pop(mse_key, None)
+        active_key = f"{session_id}_mouth_active"
+        self._mouth_mask_active.pop(active_key, None)
+        # Fix #4: Clean up target persistence
+        self._current_target_idx.pop(session_id, None)
+        self._target_hold_frames.pop(session_id, None)
+        # Fix #5: Clean up color LUT cache
+        for c in range(3):
+            lut_key = f"{session_id}_color_lut_{c}"
+            self._color_lut_cache.pop(lut_key, None)
+        # Clean up multi-face bbox keys
+        for i in range(10):
+            face_key = f"{session_id}_f{i}"
+            self._smooth_bbox.pop(f"{face_key}_bbox", None)
         print(f"Cleaned up session {session_id}")
