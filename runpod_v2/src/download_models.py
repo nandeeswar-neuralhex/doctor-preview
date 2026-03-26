@@ -1,7 +1,15 @@
 
 import os
 import subprocess
-from config import INSWAPPER_MODEL, GFPGAN_MODEL_PATH, WAV2LIP_MODEL_PATH
+from config import (
+    INSWAPPER_MODEL,
+    GFPGAN_MODEL_PATH,
+    WAV2LIP_MODEL_PATH,
+    FACE_PARSING_MODEL,
+    LIVEPORTRAIT_MODEL_DIR,
+    ENABLE_FACE_PARSING,
+    SWAP_ENGINE,
+)
 
 import hashlib
 
@@ -73,6 +81,39 @@ def download_models():
         WAV2LIP_MODEL_PATH,
         min_size_mb=1
     )
+
+    # 4. BiSeNet Face Parsing (Phase 1.1) — semantic segmentation for mask generation
+    if ENABLE_FACE_PARSING:
+        download_file(
+            "https://huggingface.co/jonathandinu/face-parsing/resolve/main/model.onnx",
+            FACE_PARSING_MODEL,
+            min_size_mb=10
+        )
+
+    # 5. LivePortrait models (Phase 3) — motion-driven face generation
+    if SWAP_ENGINE == "liveportrait":
+        lp_models = {
+            "liveportrait_appearance.onnx": (
+                "https://huggingface.co/KwaiVGI/LivePortrait/resolve/main/liveportrait_onnx/appearance_feature_extractor.onnx",
+                50
+            ),
+            "liveportrait_motion.onnx": (
+                "https://huggingface.co/KwaiVGI/LivePortrait/resolve/main/liveportrait_onnx/motion_extractor.onnx",
+                10
+            ),
+            "liveportrait_generator.onnx": (
+                "https://huggingface.co/KwaiVGI/LivePortrait/resolve/main/liveportrait_onnx/spade_generator.onnx",
+                50
+            ),
+            "liveportrait_stitching.onnx": (
+                "https://huggingface.co/KwaiVGI/LivePortrait/resolve/main/liveportrait_onnx/stitching_retargeting_module.onnx",
+                1
+            ),
+        }
+        os.makedirs(LIVEPORTRAIT_MODEL_DIR, exist_ok=True)
+        for filename, (url, min_mb) in lp_models.items():
+            path = os.path.join(LIVEPORTRAIT_MODEL_DIR, filename)
+            download_file(url, path, min_size_mb=min_mb)
 
 if __name__ == "__main__":
     download_models()

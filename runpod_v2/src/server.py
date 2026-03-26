@@ -17,7 +17,7 @@ import io
 from PIL import Image, ImageOps
 from face_swapper import FaceSwapper
 from lip_syncer import LipSyncer
-from config import JPEG_QUALITY, EXECUTION_PROVIDER, ENABLE_LIPSYNC, ENABLE_WEBRTC
+from config import JPEG_QUALITY, EXECUTION_PROVIDER, ENABLE_LIPSYNC, ENABLE_WEBRTC, SWAP_ENGINE
 from download_models import download_models
 
 # WebRTC manager (lazy init — only if ENABLE_WEBRTC=true)
@@ -122,7 +122,10 @@ async def health_check():
         "status": "healthy",
         "mode": "simple-flip",
         "gpu_active": gpu.get("gpu_active", False),
-        "webrtc_enabled": webrtc_manager is not None
+        "webrtc_enabled": webrtc_manager is not None,
+        "swap_engine": SWAP_ENGINE,
+        "face_parsing": swapper.face_parser is not None and swapper.face_parser.is_ready() if swapper else False,
+        "liveportrait": swapper.live_portrait is not None and swapper.live_portrait.is_ready() if swapper else False,
     }
 
 @app.get("/")
@@ -177,6 +180,23 @@ async def upload_target(
         
         if not success:
             return JSONResponse(status_code=400, content={"error": "No face detected in target image"})
+
+        # Phase 3: Extract LivePortrait appearance features on target upload
+        if SWAP_ENGINE == "liveportrait" and swapper.live_portrait and swapper.live_portrait.is_ready():
+            try:
+                # Crop face for appearance extraction
+                faces = swapper.face_analyzer.get(image)
+                if faces:
+                    best_face = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
+                    bbox = best_face.bbox.astype(int)
+                    x1, y1, x2, y2 = bbox
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2 = min(image.shape[1], x2)
+                    y2 = min(image.shape[0], y2)
+                    face_crop = image[y1:y2, x1:x2]
+                    swapper.live_portrait.extract_appearance(face_crop, session_id)
+            except Exception as e:
+                print(f"LivePortrait appearance extraction warning: {e}")
 
         return {
             "status": "success",

@@ -8,6 +8,7 @@ WORKDIR /app
 
 # System dependencies (devel image has build-essential already)
 # Added WebRTC codec libs: libavcodec, libopus, libvpx, libsrtp2
+# Phase 1.4: Added libopenh264-dev for H.264 WebRTC codec
 RUN apt-get update && apt-get install -y --no-install-recommends \
     software-properties-common \
     && add-apt-repository ppa:deadsnakes/ppa \
@@ -16,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx libglib2.0-0 libturbojpeg \
     libavcodec-dev libavformat-dev libavutil-dev \
     libopus-dev libvpx-dev libsrtp2-dev \
+    libopenh264-dev \
     wget curl \
     && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
     && ln -sf /usr/bin/python3.11 /usr/bin/python \

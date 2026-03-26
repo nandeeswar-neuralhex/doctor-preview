@@ -47,3 +47,27 @@ LIPSYNC_AUDIO_WINDOW_MS = int(os.getenv("LIPSYNC_AUDIO_WINDOW_MS", "500"))
 # Frame processing
 TARGET_FPS = int(os.getenv("TARGET_FPS", "24"))
 FRAME_TIMEOUT_MS = 1000 // TARGET_FPS  # ~41ms for 24 FPS
+
+# ── Phase 1: BiSeNet Face Parsing ──
+ENABLE_FACE_PARSING = os.getenv("ENABLE_FACE_PARSING", "true").lower() == "true"
+FACE_PARSING_MODEL = os.path.join(MODELS_DIR, "bisenet_face_parsing.onnx")
+# Classes to include in parsing mask: face, hair, ears, neck (see face_parser.py)
+PARSING_CLASSES = os.getenv("PARSING_CLASSES", "face,hair,ears,neck").split(",")
+
+# ── Phase 1: Real-time GFPGAN Enhancement ──
+ENABLE_REALTIME_ENHANCE = os.getenv("ENABLE_REALTIME_ENHANCE", "false").lower() == "true"
+ENHANCE_EVERY_N_FRAMES = int(os.getenv("ENHANCE_EVERY_N_FRAMES", "1"))
+
+# ── Phase 1: Detection Resolution (320 for T4, 640 for H100) ──
+DETECTION_SIZE = int(os.getenv("DETECTION_SIZE", "320"))
+
+# ── Phase 3: Swap Engine Selection ──
+# "inswapper" = current INSwapper 128x128 pipeline
+# "liveportrait" = LivePortrait motion-driven generation
+SWAP_ENGINE = os.getenv("SWAP_ENGINE", "inswapper")
+
+# ── Phase 3: LivePortrait Settings ──
+LIVEPORTRAIT_MODEL_DIR = os.path.join(MODELS_DIR, "liveportrait")
+LIVEPORTRAIT_RESOLUTION = int(os.getenv("LIVEPORTRAIT_RESOLUTION", "256"))
+ENABLE_EYE_GAZE_CORRECTION = os.getenv("ENABLE_EYE_GAZE_CORRECTION", "true").lower() == "true"
+MOTION_SMOOTHING_ALPHA = float(os.getenv("MOTION_SMOOTHING_ALPHA", "0.7"))

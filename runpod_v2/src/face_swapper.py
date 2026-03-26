@@ -21,6 +21,11 @@ from config import (
     ENABLE_TEMPORAL_SMOOTHING,
     SMOOTHING_ALPHA,
     MAX_FACES,
+    ENABLE_FACE_PARSING,
+    ENABLE_REALTIME_ENHANCE,
+    ENHANCE_EVERY_N_FRAMES,
+    DETECTION_SIZE,
+    SWAP_ENGINE,
 )
 
 
@@ -157,6 +162,49 @@ class FaceSwapper:
             except Exception as e:
                 print(f"GFPGAN not available: {e}")
                 self.enhancer = None
+
+        # ── Phase 1.1: BiSeNet Face Parser ──
+        self.face_parser = None
+        if ENABLE_FACE_PARSING:
+            try:
+                from face_parser import FaceParser
+                self.face_parser = FaceParser(providers)
+                if self.face_parser.is_ready():
+                    # On T4 (< 24GB), parse every 3rd frame to save latency
+                    if not self._is_high_end_gpu():
+                        self.face_parser.set_parse_frequency(3)
+                    print("✅ BiSeNet face parser enabled")
+                else:
+                    print("⚠️  BiSeNet face parser not ready (model missing?)")
+                    self.face_parser = None
+            except Exception as e:
+                print(f"BiSeNet face parser not available: {e}")
+                self.face_parser = None
+
+        # ── Phase 1.2: Real-time enhancement frame counter ──
+        self._enhance_frame_counter: Dict[str, int] = {}
+
+        # ── Phase 1.3: GPU capability detection for 640×640 detection ──
+        self._use_high_res_detection = DETECTION_SIZE >= 640 or self._is_high_end_gpu()
+        if self._use_high_res_detection:
+            print(f"  Detection: using 640×640 full analyzer (high-end GPU detected)")
+        else:
+            print(f"  Detection: using 320×320 fast analyzer")
+
+        # ── Phase 3: LivePortrait engine ──
+        self.live_portrait = None
+        if SWAP_ENGINE == "liveportrait":
+            try:
+                from live_portrait import LivePortrait
+                self.live_portrait = LivePortrait(providers)
+                if self.live_portrait.is_ready():
+                    print("✅ LivePortrait engine enabled (swap_engine=liveportrait)")
+                else:
+                    print("⚠️  LivePortrait not ready — falling back to INSwapper")
+                    self.live_portrait = None
+            except Exception as e:
+                print(f"LivePortrait not available: {e} — using INSwapper")
+                self.live_portrait = None
 
         # Session storage for target faces and smoothing state
         self.target_faces: Dict[str, Any] = {}
@@ -512,6 +560,10 @@ class FaceSwapper:
     def swap_face_with_faces(self, session_id: str, frame: np.ndarray, skip_mouth_preservation: bool = False):
         """Swap face using expression-matched target and return detected faces.
         
+        Supports two engines:
+          - "inswapper": Traditional INSwapper 128×128 pipeline
+          - "liveportrait": LivePortrait motion-driven generation (Phase 3)
+        
         Args:
             skip_mouth_preservation: If True, skip mouth interior preservation
                                      (used when lip sync will run afterwards)
@@ -546,6 +598,35 @@ class FaceSwapper:
         
         # Reset miss counter on successful detection
         self._miss_count[session_id] = 0
+
+        # ── Phase 3: LivePortrait engine path ──
+        if self.live_portrait and self.live_portrait.is_ready():
+            try:
+                best = max(source_faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))
+                best.bbox = self._smooth_bounding_box(session_id, best.bbox)
+
+                # Get cached appearance (extracted on target upload)
+                appearance = self.live_portrait.get_cached_appearance(session_id)
+                if appearance is not None:
+                    # Extract motion from source face
+                    motion = self.live_portrait.extract_motion(frame, best.bbox, session_id)
+                    if motion is not None:
+                        # Generate new face
+                        generated = self.live_portrait.generate(appearance, motion)
+                        if generated is not None:
+                            # Get parsing mask if available
+                            parse_mask = None
+                            if self.face_parser and self.face_parser.is_ready():
+                                parse_mask = self.face_parser.parse(frame, best.bbox, session_id)
+                            # Stitch onto background
+                            result = self.live_portrait.stitch(
+                                generated, frame, best.bbox, parse_mask
+                            )
+                            self._last_result[session_id] = result
+                            return result, source_faces
+            except Exception as e:
+                print(f"LivePortrait swap failed: {e} — falling back to INSwapper")
+            # Fall through to INSwapper if LivePortrait fails
 
         result = frame
         n_swap = max(1, MAX_FACES)
@@ -616,6 +697,24 @@ class FaceSwapper:
                 return frame
             bgr_fake, M = res  # bgr_fake: (128,128,3), M: (2,3) affine frame→128px
 
+            # ── Phase 1.2: Real-time GFPGAN enhancement on swapped face ──
+            if ENABLE_REALTIME_ENHANCE and self.enhancer is not None:
+                enhance_key = f"{session_id}_enhance"
+                self._enhance_frame_counter[enhance_key] = (
+                    self._enhance_frame_counter.get(enhance_key, 0) + 1
+                )
+                if self._enhance_frame_counter[enhance_key] % ENHANCE_EVERY_N_FRAMES == 0:
+                    try:
+                        # Upscale 128→512 for GFPGAN, then downscale back
+                        face_up = cv2.resize(bgr_fake, (512, 512), interpolation=cv2.INTER_CUBIC)
+                        _, _, enhanced = self.enhancer.enhance(
+                            face_up, has_aligned=True, only_center_face=True, paste_back=False
+                        )
+                        if enhanced is not None:
+                            bgr_fake = cv2.resize(enhanced, (128, 128), interpolation=cv2.INTER_AREA)
+                    except Exception:
+                        pass  # Enhancement failure is non-critical
+
             h, w = frame.shape[:2]
 
             # ── Fix #1: Smooth the inverse affine matrix for sub-pixel stability ──
@@ -647,8 +746,24 @@ class FaceSwapper:
             roi_warped = cv2.warpAffine(bgr_fake, M_roi_inv, (roi_w, roi_h),
                                         borderMode=cv2.BORDER_REPLICATE)
 
-            # ── Fix #6: Use cached 128×128 soft oval mask (identical every frame) ──
-            roi_mask = cv2.warpAffine(self._face_mask_128, M_roi_inv, (roi_w, roi_h))
+            # ── Phase 1.1: BiSeNet parsing mask OR fallback to oval ──
+            parsing_mask = None
+            if self.face_parser and self.face_parser.is_ready():
+                try:
+                    parsing_mask = self.face_parser.parse_roi(
+                        frame, source_face.bbox,
+                        (roi_x1, roi_y1, roi_x2, roi_y2),
+                        session_id,
+                    )
+                except Exception:
+                    parsing_mask = None
+
+            if parsing_mask is not None and parsing_mask.shape == (roi_h, roi_w):
+                # Use BiSeNet mask (already float32 in [0, 1])
+                roi_mask = (parsing_mask * 255).astype(np.uint8)
+            else:
+                # Fallback: cached 128×128 soft oval mask
+                roi_mask = cv2.warpAffine(self._face_mask_128, M_roi_inv, (roi_w, roi_h))
 
             roi_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2].copy()
 
@@ -771,9 +886,16 @@ class FaceSwapper:
             return frame
 
     def _detect_faces_with_fallback(self, frame: np.ndarray):
-        """Detect faces using fast analyzer (det-only, 320×320) for real-time.
+        """Detect faces with automatic analyzer selection.
+
+        Phase 1.3: On high-end GPUs (H100/A100), use 640×640 full analyzer
+        for better keypoint accuracy. On T4/A10, use 320×320 fast analyzer.
         Fix #1: Filter low-confidence detections to avoid noisy kps → jitter."""
-        faces = self.face_analyzer_fast.get(frame)
+        # Phase 1.3: Use full 640×640 analyzer on high-end GPUs
+        if self._use_high_res_detection:
+            faces = self.face_analyzer.get(frame)
+        else:
+            faces = self.face_analyzer_fast.get(frame)
         # Fix #1: Filter out low-confidence detections that give noisy landmarks
         faces = [f for f in faces if getattr(f, 'det_score', 0.9) >= 0.4]
         if len(faces) > 0:
@@ -1075,6 +1197,28 @@ class FaceSwapper:
             print(f"Color match error: {e}")
             return source
     
+    def _is_high_end_gpu(self) -> bool:
+        """Detect if running on H100/A100 (>= 40GB VRAM).
+
+        Returns True for high-end GPUs that can handle 640×640 detection
+        and real-time GFPGAN enhancement without FPS drop.
+        """
+        try:
+            import torch
+            if torch.cuda.is_available():
+                vram_bytes = torch.cuda.get_device_properties(0).total_mem
+                vram_gb = vram_bytes / (1024 ** 3)
+                gpu_name = torch.cuda.get_device_properties(0).name
+                is_high_end = vram_gb >= 40.0
+                print(f"  GPU: {gpu_name}, VRAM: {vram_gb:.1f}GB, high_end={is_high_end}")
+                return is_high_end
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f"  GPU detection error: {e}")
+        # Fallback: check config
+        return DETECTION_SIZE >= 640
+
     def cleanup_session(self, session_id: str):
         """Clean up session data to free memory"""
         if session_id in self.target_faces:
@@ -1115,4 +1259,13 @@ class FaceSwapper:
         for i in range(10):
             face_key = f"{session_id}_f{i}"
             self._smooth_bbox.pop(f"{face_key}_bbox", None)
+        # Phase 1.1: Clean up face parser cache
+        if self.face_parser:
+            self.face_parser.cleanup_session(session_id)
+        # Phase 1.2: Clean up enhance frame counter
+        enhance_key = f"{session_id}_enhance"
+        self._enhance_frame_counter.pop(enhance_key, None)
+        # Phase 3: Clean up LivePortrait cache
+        if self.live_portrait:
+            self.live_portrait.cleanup_session(session_id)
         print(f"Cleaned up session {session_id}")

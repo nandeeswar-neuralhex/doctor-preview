@@ -129,6 +129,19 @@ except Exception as e:
     import traceback
     traceback.print_exc()
 
+# ── Phase 1.4: H.264 codec support (preferred over VP8 when available) ──
+# H.264 is ~40% more efficient than VP8 at same bitrate.
+# We try to configure aiortc to prefer H.264, falling back to VP8 if unavailable.
+_H264_AVAILABLE = False
+try:
+    from aiortc.codecs import h264 as _h264_module
+    _H264_AVAILABLE = True
+    print("[WebRTC] H.264 codec available — will prefer over VP8")
+except ImportError:
+    print("[WebRTC] H.264 codec not available — using VP8 (install openh264 for H.264)")
+except Exception as e:
+    print(f"[WebRTC] H.264 check error: {e} — using VP8")
+
 
 def _parse_sdp_bitrate(sdp: str) -> Optional[int]:
     """Extract b=AS:<kbps> from SDP and return as bps, or None."""

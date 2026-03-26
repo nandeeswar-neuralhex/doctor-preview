@@ -42,3 +42,11 @@ albumentations>=1.0
 prettytable>=3.0
 tqdm>=4.0
 Cython>=0.29
+
+# === Phase 1.4: H.264 codec for WebRTC (optional, improves quality) ===
+# openh264 system lib required — installed via apt in Dockerfile
+# aiortc will auto-detect and prefer H.264 if available
+
+# === Phase 3: LivePortrait dependencies (optional, for motion-driven generation) ===
+# Models are downloaded at startup if SWAP_ENGINE=liveportrait
+# No additional Python packages needed — uses existing onnxruntime-gpu
