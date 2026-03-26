@@ -284,6 +284,14 @@ READY FOR TESTING: Yes
 
 Then say: **"Code generation complete. Proceeding to API Testing."**
 
+## Skills Used
+- **SK-02 Dependency Resolver**: Install new packages if needed (see `.prompts/skills.md`)
+- **SK-03 API Contract Generator**: Generate Pydantic models from contracts
+- **SK-06 Code Validator**: Syntax-check and lint all generated code
+- **SK-10 File Impact Analyzer**: Verify no unintended side-effects
+
+Also follow ALL rules in `.prompts/instructions.md`.
+
 ## Rules
 - NEVER write code without loggers
 - NEVER use magic numbers — use named constants

@@ -191,6 +191,12 @@ RETRY LOOP:
 
 Then say: **"All API tests passing. Proceeding to UI Integration."**
 
+## Skills Used
+- **SK-04 Test Runner**: Execute curl commands and capture results (see `.prompts/skills.md`)
+- **SK-05 Retry Loop**: Auto-retry failed tests with diagnosis
+- **SK-08 Log Analyzer**: Parse server logs when tests fail unexpectedly
+- **SK-09 Performance Profiler**: Verify endpoint latency meets targets
+
 ## Rules
 - NEVER skip testing and go to UI
 - NEVER mark a test as passed without actually running the curl command

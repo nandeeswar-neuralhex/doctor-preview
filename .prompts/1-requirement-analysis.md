@@ -75,6 +75,11 @@ Scan the workspace to identify:
 ### Step 4: Output the Analysis Document
 Present the complete analysis and ask user: **"Analysis complete. Shall I proceed to Code Generation?"**
 
+## Skills Used
+- **SK-01 Workspace Scanner**: Scan codebase before analysis (see `.prompts/skills.md`)
+- **SK-10 File Impact Analyzer**: Identify all affected files
+- **SK-03 API Contract Generator**: Generate endpoint contracts from requirements
+
 ## Rules
 - NEVER skip analysis and jump to code
 - ALWAYS identify ALL affected files before coding

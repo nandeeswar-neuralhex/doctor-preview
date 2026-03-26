@@ -274,6 +274,13 @@ E2E VERIFICATION:
 STATUS: ✅ FEATURE COMPLETE
 ```
 
+## Skills Used
+- **SK-02 Dependency Resolver**: Install new npm packages if needed (see `.prompts/skills.md`)
+- **SK-05 Retry Loop**: Auto-retry E2E verification on failure
+- **SK-06 Code Validator**: Check for JS syntax errors
+
+Also follow ALL rules in `.prompts/instructions.md`.
+
 ## Rules
 - NEVER put API calls directly in components — ALWAYS use custom hooks
 - NEVER hardcode API URLs — use environment variables

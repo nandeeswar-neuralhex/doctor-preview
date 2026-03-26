@@ -97,6 +97,15 @@ This is the master orchestration agent that manages the full Software Developmen
 └────────────────────────────────────────────────────────────────┘
 ```
 
+## Companion Files
+
+| File | Load When |
+|---|---|
+| `.prompts/instructions.md` | ALWAYS — global rules every agent must follow |
+| `.prompts/skills.md` | As needed — reusable capabilities (SK-01 to SK-10) |
+| `.prompts/prompt-templates.md` | When user needs help structuring a request |
+| `.github/copilot-instructions.md` | Auto-loaded by GitHub Copilot on every prompt |
+
 ## How to Trigger the Pipeline
 
 When a user provides a requirement, follow this exact sequence:
