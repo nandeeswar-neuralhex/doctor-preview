@@ -227,7 +227,9 @@ class VideoTransformTrack(MediaStreamTrack):
     MAX_PROCESS_HEIGHT = 720
 
     def _process_loop(self):
-        """Background thread: process latest input frame on GPU."""
+        """Background thread: process latest input frame on GPU.
+        Fix #7: Cross-fade between consecutive swap results to eliminate stutter."""
+        prev_result = None  # For cross-fade between swap outputs
         while not self._stop.is_set():
             self._has_input.wait(timeout=0.1)
             if self._stop.is_set():
@@ -250,14 +252,20 @@ class VideoTransformTrack(MediaStreamTrack):
             # Save original for lip sync (clean mouth pixels, no swap artifacts)
             original_img = img.copy()
 
-            # Face swap (GPU)
-            result, faces = self.swapper.swap_face_with_faces(self.session_id, img)
+            # Fix #3: Check if lip sync will run — if so, skip mouth preservation
+            settings = self.session_settings.get(self.session_id, {}) if self.session_settings else {}
+            enable_lipsync = settings.get("enable_lipsync", ENABLE_LIPSYNC)
+            will_lipsync = (enable_lipsync and self.lip_syncer
+                           and self.lip_syncer.is_ready())
+
+            # Face swap (GPU) — with skip_mouth_preservation if lip sync active
+            result, faces = self.swapper.swap_face_with_faces(
+                self.session_id, img, skip_mouth_preservation=will_lipsync
+            )
 
             # Lip sync — use original frame for Wav2Lip input so it gets
             # clean teeth/tongue instead of swapped artifacts
-            settings = self.session_settings.get(self.session_id, {}) if self.session_settings else {}
-            enable_lipsync = settings.get("enable_lipsync", ENABLE_LIPSYNC)
-            if enable_lipsync and self.lip_syncer and self.lip_syncer.is_ready() and len(faces) > 0:
+            if will_lipsync and len(faces) > 0:
                 audio_pcm, sample_rate = self.audio_buffer.get_recent_audio()
                 mel = self.lip_syncer.audio_to_mel(audio_pcm, sample_rate)
                 if mel is not None:
@@ -272,6 +280,13 @@ class VideoTransformTrack(MediaStreamTrack):
                             result = self.lip_syncer.apply_mouth_only(
                                 result, (x1, y1, x2, y2), synced
                             )
+
+            # Fix #7: Cross-fade with previous swap result to eliminate
+            # the "jump" when a new swap result replaces repeated frames.
+            # 70% new + 30% old = smooth transition over 1-2 frames.
+            if prev_result is not None and prev_result.shape == result.shape:
+                result = cv2.addWeighted(result, 0.7, prev_result, 0.3, 0)
+            prev_result = result.copy()
 
             with self._result_lock:
                 self._latest_result = result
@@ -306,9 +321,13 @@ class VideoTransformTrack(MediaStreamTrack):
             self._worker.start()
             self._reader_task = asyncio.ensure_future(self._read_input())
 
-        # Wait for at least one processed frame
-        if self._latest_result is None:
-            await self._result_event.wait()
+        # Fix #7: Wait for a new processed frame with timeout
+        # This syncs output to actual swap timing rather than a fixed 30fps clock
+        # that produces 2-3 duplicate frames then a sudden jump.
+        try:
+            await asyncio.wait_for(self._result_event.wait(), timeout=self.FRAME_INTERVAL)
+        except asyncio.TimeoutError:
+            pass  # Use previous frame if no new result ready
         self._result_event.clear()
 
         # Get latest processed result

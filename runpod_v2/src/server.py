@@ -296,9 +296,15 @@ def _process_frame_binary(jpeg_bytes: bytes, audio_pcm: bytes, audio_sr: int,
     t1 = time.time()
 
     # Face swap + get detected faces for lip sync
+    # Fix #3: If lip sync will run, tell swapper to skip mouth preservation
+    # to prevent double-overwrite conflict between mouth mask and Wav2Lip
+    will_lipsync = (lip_syncer_ref and lip_syncer_ref.is_ready()
+                    and audio_pcm and len(audio_pcm) > 0)
     source_faces = []
     if swapper_ref and swapper_ref.has_target(session_id):
-        result, source_faces = swapper_ref.swap_face_with_faces(session_id, frame)
+        result, source_faces = swapper_ref.swap_face_with_faces(
+            session_id, frame, skip_mouth_preservation=will_lipsync
+        )
     else:
         result = frame
 
@@ -414,10 +420,11 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
     _sem = asyncio.Semaphore(1)  # ONE frame on GPU at a time
     _latest_frame_id = 0         # Track latest to drop stale frames
     _send_lock = asyncio.Lock()  # Prevent concurrent writes to WebSocket
+    _last_output = None          # Fix #8: Cache last output for heartbeat frames
 
     async def process_and_respond_binary(raw_data: bytes):
         """Process a binary frame (with optional audio) and send result back."""
-        nonlocal last_timing, _latest_frame_id
+        nonlocal last_timing, _latest_frame_id, _last_output
         if len(raw_data) < 21:  # 20-byte header + at least 1 byte JPEG
             return
         # Header: 4B frameId + 8B timestamp + 4B audioLen + 4B sampleRate + audio + JPEG
@@ -435,8 +442,15 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
             return
         _latest_frame_id = frame_id
 
-        # Bounded concurrency — if all slots full, skip this frame
+        # Fix #8: If GPU is busy, send last good output as heartbeat
+        # This maintains steady frame delivery rate instead of gaps
         if _sem.locked():
+            if _last_output is not None:
+                try:
+                    async with _send_lock:
+                        await websocket.send_bytes(frame_id_bytes + ts_bytes + _last_output)
+                except Exception:
+                    pass
             return
 
         async with _sem:
@@ -453,6 +467,7 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
             if out_bytes is None:
                 return
             last_timing = timing
+            _last_output = out_bytes  # Fix #8: Cache for heartbeat frames
 
             # Response: [4 bytes frameId] + [8 bytes timestamp] + JPEG
             # Response: [4 bytes frameId] + [8 bytes timestamp] + JPEG

@@ -17,6 +17,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 const useWebSocket = (serverUrl, sessionId, onFrame) => {
     const wsRef = useRef(null);
     const frameIdRef = useRef(0);
+    const lastPaintedIdRef = useRef(0);  // Fix #8: Track last painted frame for out-of-order drop
     const [isConnected, setIsConnected] = useState(false);
     const [error, setError] = useState(null);
 
@@ -62,6 +63,12 @@ const useWebSocket = (serverUrl, sessionId, onFrame) => {
 
                     // Header: 4 bytes frameId + 8 bytes float64 timestamp
                     const view = new DataView(buf);
+
+                    // Fix #8: Drop out-of-order frames (older than last painted)
+                    const frameId = view.getUint32(0, true);
+                    if (frameId < lastPaintedIdRef.current) return;
+                    lastPaintedIdRef.current = frameId;
+
                     const sentTs = view.getFloat64(4, true);
                     const latency = Date.now() - sentTs;
 

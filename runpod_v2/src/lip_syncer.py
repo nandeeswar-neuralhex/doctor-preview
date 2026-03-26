@@ -33,6 +33,8 @@ class LipSyncer:
     def __init__(self, providers: list[str]):
         self.session: Optional[ort.InferenceSession] = None
         self.input_names = []
+        # Fix #3: Cache previous output for temporal smoothing
+        self._prev_output: Optional[np.ndarray] = None
 
         if ort is None:
             print("LipSyncer disabled: onnxruntime not installed")
@@ -73,6 +75,11 @@ class LipSyncer:
             # Resample to 16kHz if needed (Wav2Lip was trained at 16kHz)
             if sample_rate != _WAV2LIP_SR and sample_rate > 0:
                 audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=_WAV2LIP_SR)
+
+            # Fix #3: Apply Hann window to smooth audio buffer edges
+            # Prevents mel discontinuities at chunk boundaries → smoother lip movement
+            if len(audio) > 64:
+                audio *= np.hanning(len(audio))
 
             # Mel spectrogram with Wav2Lip-compatible parameters at 16kHz
             # n_fft=800  → 50ms analysis window
@@ -131,6 +138,13 @@ class LipSyncer:
             pred = np.transpose(pred[0], (1, 2, 0))
             pred = (pred * 255).clip(0, 255).astype(np.uint8)
             pred = pred[:, :, ::-1]  # RGB → BGR
+
+            # Fix #3: Temporal smoothing — blend with previous output
+            # 60% current + 40% previous = smooth lip transitions, still responsive
+            if self._prev_output is not None and self._prev_output.shape == pred.shape:
+                pred = cv2.addWeighted(pred, 0.6, self._prev_output, 0.4, 0)
+            self._prev_output = pred.copy()
+
             return pred
         except Exception as e:
             print(f"LipSync inference failed: {e}")

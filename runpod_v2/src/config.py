@@ -24,7 +24,7 @@ EXECUTION_PROVIDER = os.getenv("EXECUTION_PROVIDER", "CUDAExecutionProvider")
 
 # Quality/Blending settings
 ENABLE_SEAMLESS_CLONE = os.getenv("ENABLE_SEAMLESS_CLONE", "true").lower() == "true"
-FACE_MASK_BLUR = int(os.getenv("FACE_MASK_BLUR", "25"))
+FACE_MASK_BLUR = int(os.getenv("FACE_MASK_BLUR", "35"))  # Wider feathering hides boundary jitter
 FACE_MASK_SCALE = float(os.getenv("FACE_MASK_SCALE", "1.1"))
 
 # Optional face enhancement
@@ -32,9 +32,10 @@ ENABLE_GFPGAN = os.getenv("ENABLE_GFPGAN", "true").lower() == "true"
 _GFPGAN_PATH_ENV = os.getenv("GFPGAN_MODEL_PATH", "")
 GFPGAN_MODEL_PATH = _GFPGAN_PATH_ENV or os.path.join(MODELS_DIR, "GFPGANv1.4.pth")
 
-# Smoothing / tracking
+# Smoothing / tracking — higher alpha = heavier smoothing (Google Meet level)
+# 0.65 = 65% old + 35% new → sub-pixel stability
 ENABLE_TEMPORAL_SMOOTHING = os.getenv("ENABLE_TEMPORAL_SMOOTHING", "true").lower() == "true"
-SMOOTHING_ALPHA = float(os.getenv("SMOOTHING_ALPHA", "0.4"))
+SMOOTHING_ALPHA = float(os.getenv("SMOOTHING_ALPHA", "0.65"))
 MAX_FACES = int(os.getenv("MAX_FACES", "1"))
 
 # WebRTC / Lip sync

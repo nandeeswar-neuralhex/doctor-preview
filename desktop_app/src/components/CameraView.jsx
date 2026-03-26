@@ -117,39 +117,46 @@ window.addEventListener('beforeunload', () => bc.close());
 
     const processedFrameFilter = `brightness(${Math.max(0.4, 1 + exposureAdjust / 100)})`;
 
+    // Fix #8: Jitter buffer — decoded frames queue for steady paint cadence
+    const frameBufferRef = useRef([]);  // ring buffer of decoded ImageBitmaps
+    const MAX_BUFFER = 3;
+    const paintLoopRef = useRef(null);
+    const lastPaintedIdRef = useRef(0);
+
     // Custom hooks for webcam and WebSocket
     const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true, audioDelayMs);
     // WebSocket hook – render into the dedicated <img> ref
     const handleWsFrame = useCallback((frameData, wsLatency, isBinary) => {
-        // Direct canvas painting: decode blob → drawImage → done.
-        // createImageBitmap() decodes off main thread → zero jank.
-        // No DOM swaps, no opacity transitions, no blob URLs = zero blink.
+        // Fix #8: Decode frame and push to jitter buffer.
+        // A separate rAF loop paints at steady cadence, absorbing network timing jitter.
         const canvas = wsCanvasRef.current;
         if (!canvas) return;
 
         if (isBinary && frameData instanceof Blob) {
-            // Binary mode: raw Blob from WebSocket → decode → paint
+            // Binary mode: raw Blob from WebSocket → decode → buffer
             createImageBitmap(frameData)
                 .then(bitmap => {
-                    const ctx = canvas.getContext('2d');
+                    const buf = frameBufferRef.current;
+                    buf.push({ bitmap, blob: frameData });
+                    // Drop oldest if buffer exceeds limit
+                    while (buf.length > MAX_BUFFER) {
+                        const old = buf.shift();
+                        old.bitmap.close();
+                    }
+                    // Update canvas size if needed
                     if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
                         canvas.width = bitmap.width;
                         canvas.height = bitmap.height;
-                        // Log response resolution once when it changes
                         console.log(`[WS-RECV] Server response: ${bitmap.width}×${bitmap.height}`);
                         setDiagnostics(prev => ({ ...prev, remoteMedia: `Receiving ${bitmap.width}×${bitmap.height}` }));
                     }
-                    ctx.drawImage(bitmap, 0, 0);
-                    bitmap.close();
-                    // Mirror to popout window via BroadcastChannel
-                    if (broadcastRef.current) broadcastRef.current.postMessage(frameData);
                 })
                 .catch((err) => {
-                    console.error('Canvas paint error:', err);
+                    console.error('Canvas decode error:', err);
                     setDiagnostics(prev => ({ ...prev, remoteMedia: `Paint error: ${err.message}` }));
                 });
         } else if (typeof frameData === 'string') {
-            // Legacy text mode: data: URI
+            // Legacy text mode: data: URI — paint directly (no jitter buffer)
             const img = new Image();
             img.onload = () => {
                 const ctx = canvas.getContext('2d');
@@ -165,7 +172,8 @@ window.addEventListener('beforeunload', () => bc.close());
         wsFrameCountRef.current++;
         const now = performance.now();
         if (now - wsLastFpsTimeRef.current >= 1000) {
-            setFps(wsFrameCountRef.current);
+            // Fix #8: Smooth FPS counter with EMA
+            setFps(prev => Math.round(0.7 * (prev || 0) + 0.3 * wsFrameCountRef.current));
             wsFrameCountRef.current = 0;
             wsLastFpsTimeRef.current = now;
         }
@@ -213,6 +221,43 @@ window.addEventListener('beforeunload', () => bc.close());
             processedVideoRef.current.srcObject = remoteStreamRef.current;
         }
     }, [isStreaming, isConnected]);
+
+    // Fix #8: requestAnimationFrame paint loop — drains jitter buffer at steady cadence
+    // This absorbs network timing jitter: frames arrive unevenly but paint smoothly
+    useEffect(() => {
+        if (!isStreaming || !isWsConnected) {
+            // Clean up buffer when not streaming
+            frameBufferRef.current.forEach(f => f.bitmap.close());
+            frameBufferRef.current = [];
+            return;
+        }
+        const canvas = wsCanvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        let active = true;
+
+        const paintFrame = () => {
+            if (!active) return;
+            const buf = frameBufferRef.current;
+            if (buf.length > 0) {
+                const entry = buf.shift();
+                ctx.drawImage(entry.bitmap, 0, 0);
+                entry.bitmap.close();
+                // Mirror to popout window via BroadcastChannel
+                if (broadcastRef.current && entry.blob) {
+                    broadcastRef.current.postMessage(entry.blob);
+                }
+            }
+            paintLoopRef.current = requestAnimationFrame(paintFrame);
+        };
+        paintLoopRef.current = requestAnimationFrame(paintFrame);
+
+        return () => {
+            active = false;
+            if (paintLoopRef.current) cancelAnimationFrame(paintLoopRef.current);
+            // Don't close bitmaps here — they may still be needed if WS reconnects
+        };
+    }, [isStreaming, isWsConnected]);
 
     // Fallback logic: If WebRTC fails or disconnects, try WebSocket
     useEffect(() => {
