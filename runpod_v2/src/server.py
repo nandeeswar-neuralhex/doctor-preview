@@ -300,6 +300,8 @@ def _process_frame_binary(jpeg_bytes: bytes, audio_pcm: bytes, audio_sr: int,
     # to prevent double-overwrite conflict between mouth mask and Wav2Lip
     will_lipsync = (lip_syncer_ref and lip_syncer_ref.is_ready()
                     and audio_pcm and len(audio_pcm) > 0)
+    # Risk#3 fix: save original before in-place swap (lip sync needs clean mouth)
+    original_frame = frame.copy() if will_lipsync else None
     source_faces = []
     if swapper_ref and swapper_ref.has_target(session_id):
         result, source_faces = swapper_ref.swap_face_with_faces(
@@ -326,8 +328,9 @@ def _process_frame_binary(jpeg_bytes: bytes, audio_pcm: bytes, audio_sr: int,
                 x2 = min(result.shape[1], x2)
                 y2 = min(result.shape[0], y2)
                 if x2 > x1 and y2 > y1:
-                    face_crop = result[y1:y2, x1:x2]
-                    synced = lip_syncer_ref.infer(face_crop, mel)
+                    # Risk#3 fix: use original (not swapped) for clean lip sync input
+                    face_crop = original_frame[y1:y2, x1:x2]
+                    synced = lip_syncer_ref.infer(face_crop, mel, session_id)
                     if synced is not None:
                         result = lip_syncer_ref.apply_mouth_only(
                             result, (x1, y1, x2, y2), synced
@@ -421,10 +424,11 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
     _latest_frame_id = 0         # Track latest to drop stale frames
     _send_lock = asyncio.Lock()  # Prevent concurrent writes to WebSocket
     _last_output = None          # Fix #8: Cache last output for heartbeat frames
+    _last_processed_fid_bytes = struct.pack('<I', 0)  # Risk#1: last processed frame ID
 
     async def process_and_respond_binary(raw_data: bytes):
         """Process a binary frame (with optional audio) and send result back."""
-        nonlocal last_timing, _latest_frame_id, _last_output
+        nonlocal last_timing, _latest_frame_id, _last_output, _last_processed_fid_bytes
         if len(raw_data) < 21:  # 20-byte header + at least 1 byte JPEG
             return
         # Header: 4B frameId + 8B timestamp + 4B audioLen + 4B sampleRate + audio + JPEG
@@ -443,12 +447,13 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
         _latest_frame_id = frame_id
 
         # Fix #8: If GPU is busy, send last good output as heartbeat
-        # This maintains steady frame delivery rate instead of gaps
+        # Risk#1 fix: use LAST PROCESSED frame ID (not incoming) so the client's
+        # out-of-order check won't reject the real processed frame when it finishes
         if _sem.locked():
             if _last_output is not None:
                 try:
                     async with _send_lock:
-                        await websocket.send_bytes(frame_id_bytes + ts_bytes + _last_output)
+                        await websocket.send_bytes(_last_processed_fid_bytes + ts_bytes + _last_output)
                 except Exception:
                     pass
             return
@@ -468,6 +473,7 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
                 return
             last_timing = timing
             _last_output = out_bytes  # Fix #8: Cache for heartbeat frames
+            _last_processed_fid_bytes = frame_id_bytes  # Risk#1: track for heartbeat
 
             # Response: [4 bytes frameId] + [8 bytes timestamp] + JPEG
             # Response: [4 bytes frameId] + [8 bytes timestamp] + JPEG
@@ -553,6 +559,8 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
 async def delete_session(session_id: str):
     if swapper:
         swapper.cleanup_session(session_id)
+    if lip_syncer:
+        lip_syncer.cleanup_session(session_id)
     if webrtc_manager:
         await webrtc_manager.cleanup_session(session_id)
     print(f"Session {session_id} cleaned up")

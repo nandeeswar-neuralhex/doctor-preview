@@ -265,6 +265,7 @@ class VideoTransformTrack(MediaStreamTrack):
 
             # Lip sync — use original frame for Wav2Lip input so it gets
             # clean teeth/tongue instead of swapped artifacts
+            lipsync_applied = False
             if will_lipsync and len(faces) > 0:
                 audio_pcm, sample_rate = self.audio_buffer.get_recent_audio()
                 mel = self.lip_syncer.audio_to_mel(audio_pcm, sample_rate)
@@ -275,17 +276,18 @@ class VideoTransformTrack(MediaStreamTrack):
                     x2, y2 = min(result.shape[1], x2), min(result.shape[0], y2)
                     if x2 > x1 and y2 > y1:
                         face_crop = original_img[y1:y2, x1:x2]
-                        synced = self.lip_syncer.infer(face_crop, mel)
+                        synced = self.lip_syncer.infer(face_crop, mel, self.session_id)
                         if synced is not None:
                             result = self.lip_syncer.apply_mouth_only(
                                 result, (x1, y1, x2, y2), synced
                             )
+                            lipsync_applied = True
 
-            # Fix #7: Cross-fade with previous swap result to eliminate
-            # the "jump" when a new swap result replaces repeated frames.
-            # 70% new + 30% old = smooth transition over 1-2 frames.
-            if prev_result is not None and prev_result.shape == result.shape:
-                result = cv2.addWeighted(result, 0.7, prev_result, 0.3, 0)
+            # Fix #7 + Risk#4: Cross-fade only when lip sync NOT applied
+            # Wav2Lip temporal blend handles smoothness when lip sync is active
+            # Risk#7: reduced from 70/30 to 85/15 to minimize ghost trail on fast movement
+            if not lipsync_applied and prev_result is not None and prev_result.shape == result.shape:
+                result = cv2.addWeighted(result, 0.85, prev_result, 0.15, 0)
             prev_result = result.copy()
 
             with self._result_lock:
@@ -459,6 +461,9 @@ class WebRTCManager:
                 pass
             del self.pcs[session_id]
         self.session_settings.pop(session_id, None)
+        # Risk#2 fix: clean up per-session lip sync state
+        if self.lip_syncer:
+            self.lip_syncer.cleanup_session(session_id)
 
     def set_session_settings(self, session_id: str, settings: dict):
         self.session_settings[session_id] = {

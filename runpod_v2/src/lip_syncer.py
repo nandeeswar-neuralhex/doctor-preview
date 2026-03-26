@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import numpy as np
 import cv2
-from typing import Optional
+from typing import Dict, Optional
 
 try:
     import onnxruntime as ort
@@ -33,8 +33,8 @@ class LipSyncer:
     def __init__(self, providers: list[str]):
         self.session: Optional[ort.InferenceSession] = None
         self.input_names = []
-        # Fix #3: Cache previous output for temporal smoothing
-        self._prev_output: Optional[np.ndarray] = None
+        # Fix #3: Cache previous output for temporal smoothing (per session)
+        self._prev_outputs: Dict[str, np.ndarray] = {}
 
         if ort is None:
             print("LipSyncer disabled: onnxruntime not installed")
@@ -98,7 +98,7 @@ class LipSyncer:
             print(f"Mel extraction failed: {e}")
             return None
 
-    def infer(self, face: np.ndarray, mel: np.ndarray) -> Optional[np.ndarray]:
+    def infer(self, face: np.ndarray, mel: np.ndarray, session_id: str = "") -> Optional[np.ndarray]:
         """
         Run Wav2Lip inference on a face crop + mel spectrogram.
         Uses the last 16 mel frames (~200ms) as the model expects.
@@ -139,11 +139,13 @@ class LipSyncer:
             pred = (pred * 255).clip(0, 255).astype(np.uint8)
             pred = pred[:, :, ::-1]  # RGB → BGR
 
-            # Fix #3: Temporal smoothing — blend with previous output
+            # Fix #3: Temporal smoothing — blend with previous output (per session)
             # 60% current + 40% previous = smooth lip transitions, still responsive
-            if self._prev_output is not None and self._prev_output.shape == pred.shape:
-                pred = cv2.addWeighted(pred, 0.6, self._prev_output, 0.4, 0)
-            self._prev_output = pred.copy()
+            prev = self._prev_outputs.get(session_id) if session_id else None
+            if prev is not None and prev.shape == pred.shape:
+                pred = cv2.addWeighted(pred, 0.6, prev, 0.4, 0)
+            if session_id:
+                self._prev_outputs[session_id] = pred.copy()
 
             return pred
         except Exception as e:
@@ -191,14 +193,16 @@ class LipSyncer:
             mask[y_idx, :] = alpha
 
         # Feather horizontal edges to avoid hard vertical seams
-        edge = max(3, int(face_w * 0.08))
+        # Risk#5 fix: wider feather (0.15 vs 0.08) absorbs bbox pixel shifts
+        edge = max(5, int(face_w * 0.15))
         for x_idx in range(edge):
             factor = x_idx / edge
             mask[:, x_idx] *= factor
             mask[:, face_w - 1 - x_idx] *= factor
 
         # Gaussian blur for smooth transitions
-        mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=3, sigmaY=3)
+        # Risk#5 fix: larger sigma (7 vs 3) makes 1-2px boundary shifts invisible
+        mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=7, sigmaY=7)
 
         # Alpha-blend mouth region
         face_region = result[y1:y2, x1:x2].astype(np.float32)
@@ -207,3 +211,7 @@ class LipSyncer:
         blended = face_region * (1.0 - mask_3d) + lip_region * mask_3d
         result[y1:y2, x1:x2] = blended.astype(np.uint8)
         return result
+
+    def cleanup_session(self, session_id: str):
+        """Clean up per-session lip sync state."""
+        self._prev_outputs.pop(session_id, None)

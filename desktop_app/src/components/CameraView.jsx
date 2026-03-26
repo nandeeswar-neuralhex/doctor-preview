@@ -236,10 +236,16 @@ window.addEventListener('beforeunload', () => bc.close());
         const ctx = canvas.getContext('2d');
         let active = true;
 
-        const paintFrame = () => {
+        let lastDrainTime = 0;
+        const MIN_DRAIN_INTERVAL = 40; // ms — ~25fps max drain rate
+
+        const paintFrame = (timestamp) => {
             if (!active) return;
             const buf = frameBufferRef.current;
-            if (buf.length > 0) {
+            // Risk#6 fix: rate-limit drain so burst arrivals paint evenly
+            // Drain immediately if buffer full (prevent drops), otherwise pace to ~25fps
+            if (buf.length > 0 && (timestamp - lastDrainTime >= MIN_DRAIN_INTERVAL || buf.length >= MAX_BUFFER)) {
+                lastDrainTime = timestamp;
                 const entry = buf.shift();
                 ctx.drawImage(entry.bitmap, 0, 0);
                 entry.bitmap.close();
