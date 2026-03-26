@@ -489,6 +489,7 @@ class FaceSwapper:
             return frame, []
 
         result = frame
+        swap_succeeded = False
         n_swap = max(1, MAX_FACES)
 
         _t2 = _t.time()
@@ -497,7 +498,10 @@ class FaceSwapper:
             matched_target = self._match_best_target(session_id, best)
             _t3 = _t.time()
             if matched_target:
-                result = self._swap_single_face(result, best, matched_target["face"], session_id)
+                swapped = self._swap_single_face(result, best, matched_target["face"], session_id)
+                if swapped is not result:
+                    result = swapped
+                    swap_succeeded = True
             _t4 = _t.time()
         else:
             source_faces.sort(key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]), reverse=True)
@@ -505,7 +509,10 @@ class FaceSwapper:
             for source_face in source_faces[:n_swap]:
                 matched_target = self._match_best_target(session_id, source_face)
                 if matched_target:
-                    result = self._swap_single_face(result, source_face, matched_target["face"], session_id)
+                    swapped = self._swap_single_face(result, source_face, matched_target["face"], session_id)
+                    if swapped is not result:
+                        result = swapped
+                        swap_succeeded = True
             _t4 = _t.time()
 
         # Print per-step breakdown every 60 frames (every ~3 seconds at 20fps)
@@ -515,8 +522,15 @@ class FaceSwapper:
         if self._dbg_count[session_id] % 60 == 0:
             print(f"  [PROFILE] detect={(_t1-_t0)*1000:.1f}ms  match={(_t3-_t2)*1000:.1f}ms  swap={(_t4-_t3)*1000:.1f}ms  total={(_t4-_t0)*1000:.1f}ms")
 
-        # Cache last good result to avoid flashing on face-lost frames
-        self._last_result[session_id] = result
+        # Only cache when swap actually produced a new frame — prevents
+        # poisoning the cache with a raw unswapped frame on transient
+        # ONNX/GPU failures (which caused the rare 1-frame flicker).
+        if swap_succeeded:
+            self._last_result[session_id] = result
+        elif session_id in self._last_result:
+            # Swap failed despite face detection — use last known good frame
+            result = self._last_result[session_id]
+
         return result, source_faces
 
     def _swap_single_face(
