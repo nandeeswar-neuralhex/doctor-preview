@@ -595,15 +595,14 @@ class FaceSwapper:
             alpha = (blurred_mask.astype(np.float32) / 255.0)[..., None]
             blended_roi = (roi_frame * (1 - alpha) + roi_warped * alpha).astype(np.uint8)
 
-            # ── Pixel-Adaptive Mouth Interior Preservation ──
-            # INSwapper hallucinates blue/black pixels inside open mouths
-            # because the target photo is typically closed-mouth. Instead of
-            # a fixed oval (visible when mouth is closed), we detect the
-            # hallucination by comparing pixel brightness: if the swapped
-            # mouth region is abnormally dark vs the original webcam, we
-            # restore the original pixels with a strength proportional to
-            # the darkness. When the mouth is closed, both look similar,
-            # so the mask strength drops to ~0 and no oval appears.
+            # ── Mouth Interior Preservation (Color-Difference Adaptive) ──
+            # INSwapper hallucinates blue/black/grey pixels inside open mouths
+            # because the target photo typically has a closed mouth. We detect
+            # this by measuring the per-pixel color DIFFERENCE (MSE) between
+            # the swapped and original mouth region.
+            #   - Closed mouth: swapped ≈ original (both show skin/lips) → low MSE → skip
+            #   - Open mouth hallucination: swapped = blue/black, original = teeth → high MSE → restore
+            # The original webcam teeth/tongue are shown through — user confirmed this is OK.
             if hasattr(source_face, 'kps') and source_face.kps is not None:
                 try:
                     kps = source_face.kps
@@ -613,18 +612,17 @@ class FaceSwapper:
                     mouth_w = np.linalg.norm(mouth_right - mouth_left)
                     eye_dist = np.linalg.norm(kps[1] - kps[0])
 
-                    # Shift center slightly below mouth corner line
+                    # Center the mask slightly below mouth corners (covers inner mouth)
                     cx = mouth_center[0]
-                    cy = mouth_center[1] + eye_dist * 0.04
+                    cy = mouth_center[1] + eye_dist * 0.05
 
                     # Convert to ROI coordinates
                     cx_roi = int(cx) - roi_x1
                     cy_roi = int(cy) - roi_y1
 
-                    # ── Step 1: Sample mouth region brightness ──
-                    # Use a generous sample area around mouth center
-                    sample_rx = max(4, int(mouth_w * 0.25))
-                    sample_ry = max(4, int(eye_dist * 0.12))
+                    # ── Step 1: Color-difference detection ──
+                    sample_rx = max(6, int(mouth_w * 0.32))
+                    sample_ry = max(6, int(eye_dist * 0.16))
                     sy1 = max(0, cy_roi - sample_ry)
                     sy2 = min(roi_h, cy_roi + sample_ry)
                     sx1 = max(0, cx_roi - sample_rx)
@@ -632,61 +630,51 @@ class FaceSwapper:
 
                     mask_strength = 0.0
                     if sy2 > sy1 + 2 and sx2 > sx1 + 2 and 0 < cx_roi < roi_w and 0 < cy_roi < roi_h:
-                        swap_patch = blended_roi[sy1:sy2, sx1:sx2]
-                        orig_patch = roi_frame[sy1:sy2, sx1:sx2]
+                        swap_patch = blended_roi[sy1:sy2, sx1:sx2].astype(np.float32)
+                        orig_patch = roi_frame[sy1:sy2, sx1:sx2].astype(np.float32)
 
-                        # Mean brightness comparison (grayscale)
-                        swap_gray = np.mean(swap_patch.astype(np.float32))
-                        orig_gray = np.mean(orig_patch.astype(np.float32))
+                        # Per-pixel color MSE (across all 3 channels)
+                        mse = np.mean((swap_patch - orig_patch) ** 2)
+                        # Normalize: MSE of 500+ = very different, <100 = similar
+                        # Map to 0..1 range:  100→0, 400→0.6, 800+→1.0
+                        mse_conf = np.clip((mse - 100.0) / 700.0, 0.0, 1.0)
 
-                        # Darkness ratio: how much darker is swap vs original?
-                        # < 0.5 means swap is less than half the brightness → hallucination
-                        # ~1.0 means both look similar → no problem
-                        darkness_ratio = swap_gray / max(orig_gray, 1.0)
+                        # Also check std of swapped patch — hallucinations are
+                        # unnaturally UNIFORM (flat color), real mouth has texture
+                        swap_std = np.std(swap_patch)
+                        orig_std = np.std(orig_patch)
+                        # If swapped is much more uniform than original → hallucination
+                        uniformity_ratio = swap_std / max(orig_std, 1.0)
+                        uniform_conf = np.clip((0.6 - uniformity_ratio) / 0.4, 0.0, 0.6)
 
-                        # Blue tint check: INSwapper often produces blue/purple artifacts
-                        swap_b = np.mean(swap_patch[:, :, 0].astype(np.float32))  # BGR
-                        swap_r = np.mean(swap_patch[:, :, 2].astype(np.float32))
-                        blue_tint = max(0.0, (swap_b - swap_r) / max(swap_gray, 1.0))
+                        mask_strength = min(1.0, mse_conf + uniform_conf)
 
-                        # Combine: strong correction when very dark OR blue-tinted
-                        # darkness_ratio < 0.55 → clearly hallucinating (strength → 1.0)
-                        # darkness_ratio 0.55-0.80 → partial correction
-                        # darkness_ratio > 0.80 → mouth looks fine (strength → 0)
-                        dark_conf = np.clip((0.80 - darkness_ratio) / 0.25, 0.0, 1.0)
-                        blue_conf = np.clip(blue_tint * 3.0, 0.0, 0.5)
-                        mask_strength = min(1.0, dark_conf + blue_conf)
-
-                    # ── Step 2: Temporal smoothing of mask strength ──
-                    # Prevents flickering by smoothing rapid changes
+                    # ── Step 2: Temporal smoothing ──
                     smooth_key = f"{session_id}_mouth_str"
                     if smooth_key in self._smooth_bbox:
                         prev_str = self._smooth_bbox[smooth_key]
-                        # Quick rise (react to mouth opening), slow decay (avoid flicker)
-                        alpha_up = 0.4   # respond quickly when mouth opens
-                        alpha_down = 0.85  # decay slowly to prevent flicker
+                        # Fast rise to catch mouth opening, slow decay to prevent flicker
                         if mask_strength > prev_str:
-                            mask_strength = alpha_up * prev_str + (1.0 - alpha_up) * mask_strength
+                            mask_strength = 0.3 * prev_str + 0.7 * mask_strength
                         else:
-                            mask_strength = alpha_down * prev_str + (1.0 - alpha_down) * mask_strength
+                            mask_strength = 0.8 * prev_str + 0.2 * mask_strength
                     self._smooth_bbox[smooth_key] = mask_strength
 
-                    # ── Step 3: Apply adaptive mask only when needed ──
-                    if mask_strength > 0.03:
-                        # Scale ellipse with strength — smaller when barely triggered
-                        scale_factor = 0.5 + 0.5 * mask_strength
-                        ell_rx = int(mouth_w * 0.30 * scale_factor)
-                        ell_ry = int(eye_dist * 0.15 * scale_factor)
+                    # ── Step 3: Apply mouth mask ──
+                    if mask_strength > 0.05:
+                        # Generous ellipse covering the inner mouth area
+                        scale_factor = 0.6 + 0.4 * mask_strength
+                        ell_rx = int(mouth_w * 0.38 * scale_factor)
+                        ell_ry = int(eye_dist * 0.20 * scale_factor)
 
                         if (ell_rx > 2 and ell_ry > 2 and
                                 0 < cx_roi < roi_w and 0 < cy_roi < roi_h):
                             mouth_excl = np.zeros((roi_h, roi_w), dtype=np.float32)
                             cv2.ellipse(mouth_excl, (cx_roi, cy_roi),
                                         (ell_rx, ell_ry), 0, 0, 360, 1.0, -1)
-                            # Much larger blur for invisible transition (no visible oval)
-                            blur_sz = max(31, int(max(ell_rx, ell_ry) * 1.8) | 1)
+                            # Very large blur → invisible edge transition
+                            blur_sz = max(41, int(max(ell_rx, ell_ry) * 2.2) | 1)
                             mouth_excl = cv2.GaussianBlur(mouth_excl, (blur_sz, blur_sz), 0)
-                            # Scale mask by adaptive strength
                             mouth_excl *= mask_strength
                             m3 = mouth_excl[..., None]
                             blended_roi = (blended_roi.astype(np.float32) * (1.0 - m3) +
