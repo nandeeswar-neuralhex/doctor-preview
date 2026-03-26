@@ -51,11 +51,21 @@ class PigmentationAnalyzer(BaseAnalyzer):
         if mask is not None:
             melanin_map = melanin_map * (mask.astype(np.float64) / 255.0)
 
-        # Normalize
-        if melanin_map.max() > 0:
-            melanin_norm = melanin_map / melanin_map.max()
+        # Normalize as deviation from person's baseline (not absolute melanin)
+        # This prevents dark skin tones from showing as entirely "problematic"
+        if mask is not None:
+            skin_pixels = melanin_map[mask > 0]
+            if len(skin_pixels) > 0:
+                baseline = float(np.median(skin_pixels))
+            else:
+                baseline = float(np.median(melanin_map))
         else:
-            melanin_norm = melanin_map
+            baseline = float(np.median(melanin_map))
+        deviation_map = np.abs(melanin_map - baseline)
+        if deviation_map.max() > 0:
+            melanin_norm = deviation_map / deviation_map.max()
+        else:
+            melanin_norm = np.zeros_like(melanin_map)
 
         # Detect hyperpigmentation spots
         spots_mask = self._detect_spots(L, mask)
@@ -146,7 +156,9 @@ class PigmentationAnalyzer(BaseAnalyzer):
             L_mean = float(np.mean(L))
             B_mean = float(np.mean(B))
 
-        ita = np.degrees(np.arctan2(L_mean - 50, B_mean - 128))
+        # OpenCV LAB outputs L in [0,255]; ITA formula requires CIELAB L* in [0,100]
+        L_scaled = L_mean * 100.0 / 255.0
+        ita = np.degrees(np.arctan2(L_scaled - 50, B_mean - 128))
         return ita
 
     def _ita_to_fitzpatrick(self, ita: float) -> int:

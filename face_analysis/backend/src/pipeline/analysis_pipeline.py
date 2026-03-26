@@ -151,10 +151,10 @@ class AnalysisPipeline:
             except Exception as e:
                 analyzer_results[name] = {"score": 50, "error": str(e)}
 
-        # Step 4: Compute per-zone scores
+        # Step 4: Compute per-zone scores from existing heatmaps (no re-inference)
         for zone_name, zone_mask in zone_masks.items():
-            zone_score = self._compute_zone_score(
-                image, landmarks, zone_mask, zone_name
+            zone_score = self._compute_zone_score_fast(
+                analyzer_results, zone_mask
             )
             results["zone_scores"][zone_name] = zone_score
 
@@ -291,11 +291,51 @@ class AnalysisPipeline:
 
     # ── Private Helpers ─────────────────────────────────────────────────────
 
+    def _compute_zone_score_fast(
+        self, analyzer_results: Dict, zone_mask: np.ndarray
+    ) -> Dict[str, float]:
+        """
+        Compute zone scores from existing analyzer heatmaps — NO re-inference.
+        This is ~100x faster than _compute_zone_score since it avoids re-running models.
+        """
+        scores = {}
+        mask_area = float(np.sum(zone_mask > 0))
+        if mask_area == 0:
+            mask_area = 1.0
+
+        for key in ["wrinkle", "pore", "pigmentation", "redness", "texture"]:
+            result = analyzer_results.get(key, {})
+            heatmap = result.get("heatmap")
+
+            if heatmap is not None:
+                # Resize heatmap to match mask if needed
+                if heatmap.shape[:2] != zone_mask.shape[:2]:
+                    heatmap = cv2.resize(heatmap, (zone_mask.shape[1], zone_mask.shape[0]))
+
+                # Extract mean intensity in the zone (higher = worse)
+                zone_pixels = heatmap[zone_mask > 0]
+                if len(zone_pixels) > 0:
+                    severity = float(np.mean(zone_pixels))
+                    # Convert severity (0-1) to score (100-0)
+                    scores[key] = round(max(0, min(100, 100 - severity * 100)), 1)
+                else:
+                    scores[key] = result.get("score", 50)
+            else:
+                # Fallback: use the global score for this analyzer
+                scores[key] = result.get("score", 50)
+
+        weights = {"wrinkle": 0.25, "pore": 0.20, "pigmentation": 0.20,
+                    "redness": 0.15, "texture": 0.20}
+        scores["overall"] = round(
+            sum(scores.get(k, 50) * w for k, w in weights.items()), 1
+        )
+        return scores
+
     def _compute_zone_score(
         self, image: np.ndarray, landmarks: np.ndarray,
         zone_mask: np.ndarray, zone_name: str
     ) -> Dict[str, float]:
-        """Run key analyzers for a specific zone and return scores."""
+        """Run key analyzers for a specific zone and return scores (SLOW — kept for reference)."""
         scores = {}
         for key in ["wrinkle", "pore", "pigmentation", "redness", "texture"]:
             try:

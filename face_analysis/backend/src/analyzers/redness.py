@@ -66,10 +66,13 @@ class RednessAnalyzer(BaseAnalyzer):
         redness_zones = self._detect_zones(redness_map, mask)
 
         # Score: less redness = higher score
-        mean_redness = float(np.mean(redness_map[redness_map > 0.1]))
-        if np.isnan(mean_redness):
-            mean_redness = 0.0
-        score = max(0, min(100, 100 - mean_redness * 150))
+        # Factor in both intensity AND coverage for accurate scoring
+        red_pixels = redness_map[redness_map > 0.1]
+        skin_pixels = np.sum(mask > 0) if mask is not None else h * w
+        red_intensity = float(np.mean(red_pixels)) if len(red_pixels) > 0 else 0.0
+        red_coverage = len(red_pixels) / max(skin_pixels, 1)
+        mean_redness = red_intensity * (red_coverage ** 0.5)  # sqrt to soften coverage impact
+        score = max(0, min(100, 100 - mean_redness * 120))
 
         detections = self._classify(mean_redness, redness_zones, zone)
 

@@ -23,17 +23,19 @@ const MODES = [
     { id: 'grid',         label: 'Measurements', icon: '📐', color: '#6366f1' },
 ];
 
-/* approximate zone centres (% of face image) */
+/* approximate zone centres (% of face image) — aligned with backend ZONE_LANDMARKS */
 const ZONE_POS = {
-    forehead:    { x: 50, y: 14 },
-    left_eye:    { x: 30, y: 32 },
-    right_eye:   { x: 70, y: 32 },
-    nose:        { x: 50, y: 44 },
-    left_cheek:  { x: 20, y: 55 },
-    right_cheek: { x: 80, y: 55 },
-    mouth:       { x: 50, y: 68 },
-    chin:        { x: 50, y: 80 },
-    jawline:     { x: 50, y: 90 },
+    forehead:        { x: 50, y: 14 },
+    left_temple:     { x: 22, y: 18 },
+    right_temple:    { x: 78, y: 18 },
+    under_eye_left:  { x: 33, y: 34 },
+    under_eye_right: { x: 67, y: 34 },
+    nose:            { x: 50, y: 44 },
+    left_cheek:      { x: 20, y: 55 },
+    right_cheek:     { x: 80, y: 55 },
+    jawline_left:    { x: 25, y: 72 },
+    jawline_right:   { x: 75, y: 72 },
+    chin:            { x: 50, y: 82 },
 };
 
 /* Face mesh contours (MediaPipe landmark indices) */

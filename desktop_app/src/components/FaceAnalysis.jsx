@@ -1,12 +1,14 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect, useRef, lazy, Suspense } from 'react';
 import GuidedCapture from './GuidedCapture';
 import PhotoCapture from './PhotoCapture';
 import AnalysisResults from './AnalysisResults';
 import ReportView from './ReportView';
 import BeforeAfter from './BeforeAfter';
 import AnnotationEditor from './AnnotationEditor';
-import FaceModel3D from './FaceModel3D';
-import SurgerySimulator from './SurgerySimulator';
+
+// Lazy-load heavy 3D components (Three.js) to avoid crashing the initial render
+const FaceModel3D = lazy(() => import('./FaceModel3D'));
+const SurgerySimulator = lazy(() => import('./SurgerySimulator'));
 
 /**
  * FaceAnalysis — Main orchestrator component for the skin analysis module.
@@ -32,8 +34,22 @@ export default function FaceAnalysis({ serverUrl, onBack }) {
     const [error, setError] = useState(null);
     const [previousSessions, setPreviousSessions] = useState([]);
     const [patientInfo, setPatientInfo] = useState({ name: '', age: '', skin_type: '' });
+    const [analysisElapsed, setAnalysisElapsed] = useState(0);
+    const abortRef = useRef(null);
+    const timerRef = useRef(null);
 
     const analysisUrl = import.meta.env.VITE_ANALYSIS_URL || serverUrl.replace(/:\d+/, ':8766');
+
+    // ── Elapsed Timer ──────────────────────────────────────────────────────
+    useEffect(() => {
+        if (isAnalyzing) {
+            setAnalysisElapsed(0);
+            timerRef.current = setInterval(() => setAnalysisElapsed(s => s + 1), 1000);
+        } else {
+            if (timerRef.current) clearInterval(timerRef.current);
+        }
+        return () => { if (timerRef.current) clearInterval(timerRef.current); };
+    }, [isAnalyzing]);
 
     // ── Guided Capture Complete ────────────────────────────────────────────
 
@@ -44,9 +60,20 @@ export default function FaceAnalysis({ serverUrl, onBack }) {
 
     // ── API Calls ──────────────────────────────────────────────────────────
 
+    const cancelAnalysis = useCallback(() => {
+        if (abortRef.current) abortRef.current.abort();
+        setIsAnalyzing(false);
+        setError('Analysis cancelled');
+    }, []);
+
     const analyzePhotos = useCallback(async (photos) => {
         setIsAnalyzing(true);
         setError(null);
+
+        // Abort controller with 5-minute timeout
+        const controller = new AbortController();
+        abortRef.current = controller;
+        const timeoutId = setTimeout(() => controller.abort(), 5 * 60 * 1000);
 
         try {
             const formData = new FormData();
@@ -60,6 +87,7 @@ export default function FaceAnalysis({ serverUrl, onBack }) {
                 const res = await fetch(`${analysisUrl}/analyze`, {
                     method: 'POST',
                     body: formData,
+                    signal: controller.signal,
                 });
 
                 if (!res.ok) throw new Error(`Analysis failed: ${res.status}`);
@@ -79,6 +107,7 @@ export default function FaceAnalysis({ serverUrl, onBack }) {
                 const res = await fetch(`${analysisUrl}/analyze/multi`, {
                     method: 'POST',
                     body: formData,
+                    signal: controller.signal,
                 });
 
                 if (!res.ok) throw new Error(`Multi-analysis failed: ${res.status}`);
@@ -91,8 +120,14 @@ export default function FaceAnalysis({ serverUrl, onBack }) {
             // Refresh session list
             fetchSessions();
         } catch (err) {
-            setError(err.message);
+            if (err.name === 'AbortError') {
+                setError('Analysis timed out or was cancelled. Please try again.');
+            } else {
+                setError(err.message);
+            }
         } finally {
+            clearTimeout(timeoutId);
+            abortRef.current = null;
             setIsAnalyzing(false);
         }
     }, [analysisUrl, patientInfo]);
@@ -208,10 +243,22 @@ export default function FaceAnalysis({ serverUrl, onBack }) {
             {/* Loading Overlay */}
             {isAnalyzing && (
                 <div className="absolute inset-0 bg-black/70 flex items-center justify-center z-50">
-                    <div className="bg-gray-900 rounded-2xl p-8 text-center shadow-2xl">
+                    <div className="bg-gray-900 rounded-2xl p-8 text-center shadow-2xl min-w-[320px]">
                         <div className="animate-spin w-12 h-12 border-4 border-indigo-500 border-t-transparent rounded-full mx-auto mb-4" />
                         <p className="text-lg font-medium">Analyzing skin...</p>
-                        <p className="text-gray-400 text-sm mt-1">AI pipeline processing (~2 seconds)</p>
+                        <p className="text-gray-400 text-sm mt-1">Running 8 AI models across all photos</p>
+                        <p className="text-indigo-400 text-sm mt-2 font-mono">
+                            {Math.floor(analysisElapsed / 60)}:{String(analysisElapsed % 60).padStart(2, '0')} elapsed
+                        </p>
+                        {analysisElapsed > 10 && (
+                            <p className="text-yellow-400/70 text-xs mt-1">Multi-angle analysis can take 1-3 minutes</p>
+                        )}
+                        <button
+                            onClick={cancelAnalysis}
+                            className="mt-4 px-4 py-2 bg-red-600/80 hover:bg-red-600 text-white text-sm rounded-lg transition-colors"
+                        >
+                            Cancel
+                        </button>
                     </div>
                 </div>
             )}
@@ -237,10 +284,14 @@ export default function FaceAnalysis({ serverUrl, onBack }) {
                     <AnalysisResults result={analysisResult} />
                 )}
                 {activeTab === TABS.THREE_D && analysisResult && (
-                    <FaceModel3D result={analysisResult} patientInfo={patientInfo} />
+                    <Suspense fallback={<div className="flex items-center justify-center h-full bg-gray-950 text-gray-400"><div className="text-center"><div className="animate-spin w-10 h-10 border-4 border-indigo-500 border-t-transparent rounded-full mx-auto mb-3" /><p>Loading 3D Model...</p></div></div>}>
+                        <FaceModel3D result={analysisResult} patientInfo={patientInfo} />
+                    </Suspense>
                 )}
                 {activeTab === TABS.SIMULATE && analysisResult && (
-                    <SurgerySimulator result={analysisResult} />
+                    <Suspense fallback={<div className="flex items-center justify-center h-full bg-gray-950 text-gray-400"><div className="text-center"><div className="animate-spin w-10 h-10 border-4 border-purple-500 border-t-transparent rounded-full mx-auto mb-3" /><p>Loading Surgery Simulator...</p></div></div>}>
+                        <SurgerySimulator result={analysisResult} />
+                    </Suspense>
                 )}
                 {activeTab === TABS.ANNOTATE && analysisResult && (
                     <AnnotationEditor

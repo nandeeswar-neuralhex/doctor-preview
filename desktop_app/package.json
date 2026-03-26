@@ -39,8 +39,8 @@
     },
     "dependencies": {
         "@clerk/clerk-react": "^5.61.3",
-        "@react-three/drei": "^10.7.7",
-        "@react-three/fiber": "^9.5.0",
+        "@react-three/drei": "^9.122.0",
+        "@react-three/fiber": "^8.18.0",
         "delaunator": "^5.0.1",
         "electron-store": "^8.1.0",
         "react": "^18.2.0",

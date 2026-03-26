@@ -71,7 +71,8 @@ class TextureAnalyzer(BaseAnalyzer):
             score = 50.0
 
         # Invert heatmap for display (red = rough, green = smooth)
-        display_heatmap = 1.0 - texture_quality
+        # Only invert skin pixels — non-skin stays at 0 to avoid false hotspots
+        display_heatmap = np.where(texture_quality > 0, 1.0 - texture_quality, 0.0)
 
         return {
             "score": round(score, 1),

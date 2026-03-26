@@ -26,10 +26,13 @@ class MeasurementAnalyzer(BaseAnalyzer):
         "left_eye_inner": 133,
         "right_eye_outer": 263,
         "right_eye_inner": 362,
+        "left_pupil": 468,       # Iris center (refine_landmarks=True)
+        "right_pupil": 473,      # Iris center (refine_landmarks=True)
         "left_eyebrow_outer": 46,
         "right_eyebrow_outer": 276,
         "nose_tip": 1,
         "nose_bridge": 6,
+        "nose_base": 2,          # Columella / subnasal point
         "nose_left": 48,
         "nose_right": 278,
         "nasion": 168,
@@ -43,8 +46,8 @@ class MeasurementAnalyzer(BaseAnalyzer):
         "right_jaw": 361,
         "left_cheek": 234,
         "right_cheek": 454,
-        "left_ear": 234,
-        "right_ear": 454,
+        "left_ear": 127,          # Tragion (ear) - distinct from cheek
+        "right_ear": 356,         # Tragion (ear) - distinct from cheek
     }
 
     def __init__(self, device: str = "cpu"):
@@ -65,10 +68,11 @@ class MeasurementAnalyzer(BaseAnalyzer):
 
         if landmarks is None or len(landmarks) < 468:
             return {
-                "score": 0,
+                "score": 50,
                 "detections": [],
                 "heatmap": None,
                 "error": "468 landmarks required",
+                "measurements": {},
             }
 
         # Calibrate pixel-to-mm using interpupillary distance
@@ -191,10 +195,17 @@ class MeasurementAnalyzer(BaseAnalyzer):
 
     def _calibrate(self, landmarks: np.ndarray) -> float:
         """Calibrate pixel-to-mm ratio using interpupillary distance."""
-        left_eye = landmarks[self.LM["left_eye_outer"]]
-        right_eye = landmarks[self.LM["right_eye_outer"]]
-        ipd_px = np.sqrt(np.sum((left_eye - right_eye) ** 2))
-        return self.AVG_IPD_MM / max(ipd_px, 1.0)
+        # Use iris centers if available (refine_landmarks=True provides 478 landmarks)
+        if len(landmarks) >= 478:
+            left_pupil = landmarks[self.LM["left_pupil"]]
+            right_pupil = landmarks[self.LM["right_pupil"]]
+            ipd_px = np.sqrt(np.sum((left_pupil - right_pupil) ** 2))
+            return self.AVG_IPD_MM / max(ipd_px, 1.0)
+        # Fallback: use inner eye corners (intercanthal ~33mm) as more reliable
+        left_eye = landmarks[self.LM["left_eye_inner"]]
+        right_eye = landmarks[self.LM["right_eye_inner"]]
+        icd_px = np.sqrt(np.sum((left_eye - right_eye) ** 2))
+        return 33.0 / max(icd_px, 1.0)  # Average intercanthal distance
 
     def _dist(self, landmarks: np.ndarray, name1: str, name2: str) -> float:
         """Euclidean distance between two named landmarks."""
@@ -254,9 +265,9 @@ class MeasurementAnalyzer(BaseAnalyzer):
         return float(np.degrees(np.arccos(np.clip(cos_a, -1, 1))))
 
     def _nasolabial_angle(self, landmarks: np.ndarray) -> float:
-        """Angle between nose base and upper lip."""
+        """Angle at nose tip between columella (nose base) and upper lip."""
         nose_tip = landmarks[self.LM["nose_tip"]]
-        nose_base = landmarks[self.LM["nose_bridge"]]
+        nose_base = landmarks[self.LM["nose_base"]]  # Subnasal/columella point
         upper_lip = landmarks[self.LM["upper_lip_top"]]
 
         v1 = nose_base - nose_tip

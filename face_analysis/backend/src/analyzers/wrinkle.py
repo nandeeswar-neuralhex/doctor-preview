@@ -44,7 +44,7 @@ class WrinkleAnalyzer(BaseAnalyzer):
                 gamma=params["gamma"],
                 psi=0,
             )
-            kernel /= kernel.sum() + 1e-7
+            kernel /= np.linalg.norm(kernel) + 1e-7
             self._gabor_kernels.append(kernel)
         self._is_loaded = True
 
@@ -88,10 +88,13 @@ class WrinkleAnalyzer(BaseAnalyzer):
         detections = self._classify_wrinkles(combined, landmarks, zone)
 
         # Score: higher = fewer wrinkles = healthier
-        wrinkle_density = np.mean(combined[combined > 0.3])
-        if np.isnan(wrinkle_density):
-            wrinkle_density = 0.0
-        score = max(0, min(100, 100 - wrinkle_density * 200))
+        # Factor in both intensity AND coverage for accurate scoring
+        wrinkle_pixels = combined[combined > 0.3]
+        skin_pixels = np.sum(mask > 0) if mask is not None else h * w
+        wrinkle_intensity = float(np.mean(wrinkle_pixels)) if len(wrinkle_pixels) > 0 else 0.0
+        wrinkle_coverage = len(wrinkle_pixels) / max(skin_pixels, 1)
+        wrinkle_density = wrinkle_intensity * (wrinkle_coverage ** 0.5)  # sqrt to soften coverage impact
+        score = max(0, min(100, 100 - wrinkle_density * 80))
 
         return {
             "score": round(score, 1),
