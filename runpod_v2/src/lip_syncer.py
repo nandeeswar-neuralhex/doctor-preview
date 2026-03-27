@@ -187,11 +187,12 @@ class LipSyncer:
 
         # Build a vertical gradient mask:
         #   0 at top (preserve face-swap output)
-        #   gradual blend from 48-62% of face height
+        #   gradual blend from 52-68% of face height
         #   1 at bottom (use Wav2Lip lip-synced output)
+        # Shifted lower to better match actual mouth position and reduce dark seams
         mask = np.zeros((face_h, face_w), dtype=np.float32)
-        blend_start = int(face_h * 0.48)
-        blend_end = int(face_h * 0.62)
+        blend_start = int(face_h * 0.52)
+        blend_end = int(face_h * 0.68)
 
         for y_idx in range(blend_start, face_h):
             if y_idx < blend_end:
@@ -201,16 +202,16 @@ class LipSyncer:
             mask[y_idx, :] = alpha
 
         # Feather horizontal edges to avoid hard vertical seams
-        # Risk#5 fix: wider feather (0.15 vs 0.08) absorbs bbox pixel shifts
-        edge = max(5, int(face_w * 0.15))
+        # Wider feather absorbs bbox pixel shifts and reduces dark edge artifacts
+        edge = max(5, int(face_w * 0.20))
         for x_idx in range(edge):
             factor = x_idx / edge
             mask[:, x_idx] *= factor
             mask[:, face_w - 1 - x_idx] *= factor
 
         # Gaussian blur for smooth transitions
-        # Risk#5 fix: larger sigma (7 vs 3) makes 1-2px boundary shifts invisible
-        mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=7, sigmaY=7)
+        # Larger sigma makes boundary shifts invisible, reducing dark edge artifacts
+        mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=11, sigmaY=11)
 
         # Alpha-blend mouth region
         face_region = result[y1:y2, x1:x2].astype(np.float32)

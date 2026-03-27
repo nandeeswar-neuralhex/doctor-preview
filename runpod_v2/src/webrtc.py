@@ -240,9 +240,7 @@ class VideoTransformTrack(MediaStreamTrack):
     MAX_PROCESS_HEIGHT = 720
 
     def _process_loop(self):
-        """Background thread: process latest input frame on GPU.
-        Fix #7: Cross-fade between consecutive swap results to eliminate stutter."""
-        prev_result = None  # For cross-fade between swap outputs
+        """Background thread: process latest input frame on GPU."""
         while not self._stop.is_set():
             self._has_input.wait(timeout=0.1)
             if self._stop.is_set():
@@ -293,13 +291,8 @@ class VideoTransformTrack(MediaStreamTrack):
                             )
                             lipsync_applied = True
 
-            # Fix #7 + Risk#4: Cross-fade only when lip sync NOT applied
-            # Wav2Lip temporal blend handles smoothness when lip sync is active
-            # Reduced to 95/5 — minimal ghost trail, negligible lag accumulation.
-            # At 30fps, 5% blend = <1 frame of effective lag (vs 67ms at 15%).
-            if not lipsync_applied and prev_result is not None and prev_result.shape == result.shape:
-                result = cv2.addWeighted(result, 0.95, prev_result, 0.05, 0)
-            prev_result = result.copy()
+            # Cross-fade removed: was causing ghosting/smearing on fast movements.
+            # The face swapper's temporal smoothing already handles frame stability.
 
             with self._result_lock:
                 self._latest_result = result
@@ -370,8 +363,8 @@ class VideoTransformTrack(MediaStreamTrack):
             self._swap_count = 0
             self._last_log = now
 
-        # Pace output to ~30 FPS
-        await asyncio.sleep(self.FRAME_INTERVAL)
+        # Pacing handled by wait_for timeout above — no extra sleep needed.
+        # Previous double-sleep (wait_for + sleep) halved effective FPS from 30 to ~15.
         return new_frame
 
     def stop(self):

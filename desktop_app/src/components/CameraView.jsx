@@ -24,8 +24,9 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     const qualityRef = useRef(QUALITY_PRESETS[DEFAULT_QUALITY]);
     const [lipSyncEnabled, setLipSyncEnabled] = useState(true);
     const [audioDelayMs, setAudioDelayMs] = useState(300);
-    // Smoothed latency tracker for auto BlackHole delay sync
+    // Smoothed latency tracker for suggested delay display (not auto-applied)
     const smoothedLatencyRef = useRef(300); // EMA of measured latency
+    const [suggestedDelay, setSuggestedDelay] = useState(300);
     const [exposureAdjust, setExposureAdjust] = useState(0);
     const [diagnostics, setDiagnostics] = useState({
         health: null,
@@ -121,7 +122,7 @@ window.addEventListener('beforeunload', () => bc.close());
 
     // Fix #8: Jitter buffer — decoded frames queue for steady paint cadence
     const frameBufferRef = useRef([]);  // ring buffer of decoded ImageBitmaps
-    const MAX_BUFFER = 6;  // increased from 3: absorbs larger network bursts
+    const MAX_BUFFER = 3;  // Smaller buffer = lower latency; paced drain handles bursts
     const paintLoopRef = useRef(null);
     const lastPaintedIdRef = useRef(0);
 
@@ -179,18 +180,17 @@ window.addEventListener('beforeunload', () => bc.close());
             wsFrameCountRef.current = 0;
             wsLastFpsTimeRef.current = now;
         }
-        // Update latency if provided; also smooth and auto-sync BlackHole delay
+        // Update latency display and compute a suggested audio delay.
+        // The suggestion is shown to the user but NOT auto-applied — this avoids the
+        // feedback loop where high latency → increased delay → delayed audio → higher latency.
+        // User can press “Sync” to adopt the suggestion manually.
         if (wsLatency !== undefined && wsLatency > 0 && wsLatency < 3000) {
             setLatency(wsLatency);
-            // EMA smoothing: 90% old + 10% new to prevent jittery audio delay changes
-            const ema = smoothedLatencyRef.current * 0.9 + wsLatency * 0.1;
+            const ema = smoothedLatencyRef.current * 0.92 + wsLatency * 0.08;
             smoothedLatencyRef.current = ema;
-            // Only update audio delay if it differs by more than 50ms from current
-            // This prevents constant micro-adjustments that cause audible artifacts
-            setAudioDelayMs(prev => {
-                const target = Math.round(ema / 50) * 50; // round to nearest 50ms
-                return Math.abs(target - prev) > 50 ? target : prev;
-            });
+            // Round to nearest 50ms for stability
+            const suggested = Math.round(ema / 50) * 50;
+            setSuggestedDelay(suggested);
         }
     }, []);
 
@@ -247,17 +247,21 @@ window.addEventListener('beforeunload', () => bc.close());
         const ctx = canvas.getContext('2d');
         let active = true;
 
+        let lastDrainTime = 0;
+        const DRAIN_INTERVAL = 42; // ~24fps pacing — matches server output rate
+
         const paintFrame = (timestamp) => {
             if (!active) return;
             const buf = frameBufferRef.current;
-            // Drain the oldest frame every rAF tick (browser calls rAF at 60fps).
-            // No artificial 40ms gate — rAF already paces us to the display refresh.
-            // If buffer has 2+ frames, drain 2 to catch up on burst arrivals faster.
-            const drainCount = buf.length >= 4 ? 2 : 1;
-            for (let i = 0; i < drainCount && buf.length > 0; i++) {
+            const elapsed = timestamp - lastDrainTime;
+            // Pace drain to ~24fps to prevent fast-forward on burst arrivals.
+            // If buffer is getting full (>2), drain extra to prevent buildup.
+            const shouldDrain = elapsed >= DRAIN_INTERVAL || buf.length > 2;
+            if (buf.length > 0 && shouldDrain) {
                 const entry = buf.shift();
                 ctx.drawImage(entry.bitmap, 0, 0);
                 entry.bitmap.close();
+                lastDrainTime = timestamp;
                 // Mirror to popout window via BroadcastChannel
                 if (broadcastRef.current && entry.blob) {
                     broadcastRef.current.postMessage(entry.blob);
@@ -1124,6 +1128,15 @@ window.addEventListener('beforeunload', () => bc.close());
                         className="w-16 md:w-24 accent-blue-500"
                     />
                     <span className="font-mono text-blue-400 font-semibold text-right">{audioDelayMs}ms</span>
+                    {isStreaming && suggestedDelay !== audioDelayMs && (
+                        <button
+                            onClick={() => setAudioDelayMs(suggestedDelay)}
+                            className="px-1.5 py-0.5 text-[10px] bg-blue-600 hover:bg-blue-500 rounded text-white whitespace-nowrap"
+                            title={`Set delay to match measured latency (${suggestedDelay}ms)`}
+                        >
+                            Sync {suggestedDelay}ms
+                        </button>
+                    )}
                 </div>
                 <div className="flex items-center gap-2 text-xs md:text-sm text-gray-300">
                     <span className="whitespace-nowrap">Exposure:</span>

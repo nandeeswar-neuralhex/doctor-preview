@@ -455,7 +455,14 @@ class FaceSwapper:
             eye_mid = (kps[0] + kps[1]) / 2
             nose_offset = (kps[2][0] - eye_mid[0]) / eye_dist  # yaw proxy
             nose_v_offset = (kps[2][1] - eye_mid[1]) / eye_dist  # pitch proxy
-            features.extend([nose_mouth, mouth_w, nose_offset, nose_v_offset])
+            # Mouth corner vertical positions relative to nose — captures subtle
+            # smile/frown that shifts corners by only 1-2 pixels at 320×320.
+            mouth_left_v = (kps[3][1] - kps[2][1]) / eye_dist
+            mouth_right_v = (kps[4][1] - kps[2][1]) / eye_dist
+            # Mouth midpoint vertical — captures jaw-open (mouth drops down)
+            mouth_mid_y = ((kps[3][1] + kps[4][1]) / 2.0 - kps[2][1]) / eye_dist
+            features.extend([nose_mouth, mouth_w, nose_offset, nose_v_offset,
+                             mouth_left_v, mouth_right_v, mouth_mid_y])
         
         # From 68-point landmarks (if available): detailed expression
         if hasattr(face, 'landmark_3d_68') and face.landmark_3d_68 is not None:
@@ -603,7 +610,9 @@ class FaceSwapper:
                     return faded, []
             return frame, []
         
-        # Reset miss counter on successful detection
+        # ── Smooth recovery from detection miss ──
+        # Save miss count before resetting — used for cross-fade below
+        _prev_miss_count = self._miss_count.get(session_id, 0)
         self._miss_count[session_id] = 0
 
         # ── Phase 3: LivePortrait engine path ──
@@ -666,6 +675,14 @@ class FaceSwapper:
         self._dbg_count[session_id] = self._dbg_count.get(session_id, 0) + 1
         if self._dbg_count[session_id] % 60 == 0:
             print(f"  [PROFILE] detect={(_t1-_t0)*1000:.1f}ms  match={(_t3-_t2)*1000:.1f}ms  swap={(_t4-_t3)*1000:.1f}ms  total={(_t4-_t0)*1000:.1f}ms")
+
+        # Cross-fade when recovering from detection miss to prevent visible jump
+        # Only activates after 3+ missed frames (~150ms gap)
+        if _prev_miss_count > 3 and session_id in self._last_result:
+            cached = self._last_result[session_id]
+            if cached.shape == result.shape:
+                blend = min(0.35, _prev_miss_count * 0.02)
+                result = cv2.addWeighted(result, 1.0 - blend, cached, blend, 0)
 
         # Cache last good result to avoid flashing on face-lost frames
         self._last_result[session_id] = result
@@ -796,7 +813,7 @@ class FaceSwapper:
                     eye_dist = np.linalg.norm(kps[1] - kps[0])
 
                     cx = mouth_center[0]
-                    cy = mouth_center[1] + eye_dist * 0.05
+                    cy = mouth_center[1] + eye_dist * 0.08
 
                     # Convert to ROI coordinates
                     cx_roi = int(cx) - roi_x1
@@ -826,14 +843,17 @@ class FaceSwapper:
                             self._mouth_mse_history[mse_key] = self._mouth_mse_history[mse_key][-5:]
                         mse = np.mean(self._mouth_mse_history[mse_key])
 
-                        mse_conf = np.clip((mse - 100.0) / 700.0, 0.0, 1.0)
+                        mse_conf = np.clip((mse - 250.0) / 1000.0, 0.0, 1.0)
 
                         swap_std = np.std(swap_patch)
                         orig_std = np.std(orig_patch)
                         uniformity_ratio = swap_std / max(orig_std, 1.0)
-                        uniform_conf = np.clip((0.6 - uniformity_ratio) / 0.4, 0.0, 0.6)
+                        uniform_conf = np.clip((0.6 - uniformity_ratio) / 0.4, 0.0, 0.5)
 
-                        mask_strength = min(1.0, mse_conf + uniform_conf)
+                        # Cap at 0.70 — never fully replace the swap with original.
+                        # This preserves subtle expression differences that the swap
+                        # model generated (small smiles, teeth showing slightly).
+                        mask_strength = min(0.70, mse_conf + uniform_conf)
 
                     # ── Step 2: Heavy temporal smoothing (Fix #2) ──
                     smooth_key = f"{session_id}_mouth_str"
@@ -852,27 +872,28 @@ class FaceSwapper:
                     is_active = self._mouth_mask_active.get(active_key, False)
                     if is_active:
                         # Deactivate only when strength drops well below threshold
-                        if mask_strength < 0.08:
+                        if mask_strength < 0.10:
                             is_active = False
                     else:
                         # Activate only when strength is clearly above threshold
-                        if mask_strength > 0.20:
+                        if mask_strength > 0.30:
                             is_active = True
                     self._mouth_mask_active[active_key] = is_active
 
                     # ── Step 4: Apply mouth mask (Fixed geometry — only alpha varies) ──
                     if is_active and mask_strength > 0.05:
-                        # Fix #2: CONSTANT ellipse size — only blend intensity varies
-                        ell_rx = int(mouth_w * 0.38)
-                        ell_ry = int(eye_dist * 0.20)
+                        # Tighter ellipse focused on inner mouth/teeth area
+                        # Smaller region reduces dark halo at skin-mouth boundary
+                        ell_rx = int(mouth_w * 0.28)
+                        ell_ry = int(eye_dist * 0.14)
 
                         if (ell_rx > 2 and ell_ry > 2 and
                                 0 < cx_roi < roi_w and 0 < cy_roi < roi_h):
                             mouth_excl = np.zeros((roi_h, roi_w), dtype=np.float32)
                             cv2.ellipse(mouth_excl, (cx_roi, cy_roi),
                                         (ell_rx, ell_ry), 0, 0, 360, 1.0, -1)
-                            # Fix #2: Larger blur for softer boundary
-                            blur_sz = max(61, int(max(ell_rx, ell_ry) * 2.8) | 1)
+                            # Wider blur for softer boundary to hide skin-mouth seam
+                            blur_sz = max(71, int(max(ell_rx, ell_ry) * 3.5) | 1)
                             mouth_excl = cv2.GaussianBlur(mouth_excl, (blur_sz, blur_sz), 0)
                             mouth_excl *= mask_strength
                             m3 = mouth_excl[..., None]
@@ -901,7 +922,8 @@ class FaceSwapper:
         else:
             faces = self.face_analyzer_fast.get(frame)
         # Filter out low-confidence detections that give noisy landmarks
-        faces = [f for f in faces if getattr(f, 'det_score', 0.9) >= 0.55]
+        # Raised from 0.55 → 0.65 to eliminate jittery bboxes from borderline detections
+        faces = [f for f in faces if getattr(f, 'det_score', 0.9) >= 0.65]
         if len(faces) > 0:
             return faces
 
@@ -1115,12 +1137,22 @@ class FaceSwapper:
             return frame
 
     def _smooth_landmarks(self, session_id: str, kps: np.ndarray) -> np.ndarray:
-        """Exponential smoothing of landmarks per session for stability."""
+        """Per-point exponential smoothing of landmarks.
+
+        Eye points (0, 1) and nose (2) use the standard alpha for position
+        stability.  Mouth corners (3, 4) use a lighter alpha (50% of standard)
+        so that subtle lip movements — small smiles, slight mouth opening —
+        pass through with minimal damping.
+        """
         if session_id not in self._smooth_kps:
             self._smooth_kps[session_id] = kps.copy()
             return kps
         prev = self._smooth_kps[session_id]
-        smoothed = SMOOTHING_ALPHA * prev + (1.0 - SMOOTHING_ALPHA) * kps
+        # Per-point alpha: lighter smoothing on mouth corners
+        alpha = np.full(kps.shape, SMOOTHING_ALPHA, dtype=np.float32)
+        alpha[3] = SMOOTHING_ALPHA * 0.5   # left mouth corner — more responsive
+        alpha[4] = SMOOTHING_ALPHA * 0.5   # right mouth corner — more responsive
+        smoothed = alpha * prev + (1.0 - alpha) * kps
         self._smooth_kps[session_id] = smoothed
         return smoothed
 
@@ -1181,6 +1213,14 @@ class FaceSwapper:
 
                 # Build 256-entry LUT
                 lut = np.searchsorted(tgt_cdf, src_cdf).clip(0, 255).astype(np.float64)
+
+                # Reduce L-channel (lightness) matching intensity to prevent
+                # mouth interior darkening — dark cavity pixels in the histogram
+                # pull the LUT toward black, making teeth/lips even darker.
+                # Blending 50% with identity preserves original brightness structure.
+                if c == 0:
+                    identity = np.arange(256, dtype=np.float64)
+                    lut = 0.5 * identity + 0.5 * lut
 
                 # Fix #5: Temporal smoothing of LUT (70% old + 30% new)
                 if session_id:

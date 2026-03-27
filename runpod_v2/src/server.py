@@ -466,18 +466,9 @@ async def websocket_stream(websocket: WebSocket, session_id: str):
             return
         _latest_frame_id = frame_id
 
-        # Fix #8: If GPU is busy, send last good output as heartbeat
-        # Risk#1 fix: use LAST PROCESSED frame ID (not incoming) so the client's
-        # out-of-order check won't reject the real processed frame when it finishes
-        # Use the stored timestamp from when that result was actually built so
-        # the client measures real latency, not a falsely low "0ms" heartbeat.
+        # Drop frame when GPU is busy — the client jitter buffer smooths over gaps.
+        # Previous "heartbeat" approach sent stale frames causing slow-motion effect.
         if _sem.locked():
-            if _last_output is not None:
-                try:
-                    async with _send_lock:
-                        await websocket.send_bytes(_last_processed_fid_bytes + _last_processed_ts_bytes + _last_output)
-                except Exception:
-                    pass
             return
 
         async with _sem:

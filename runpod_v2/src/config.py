@@ -33,11 +33,11 @@ _GFPGAN_PATH_ENV = os.getenv("GFPGAN_MODEL_PATH", "")
 GFPGAN_MODEL_PATH = _GFPGAN_PATH_ENV or os.path.join(MODELS_DIR, "GFPGANv1.4.pth")
 
 # Smoothing / tracking — alpha = how much old value is retained
-# 0.40 = 40% old + 60% new → responsive tracking with sub-pixel stability
+# 0.30 = 30% old + 70% new → more responsive, catches subtle mouth/expression changes
 # NOTE: bbox and kps are both smoothed, so do NOT also smooth the affine matrix
 # (it derives from already-smoothed kps — double-smoothing causes extreme lag)
 ENABLE_TEMPORAL_SMOOTHING = os.getenv("ENABLE_TEMPORAL_SMOOTHING", "true").lower() == "true"
-SMOOTHING_ALPHA = float(os.getenv("SMOOTHING_ALPHA", "0.40"))
+SMOOTHING_ALPHA = float(os.getenv("SMOOTHING_ALPHA", "0.30"))
 MAX_FACES = int(os.getenv("MAX_FACES", "1"))
 
 # WebRTC / Lip sync
