@@ -24,6 +24,8 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     const qualityRef = useRef(QUALITY_PRESETS[DEFAULT_QUALITY]);
     const [lipSyncEnabled, setLipSyncEnabled] = useState(true);
     const [audioDelayMs, setAudioDelayMs] = useState(300);
+    // Smoothed latency tracker for auto BlackHole delay sync
+    const smoothedLatencyRef = useRef(300); // EMA of measured latency
     const [exposureAdjust, setExposureAdjust] = useState(0);
     const [diagnostics, setDiagnostics] = useState({
         health: null,
@@ -119,7 +121,7 @@ window.addEventListener('beforeunload', () => bc.close());
 
     // Fix #8: Jitter buffer — decoded frames queue for steady paint cadence
     const frameBufferRef = useRef([]);  // ring buffer of decoded ImageBitmaps
-    const MAX_BUFFER = 3;
+    const MAX_BUFFER = 6;  // increased from 3: absorbs larger network bursts
     const paintLoopRef = useRef(null);
     const lastPaintedIdRef = useRef(0);
 
@@ -177,9 +179,18 @@ window.addEventListener('beforeunload', () => bc.close());
             wsFrameCountRef.current = 0;
             wsLastFpsTimeRef.current = now;
         }
-        // Update latency if provided
-        if (wsLatency !== undefined) {
+        // Update latency if provided; also smooth and auto-sync BlackHole delay
+        if (wsLatency !== undefined && wsLatency > 0 && wsLatency < 3000) {
             setLatency(wsLatency);
+            // EMA smoothing: 90% old + 10% new to prevent jittery audio delay changes
+            const ema = smoothedLatencyRef.current * 0.9 + wsLatency * 0.1;
+            smoothedLatencyRef.current = ema;
+            // Only update audio delay if it differs by more than 50ms from current
+            // This prevents constant micro-adjustments that cause audible artifacts
+            setAudioDelayMs(prev => {
+                const target = Math.round(ema / 50) * 50; // round to nearest 50ms
+                return Math.abs(target - prev) > 50 ? target : prev;
+            });
         }
     }, []);
 
@@ -236,16 +247,14 @@ window.addEventListener('beforeunload', () => bc.close());
         const ctx = canvas.getContext('2d');
         let active = true;
 
-        let lastDrainTime = 0;
-        const MIN_DRAIN_INTERVAL = 40; // ms — ~25fps max drain rate
-
         const paintFrame = (timestamp) => {
             if (!active) return;
             const buf = frameBufferRef.current;
-            // Risk#6 fix: rate-limit drain so burst arrivals paint evenly
-            // Drain immediately if buffer full (prevent drops), otherwise pace to ~25fps
-            if (buf.length > 0 && (timestamp - lastDrainTime >= MIN_DRAIN_INTERVAL || buf.length >= MAX_BUFFER)) {
-                lastDrainTime = timestamp;
+            // Drain the oldest frame every rAF tick (browser calls rAF at 60fps).
+            // No artificial 40ms gate — rAF already paces us to the display refresh.
+            // If buffer has 2+ frames, drain 2 to catch up on burst arrivals faster.
+            const drainCount = buf.length >= 4 ? 2 : 1;
+            for (let i = 0; i < drainCount && buf.length > 0; i++) {
                 const entry = buf.shift();
                 ctx.drawImage(entry.bitmap, 0, 0);
                 entry.bitmap.close();
@@ -653,17 +662,24 @@ window.addEventListener('beforeunload', () => bc.close());
                     for (let i = 0; i < float32.length; i++) {
                         int16[i] = (float32[i] * 0x7FFF) | 0;
                     }
-                    const maxSamples = 8000;
+                    // True ring buffer: keep exactly the last 500ms of audio (8000 samples @ 16kHz).
+                    // Slice from the end — ensures server always gets the MOST RECENT audio,
+                    // never stale audio from seconds ago. This fixes lip-sync drift over time.
+                    const maxSamples = 8000; // 500ms @ 16kHz
                     const prev = audioBufferRef.current;
-                    if (prev.length === 0) {
-                        audioBufferRef.current = int16.length > maxSamples
-                            ? int16.slice(int16.length - maxSamples) : int16;
-                    } else {
-                        const combined = new Int16Array(prev.length + int16.length);
+                    const totalLen = prev.length + int16.length;
+                    if (totalLen <= maxSamples) {
+                        const combined = new Int16Array(totalLen);
                         combined.set(prev);
                         combined.set(int16, prev.length);
-                        audioBufferRef.current = combined.length > maxSamples
-                            ? combined.slice(combined.length - maxSamples) : combined;
+                        audioBufferRef.current = combined;
+                    } else {
+                        // Fast ring-buffer: write only what fits at the end
+                        const combined = new Int16Array(maxSamples);
+                        const keep = Math.min(prev.length, maxSamples - int16.length);
+                        if (keep > 0) combined.set(prev.slice(prev.length - keep), 0);
+                        combined.set(int16.slice(Math.max(0, int16.length - (maxSamples - keep))), keep);
+                        audioBufferRef.current = combined;
                     }
                 };
 

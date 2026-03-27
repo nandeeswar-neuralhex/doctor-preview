@@ -76,10 +76,13 @@ class LipSyncer:
             if sample_rate != _WAV2LIP_SR and sample_rate > 0:
                 audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=_WAV2LIP_SR)
 
-            # Fix #3: Apply Hann window to smooth audio buffer edges
-            # Prevents mel discontinuities at chunk boundaries → smoother lip movement
+            # Apply Tukey window (cosine-tapered) to smooth only the edges.
+            # Unlike Hann which zeroes ~25% at each end (killing lip amplitude),
+            # Tukey(alpha=0.25) keeps the middle 75% at full strength and only
+            # tapers the outer 12.5% on each side — preserving speech energy.
             if len(audio) > 64:
-                audio *= np.hanning(len(audio))
+                from scipy.signal import windows as _wins
+                audio = audio * _wins.tukey(len(audio), alpha=0.25)
 
             # Mel spectrogram with Wav2Lip-compatible parameters at 16kHz
             # n_fft=800  → 50ms analysis window
@@ -125,11 +128,15 @@ class LipSyncer:
                 )
             mel_input = mel_win[None, ...].astype(np.float32)
 
-            # Map inputs by expected shapes (4D = face image, other = mel)
+            # Map inputs: match by name first (reliable), fall back to shape heuristic
             inputs = {}
             for name, inp in zip(self.input_names, self.session.get_inputs()):
-                shape = inp.shape
-                if len(shape) == 4:
+                name_lower = name.lower()
+                if 'mel' in name_lower or 'audio' in name_lower:
+                    inputs[name] = mel_input
+                elif 'face' in name_lower or 'img' in name_lower or 'image' in name_lower:
+                    inputs[name] = face_input
+                elif len(inp.shape) == 4:
                     inputs[name] = face_input
                 else:
                     inputs[name] = mel_input
@@ -139,11 +146,12 @@ class LipSyncer:
             pred = (pred * 255).clip(0, 255).astype(np.uint8)
             pred = pred[:, :, ::-1]  # RGB → BGR
 
-            # Fix #3: Temporal smoothing — blend with previous output (per session)
-            # 60% current + 40% previous = smooth lip transitions, still responsive
+            # Light temporal smoothing — 85% current + 15% previous
+            # Higher current weight preserves crisp lip articulation (m/b/p closures)
+            # while still removing single-frame jitter
             prev = self._prev_outputs.get(session_id) if session_id else None
             if prev is not None and prev.shape == pred.shape:
-                pred = cv2.addWeighted(pred, 0.6, prev, 0.4, 0)
+                pred = cv2.addWeighted(pred, 0.85, prev, 0.15, 0)
             if session_id:
                 self._prev_outputs[session_id] = pred.copy()
 

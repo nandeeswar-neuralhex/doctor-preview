@@ -580,20 +580,27 @@ class FaceSwapper:
 
         if len(source_faces) == 0:
             # ── Fix #1: Graceful fade-out on detection miss ──
+            # Keep returning cached swap for up to 90 frames (4.5s at 20fps) before
+            # slowly fading back — this prevents rapid original↔swapped flicker when
+            # detection momentarily drops (pose change, motion blur, lighting).
             miss_count = self._miss_count.get(session_id, 0) + 1
             self._miss_count[session_id] = miss_count
             if session_id in self._last_result:
-                if miss_count <= 10:
-                    # First 10 missed frames: return cached result (stable)
+                if miss_count <= 90:
+                    # First 90 missed frames: return cached result (no visible flicker)
                     return self._last_result[session_id], []
                 else:
-                    # After 10 misses: gradually blend toward raw frame (10% per frame)
-                    blend = min(1.0, (miss_count - 10) * 0.1)
+                    # After 90 misses: slowly blend toward raw frame (2% per frame)
+                    # Takes 50 more frames (~2.5s) to fully return to original
+                    blend = min(1.0, (miss_count - 90) * 0.02)
                     cached = self._last_result[session_id]
                     if cached.shape == frame.shape:
                         faded = cv2.addWeighted(cached, 1.0 - blend, frame, blend, 0)
                         return faded, []
-                    return cached, []
+                    # Resolution changed — resize cached to match current frame
+                    resized_cached = cv2.resize(cached, (frame.shape[1], frame.shape[0]))
+                    faded = cv2.addWeighted(resized_cached, 1.0 - blend, frame, blend, 0)
+                    return faded, []
             return frame, []
         
         # Reset miss counter on successful detection
@@ -717,13 +724,10 @@ class FaceSwapper:
 
             h, w = frame.shape[:2]
 
-            # ── Fix #1: Smooth the inverse affine matrix for sub-pixel stability ──
+            # Inverse affine for paste-back. NOT smoothed separately because
+            # the source kps that produce M are already EMA-smoothed.
+            # Double-smoothing caused ~150-250ms face lag on head turns.
             M_inv = cv2.invertAffineTransform(M)
-            affine_key = f"{session_id}_affine"
-            if affine_key in self._smooth_affine:
-                prev_M = self._smooth_affine[affine_key]
-                M_inv = SMOOTHING_ALPHA * prev_M + (1.0 - SMOOTHING_ALPHA) * M_inv
-            self._smooth_affine[affine_key] = M_inv.copy()
 
             # ── Fix #6: Build face ROI with larger padding + rounded coords ──
             bbox = source_face.bbox.astype(int)
@@ -896,8 +900,8 @@ class FaceSwapper:
             faces = self.face_analyzer.get(frame)
         else:
             faces = self.face_analyzer_fast.get(frame)
-        # Fix #1: Filter out low-confidence detections that give noisy landmarks
-        faces = [f for f in faces if getattr(f, 'det_score', 0.9) >= 0.4]
+        # Filter out low-confidence detections that give noisy landmarks
+        faces = [f for f in faces if getattr(f, 'det_score', 0.9) >= 0.55]
         if len(faces) > 0:
             return faces
 

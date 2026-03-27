@@ -157,7 +157,7 @@ class AudioBuffer:
         self._buffer = bytearray()
         self._sample_rate = 48000
         self._channels = 1
-        self._max_duration_s = 0.5
+        self._max_duration_s = 0.3  # 300ms — only the last 200ms (16 mel frames) are used
 
     def append(self, frame: AudioFrame):
         try:
@@ -262,10 +262,7 @@ class VideoTransformTrack(MediaStreamTrack):
                 new_h = self.MAX_PROCESS_HEIGHT
                 img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-            # Save original for lip sync (clean mouth pixels, no swap artifacts)
-            original_img = img.copy()
-
-            # Fix #3: Check if lip sync will run — if so, skip mouth preservation
+            # Check if lip sync will run — if so, skip mouth preservation
             settings = self.session_settings.get(self.session_id, {}) if self.session_settings else {}
             enable_lipsync = settings.get("enable_lipsync", ENABLE_LIPSYNC)
             will_lipsync = (enable_lipsync and self.lip_syncer
@@ -276,8 +273,8 @@ class VideoTransformTrack(MediaStreamTrack):
                 self.session_id, img, skip_mouth_preservation=will_lipsync
             )
 
-            # Lip sync — use original frame for Wav2Lip input so it gets
-            # clean teeth/tongue instead of swapped artifacts
+            # Lip sync — use the SWAPPED result so generated mouth
+            # matches target skin tone (not original person's)
             lipsync_applied = False
             if will_lipsync and len(faces) > 0:
                 audio_pcm, sample_rate = self.audio_buffer.get_recent_audio()
@@ -288,7 +285,7 @@ class VideoTransformTrack(MediaStreamTrack):
                     x1, y1 = max(0, x1), max(0, y1)
                     x2, y2 = min(result.shape[1], x2), min(result.shape[0], y2)
                     if x2 > x1 and y2 > y1:
-                        face_crop = original_img[y1:y2, x1:x2]
+                        face_crop = result[y1:y2, x1:x2]
                         synced = self.lip_syncer.infer(face_crop, mel, self.session_id)
                         if synced is not None:
                             result = self.lip_syncer.apply_mouth_only(
@@ -298,9 +295,10 @@ class VideoTransformTrack(MediaStreamTrack):
 
             # Fix #7 + Risk#4: Cross-fade only when lip sync NOT applied
             # Wav2Lip temporal blend handles smoothness when lip sync is active
-            # Risk#7: reduced from 70/30 to 85/15 to minimize ghost trail on fast movement
+            # Reduced to 95/5 — minimal ghost trail, negligible lag accumulation.
+            # At 30fps, 5% blend = <1 frame of effective lag (vs 67ms at 15%).
             if not lipsync_applied and prev_result is not None and prev_result.shape == result.shape:
-                result = cv2.addWeighted(result, 0.85, prev_result, 0.15, 0)
+                result = cv2.addWeighted(result, 0.95, prev_result, 0.05, 0)
             prev_result = result.copy()
 
             with self._result_lock:

@@ -32,17 +32,19 @@ ENABLE_GFPGAN = os.getenv("ENABLE_GFPGAN", "true").lower() == "true"
 _GFPGAN_PATH_ENV = os.getenv("GFPGAN_MODEL_PATH", "")
 GFPGAN_MODEL_PATH = _GFPGAN_PATH_ENV or os.path.join(MODELS_DIR, "GFPGANv1.4.pth")
 
-# Smoothing / tracking — higher alpha = heavier smoothing (Google Meet level)
-# 0.65 = 65% old + 35% new → sub-pixel stability
+# Smoothing / tracking — alpha = how much old value is retained
+# 0.40 = 40% old + 60% new → responsive tracking with sub-pixel stability
+# NOTE: bbox and kps are both smoothed, so do NOT also smooth the affine matrix
+# (it derives from already-smoothed kps — double-smoothing causes extreme lag)
 ENABLE_TEMPORAL_SMOOTHING = os.getenv("ENABLE_TEMPORAL_SMOOTHING", "true").lower() == "true"
-SMOOTHING_ALPHA = float(os.getenv("SMOOTHING_ALPHA", "0.65"))
+SMOOTHING_ALPHA = float(os.getenv("SMOOTHING_ALPHA", "0.40"))
 MAX_FACES = int(os.getenv("MAX_FACES", "1"))
 
 # WebRTC / Lip sync
 ENABLE_WEBRTC = os.getenv("ENABLE_WEBRTC", "true").lower() == "true"
 ENABLE_LIPSYNC = os.getenv("ENABLE_LIPSYNC", "true").lower() == "true"
 WAV2LIP_MODEL_PATH = os.getenv("WAV2LIP_MODEL_PATH", os.path.join(MODELS_DIR, "wav2lip_gan_96.onnx"))
-LIPSYNC_AUDIO_WINDOW_MS = int(os.getenv("LIPSYNC_AUDIO_WINDOW_MS", "500"))
+LIPSYNC_AUDIO_WINDOW_MS = int(os.getenv("LIPSYNC_AUDIO_WINDOW_MS", "300"))
 
 # Frame processing
 TARGET_FPS = int(os.getenv("TARGET_FPS", "24"))
