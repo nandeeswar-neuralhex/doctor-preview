@@ -72,22 +72,40 @@ RUN python3 -m pip uninstall -y onnxruntime onnxruntime-gpu 2>/dev/null || true 
     && python3 -m pip install --no-cache-dir onnxruntime-gpu==1.20.1 \
     --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
 
-# Step 4: Install pinned dependencies with constraints
-COPY requirements-pinned.txt .
-COPY constraints.txt .
-RUN python3 -m pip install --no-cache-dir -c constraints.txt -r requirements-pinned.txt
+# Step 4: Install torch + torchvision explicitly (avoids resolver pulling cuda-13 bindings)
+RUN python3 -m pip install --no-cache-dir --no-deps \
+    torch==2.11.0 \
+    torchvision==0.26.0
 
-# Step 5: Re-pin onnxruntime-gpu (gfpgan/basicsr may overwrite with CPU version)
+# Step 5: Install all remaining packages from the exact Debug freeze (no-deps = no resolver conflicts)
+COPY constraints.txt .
+RUN python3 -m pip install --no-cache-dir --no-deps \
+    $(grep -v '^\(#\|Cython\|numpy\|insightface\|onnxruntime\|torch==\|torchvision\|nvidia-\)' constraints.txt | tr '\n' ' ')
+
+# Step 6: Re-pin onnxruntime-gpu (ensure CUDA 12 version)
 RUN python3 -m pip uninstall -y onnxruntime 2>/dev/null || true \
     && python3 -m pip install --no-cache-dir --force-reinstall onnxruntime-gpu==1.20.1 \
     --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
 
-# Step 6: Force CUDA 12 cuDNN/cuBLAS — remove any CUDA 13 contamination
+# Step 7: Force CUDA 12 cuDNN/cuBLAS — remove any CUDA 13 contamination
 RUN python3 -m pip uninstall -y nvidia-cudnn-cu13 nvidia-cublas 2>/dev/null || true \
-    && python3 -m pip install --no-cache-dir nvidia-cudnn-cu12==9.1.0.70 nvidia-cublas-cu12==12.9.2.10
+    && python3 -m pip install --no-cache-dir \
+    nvidia-cudnn-cu12==9.1.0.70 \
+    nvidia-cublas-cu12==12.9.2.10 \
+    nvidia-cuda-cupti==13.0.85 \
+    nvidia-cuda-nvrtc==13.0.88 \
+    nvidia-cuda-nvrtc-cu12==12.9.86 \
+    nvidia-cuda-runtime==13.0.96 \
+    nvidia-cufft==12.0.0.61 \
+    nvidia-cufile==1.15.1.6 \
+    nvidia-curand==10.4.0.35 \
+    nvidia-cusolver==12.0.4.66 \
+    nvidia-cusparse==12.6.3.3 \
+    nvidia-nvjitlink==13.0.88 \
+    nvidia-nvtx==13.0.85
 
-# Step 7: Pin numpy back to 1.x
-RUN python3 -m pip install --no-cache-dir "numpy==1.26.4"
+# Step 8: Pin numpy back to 1.x (in case anything upgraded it)
+RUN python3 -m pip install --no-cache-dir --force-reinstall "numpy==1.26.4"
 
 # Copy application source
 COPY src/ ./src/

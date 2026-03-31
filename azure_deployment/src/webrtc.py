@@ -13,6 +13,7 @@ Quality pipeline:
 from __future__ import annotations
 
 import asyncio
+import json
 
 # ── Extend ICE consent timeout ──
 # aioice defaults: CONSENT_INTERVAL=5s, CONSENT_FAILURES=6 → dies after 30s.
@@ -429,6 +430,19 @@ class WebRTCManager:
                             print(f"[WebRTC:{session_id}] Warning: could not set encoder bitrate (encoder not found)")
                             return
                 asyncio.ensure_future(_set_encoder_bitrate())
+
+        @pc.on("datachannel")
+        def on_datachannel(channel):
+            print(f"[WebRTC:{session_id}] Data channel '{channel.label}' opened")
+
+            @channel.on("message")
+            def on_message(message):
+                try:
+                    msg = json.loads(message)
+                    if msg.get("type") == "ping":
+                        channel.send(json.dumps({"type": "pong", "ts": msg["ts"]}))
+                except Exception:
+                    pass
 
         @pc.on("connectionstatechange")
         async def on_state_change():
