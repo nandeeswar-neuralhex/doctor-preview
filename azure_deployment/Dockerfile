@@ -13,7 +13,7 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 # pip installs nvidia-cudnn-cu12 which puts the libs under dist-packages/nvidia/cudnn/lib/.
 # Add all nvidia pip lib dirs to LD_LIBRARY_PATH so ort can load them.
 ENV NV_PYLIB=/usr/local/lib/python3.11/dist-packages/nvidia
-ENV LD_LIBRARY_PATH=${NV_PYLIB}/cudnn/lib:${NV_PYLIB}/cublas/lib:${NV_PYLIB}/cuda_runtime/lib:${NV_PYLIB}/cufft/lib:${NV_PYLIB}/cusolver/lib:${NV_PYLIB}/cusparse/lib:/usr/local/cuda-12.1/lib64
+ENV LD_LIBRARY_PATH=${NV_PYLIB}/cudnn/lib:${NV_PYLIB}/cublas/lib:${NV_PYLIB}/cuda_runtime/lib:${NV_PYLIB}/cufft/lib:${NV_PYLIB}/cusolver/lib:${NV_PYLIB}/cusparse/lib:${NV_PYLIB}/nvjitlink/lib:${NV_PYLIB}/cuda_nvrtc/lib:/usr/local/cuda-12.1/lib64
 
 WORKDIR /app
 
@@ -70,10 +70,10 @@ RUN python3 -m pip uninstall -y onnxruntime 2>/dev/null || true \
     && python3 -m pip install --no-cache-dir --force-reinstall onnxruntime-gpu==1.20.1 \
     --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
 
-# Step 5b: onnxruntime-gpu may pull nvidia-cudnn-cu13 (CUDA 13) which is
-# incompatible with our CUDA 12.1 base. Force CUDA 12 versions.
-RUN python3 -m pip uninstall -y nvidia-cudnn-cu13 nvidia-cublas 2>/dev/null || true \
-    && python3 -m pip install --no-cache-dir nvidia-cudnn-cu12==9.1.0.70 nvidia-cublas-cu12
+# Step 5b: onnxruntime-gpu may pull nvidia-cudnn-cu13 which lacks cuDNN 9 libs
+# that ort 1.20.1 needs. Install cudnn-cu12 alongside, but do NOT remove
+# nvidia-cublas cu13 — torch 2.11 needs libcublas.so.13.
+RUN python3 -m pip install --no-cache-dir nvidia-cudnn-cu12==9.1.0.70
 
 # Step 6: Pin numpy back to 1.x after all installs (avoid binary compat issues)
 RUN python3 -m pip install --no-cache-dir "numpy>=1.24,<2.0"

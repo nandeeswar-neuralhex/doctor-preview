@@ -80,7 +80,8 @@ if [ "$AVAIL_GB" -lt 20 ]; then
 fi
 
 # ── STEP 3: Pull latest code ────────────────────────────────────────
-info "Step 3/7  Pulling latest code (branch: $BRANCH)..."
+PINNED_COMMIT="ae0ee61"   # Stable version with lip sync of the real person
+info "Step 3/7  Pulling code — latest Dockerfile + src/ from $PINNED_COMMIT..."
 if [ -d "$CODE_DIR/.git" ]; then
     cd "$CODE_DIR"
     sudo git config --global --add safe.directory "$CODE_DIR"
@@ -93,8 +94,12 @@ else
     sudo git clone -b "$BRANCH" "$REPO" "$CODE_DIR"
 fi
 cd "$CODE_DIR"
-COMMIT=$(git log --oneline -1)
-success "Code at: $COMMIT"
+success "Dockerfile at: $(git log --oneline -1)"
+
+# Now overlay only src/ from the stable commit
+info "Checking out azure_deployment/src/ from $PINNED_COMMIT..."
+sudo git checkout "$PINNED_COMMIT" -- azure_deployment/src/
+success "src/ at: $PINNED_COMMIT (Stable version with lip sync of the real person)"
 
 # ── STEP 4: Build Docker image ──────────────────────────────────────
 info "Step 4/7  Building Docker image (this takes ~15-20 min)..."

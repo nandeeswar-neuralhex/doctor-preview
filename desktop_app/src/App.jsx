@@ -7,6 +7,7 @@ const GPU_OPTIONS = [
     { id: 'prod-t4',   label: 'T4',         url: import.meta.env.VITE_SERVER_URL     || 'https://faceiq.sparkiq.ai' },
     { id: 'legacy-t4', label: 'T4 Legacy',  url: import.meta.env.VITE_GPU_LEGACY_URL || 'https://t4lagcyfaceiq.sparkiq.ai' },
     { id: 'debug-t4',  label: 'T4 Debug',   url: import.meta.env.VITE_GPU_DEBUG_URL  || 'https://faceiq-debug.sparkiq.ai' },
+    { id: 'h100',      label: 'H100',       url: import.meta.env.VITE_GPU_H100_URL   || 'https://h100-faceiq.sparkiq.ai' },
 ];
 
 /* ── GPU Badge ───────────────────────────────────────────────────────

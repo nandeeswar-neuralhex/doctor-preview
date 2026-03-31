@@ -239,9 +239,14 @@ class VideoTransformTrack(MediaStreamTrack):
             if img is None:
                 continue
 
-            # Downscale to 720p if larger — saves CPU on warp/blend/copy/encode
+            # Normalize to exactly TARGET_HEIGHT (e.g. 540p) regardless of input.
+            # WebRTC auto-negotiates resolution upward (360→540→720→1080) as
+            # bandwidth improves. Each jump causes a visible face flicker because
+            # the temporal smoothing buffers hold stale data from the old resolution.
+            # By always resizing to a fixed height, the face detector and smoother
+            # see a consistent frame size — zero resolution-change flicker.
             h, w = img.shape[:2]
-            if h > self.MAX_PROCESS_HEIGHT:
+            if h != self.MAX_PROCESS_HEIGHT:
                 scale = self.MAX_PROCESS_HEIGHT / h
                 new_w = int(w * scale)
                 new_h = self.MAX_PROCESS_HEIGHT
@@ -283,14 +288,15 @@ class VideoTransformTrack(MediaStreamTrack):
 
     async def _read_input(self):
         """Async task: continuously read input frames, store latest."""
-        logged_input_res = False
+        last_logged_res = None
         try:
             while not self._stop.is_set():
                 frame = await self.track.recv()
                 img = frame.to_ndarray(format="bgr24")
-                if not logged_input_res:
-                    logged_input_res = True
-                    h, w = img.shape[:2]
+                h, w = img.shape[:2]
+                res_key = (w, h)
+                if res_key != last_logged_res:
+                    last_logged_res = res_key
                     print(f"[WebRTC:{self.session_id}] Input resolution: {w}×{h}")
                 with self._input_lock:
                     self._latest_input = img
