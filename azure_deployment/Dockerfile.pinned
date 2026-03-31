@@ -1,0 +1,105 @@
+# ===================================================================
+# REPRODUCIBLE BUILD — Exact replica of T4 Debug container
+# Built: 2026-03-26T17:31:57Z | Source: 8396272 (nandeeswar-webrtc)
+# Base: nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04
+# ===================================================================
+# Usage:
+#   docker build -f Dockerfile.pinned -t doctor-preview-v2:debug-backup .
+#   docker run --gpus all -p 8765:8765 \
+#     -e EXECUTION_PROVIDER=CUDAExecutionProvider \
+#     -e ENABLE_WEBRTC=true \
+#     -e ENABLE_LIPSYNC=true \
+#     -e JPEG_QUALITY=90 \
+#     -e ENABLE_GFPGAN=true \
+#     -e ENABLE_SEAMLESS_CLONE=true \
+#     -e ENABLE_TEMPORAL_SMOOTHING=true \
+#     -e FACE_MASK_BLUR=25 \
+#     -e FACE_MASK_SCALE=1.1 \
+#     -e SMOOTHING_ALPHA=0.4 \
+#     -e MAX_FACES=1 \
+#     -e TARGET_FPS=24 \
+#     doctor-preview-v2:debug-backup
+# ===================================================================
+
+FROM nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04
+
+ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENV NV_PYLIB=/usr/local/lib/python3.11/dist-packages/nvidia
+ENV LD_LIBRARY_PATH=${NV_PYLIB}/cudnn/lib:${NV_PYLIB}/cublas/lib:${NV_PYLIB}/cuda_runtime/lib:${NV_PYLIB}/cufft/lib:${NV_PYLIB}/cusolver/lib:${NV_PYLIB}/cusparse/lib:/usr/local/cuda-12.1/lib64
+
+WORKDIR /app
+
+# System dependencies — identical to Debug image layer
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-venv \
+    python3.11-dev \
+    python3-pip \
+    build-essential \
+    g++ \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libturbojpeg \
+    ffmpeg \
+    wget \
+    curl \
+    git \
+    libavcodec-dev libavformat-dev libavutil-dev \
+    libopus-dev libvpx-dev libsrtp2-dev \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python \
+    && python3 -m ensurepip --upgrade \
+    && python3 -m pip install --upgrade pip setuptools wheel \
+    && rm -rf /var/lib/apt/lists/*
+
+# Step 1: Cython + numpy (insightface build deps) — pinned
+RUN python3 -m pip install --no-cache-dir "Cython==0.29.37" "numpy==1.26.4"
+
+# Step 2: insightface from source, no build isolation
+RUN python3 -m pip install --no-cache-dir --no-build-isolation --no-deps insightface==0.7.3
+
+# Step 3: onnxruntime-gpu from Microsoft CUDA 12 feed — pinned
+RUN python3 -m pip uninstall -y onnxruntime onnxruntime-gpu 2>/dev/null || true \
+    && python3 -m pip install --no-cache-dir onnxruntime-gpu==1.20.1 \
+    --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
+
+# Step 4: Install pinned dependencies with constraints
+COPY requirements-pinned.txt .
+COPY constraints.txt .
+RUN python3 -m pip install --no-cache-dir -c constraints.txt -r requirements-pinned.txt
+
+# Step 5: Re-pin onnxruntime-gpu (gfpgan/basicsr may overwrite with CPU version)
+RUN python3 -m pip uninstall -y onnxruntime 2>/dev/null || true \
+    && python3 -m pip install --no-cache-dir --force-reinstall onnxruntime-gpu==1.20.1 \
+    --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
+
+# Step 6: Force CUDA 12 cuDNN/cuBLAS — remove any CUDA 13 contamination
+RUN python3 -m pip uninstall -y nvidia-cudnn-cu13 nvidia-cublas 2>/dev/null || true \
+    && python3 -m pip install --no-cache-dir nvidia-cudnn-cu12==9.1.0.70 nvidia-cublas-cu12==12.9.2.10
+
+# Step 7: Pin numpy back to 1.x
+RUN python3 -m pip install --no-cache-dir "numpy==1.26.4"
+
+# Copy application source
+COPY src/ ./src/
+
+# Non-root user
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8765
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:8765/health || exit 1
+
+WORKDIR /app/src
+CMD ["python3", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8765", "--workers", "1"]
