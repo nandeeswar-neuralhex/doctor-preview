@@ -23,7 +23,9 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     const [qualityPreset, setQualityPreset] = useState(DEFAULT_QUALITY);
     const qualityRef = useRef(QUALITY_PRESETS[DEFAULT_QUALITY]);
     const [lipSyncEnabled, setLipSyncEnabled] = useState(true);
-    const [audioDelayMs, setAudioDelayMs] = useState(300);
+    const [autoSyncAudio, setAutoSyncAudio] = useState(true);
+    const [extraAudioDelayMs, setExtraAudioDelayMs] = useState(0);
+    const audioDelayMs = autoSyncAudio ? latency + extraAudioDelayMs : extraAudioDelayMs;
     const [exposureAdjust, setExposureAdjust] = useState(0);
     const [diagnostics, setDiagnostics] = useState({
         health: null,
@@ -204,6 +206,9 @@ window.addEventListener('beforeunload', () => bc.close());
                 audioTracks: remoteStream.getAudioTracks().length
             }
         }));
+    }, (rtt) => {
+        // onLatency callback from WebRTC data channel ping/pong
+        setLatency(rtt);
     });
 
     // Attach remote stream to video element once it renders (WebRTC ontrack
@@ -763,35 +768,6 @@ window.addEventListener('beforeunload', () => bc.close());
         return () => { active = false; };
     }, [isStreaming, isConnected, isWsConnected]);
 
-    // Measure round-trip latency via WebRTC stats
-    useEffect(() => {
-        if (!isStreaming || !isConnected) {
-            setLatency(0);
-            return;
-        }
-
-        // Poll RTCPeerConnection stats every 2 seconds
-        const interval = setInterval(async () => {
-            try {
-                // Access peer connection from the hook's internal ref isn't possible,
-                // so we estimate latency from frame timestamps
-                const video = processedVideoRef.current;
-                if (video && video.getVideoPlaybackQuality) {
-                    const quality = video.getVideoPlaybackQuality();
-                    // Use totalVideoFrames vs droppedVideoFrames as a proxy
-                    const dropped = quality.droppedVideoFrames || 0;
-                    const total = quality.totalVideoFrames || 1;
-                    const dropRate = (dropped / total) * 100;
-                    // If drop rate > 10%, latency is likely high
-                    if (dropRate > 10) setLatency(prev => Math.min(prev + 5, 500));
-                    else setLatency(prev => Math.max(prev - 5, 0));
-                }
-            } catch (_) { /* ignore */ }
-        }, 2000);
-
-        return () => clearInterval(interval);
-    }, [isStreaming, isConnected]);
-
     const handleStart = async () => {
         if (!serverUrl) {
             alert('Please set server URL in settings first');
@@ -1046,17 +1022,28 @@ window.addEventListener('beforeunload', () => bc.close());
                     Lip Sync
                 </label>
                 <div className="flex items-center gap-2 text-xs md:text-sm text-gray-300">
-                    <span className="whitespace-nowrap">Delay:</span>
+                    <label className="flex items-center gap-1 whitespace-nowrap cursor-pointer">
+                        <input
+                            type="checkbox"
+                            checked={autoSyncAudio}
+                            onChange={(e) => setAutoSyncAudio(e.target.checked)}
+                            className="accent-blue-500"
+                        />
+                        Auto Sync
+                    </label>
+                    <span className="whitespace-nowrap">+</span>
                     <input
                         type="range"
                         min="0"
                         max="1000"
                         step="50"
-                        value={audioDelayMs}
-                        onChange={(e) => setAudioDelayMs(Number(e.target.value))}
+                        value={extraAudioDelayMs}
+                        onChange={(e) => setExtraAudioDelayMs(Number(e.target.value))}
                         className="w-16 md:w-24 accent-blue-500"
                     />
-                    <span className="font-mono text-blue-400 font-semibold text-right">{audioDelayMs}ms</span>
+                    <span className="font-mono text-blue-400 font-semibold text-right whitespace-nowrap">
+                        {autoSyncAudio ? `${latency}+${extraAudioDelayMs}=` : ''}{audioDelayMs}ms
+                    </span>
                 </div>
                 <div className="flex items-center gap-2 text-xs md:text-sm text-gray-300">
                     <span className="whitespace-nowrap">Exposure:</span>

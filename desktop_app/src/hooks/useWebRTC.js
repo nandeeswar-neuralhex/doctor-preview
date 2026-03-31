@@ -1,11 +1,24 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import QUALITY_PRESETS from '../qualityPresets';
 
-function useWebRTC(serverUrl, sessionId, onRemoteStream) {
+function useWebRTC(serverUrl, sessionId, onRemoteStream, onLatency) {
     const pcRef = useRef(null);
+    const dcRef = useRef(null);          // data channel for ping/pong
+    const pingIntervalRef = useRef(null);
+    const latencyPollRef = useRef(null); // video pipeline stats poller
+    const onLatencyRef = useRef(onLatency);
+    // Previous stats for differential calculations
+    const prevStatsRef = useRef({
+        jitterBufferDelay: 0, jitterBufferEmittedCount: 0,
+        totalPacketSendDelay: 0, packetsSent: 0,
+        lastFrameTime: 0, lastBaseLatency: 0,
+    });
     const [error, setError] = useState(null);
     const [isConnected, setIsConnected] = useState(false);
     const [connectionState, setConnectionState] = useState('new');
+
+    // Keep onLatency ref fresh across renders
+    useEffect(() => { onLatencyRef.current = onLatency; }, [onLatency]);
 
     /**
      * Apply bitrate / resolution constraints to all video senders.
@@ -61,6 +74,89 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream) {
             const pc = new RTCPeerConnection({
                 iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
             });
+
+            // ── Data channel (kept for future server-side echo) ──
+            const dc = pc.createDataChannel('latency', { ordered: false, maxRetransmits: 0 });
+            dc.onclose = () => {
+                if (pingIntervalRef.current) {
+                    clearInterval(pingIntervalRef.current);
+                    pingIntervalRef.current = null;
+                }
+            };
+            dcRef.current = dc;
+
+            // ── Video pipeline latency measurement ──
+            // ── Video pipeline latency measurement ──
+            // Measures the REAL end-to-end delay by combining:
+            //   1. Outbound send delay — time video packets sit in the upload queue
+            //      (on bad uplink this grows to SECONDS — STUN RTT misses this)
+            //   2. ICE RTT — network round trip (for the actual transit, not queuing)
+            //   3. Inbound jitter buffer — time frames wait before being displayed
+            //   4. ~75ms server GPU processing
+            // Also detects video stalls: when no new frames arrive, latency keeps
+            // climbing (just like WebSocket timestamp would show).
+            prevStatsRef.current = {
+                jitterBufferDelay: 0, jitterBufferEmittedCount: 0,
+                totalPacketSendDelay: 0, packetsSent: 0,
+                lastFrameTime: Date.now(), lastBaseLatency: 0,
+            };
+            latencyPollRef.current = setInterval(async () => {
+                try {
+                    const stats = await pc.getStats();
+                    let iceRttMs = 0;
+                    let jbDelayMs = 0;
+                    let sendDelayMs = 0;
+                    let inboundHasNewFrames = false;
+
+                    for (const report of stats.values()) {
+                        // Network RTT from ICE candidate pair
+                        if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.currentRoundTripTime != null) {
+                            iceRttMs = report.currentRoundTripTime * 1000;
+                        }
+
+                        // OUTBOUND: send queue delay (large frames queue on bad uplink)
+                        if (report.type === 'outbound-rtp' && report.kind === 'video' && report.totalPacketSendDelay != null) {
+                            const prev = prevStatsRef.current;
+                            const deltaSendDelay = report.totalPacketSendDelay - prev.totalPacketSendDelay;
+                            const deltaPkts = report.packetsSent - prev.packetsSent;
+                            if (deltaPkts > 0) {
+                                sendDelayMs = (deltaSendDelay / deltaPkts) * 1000;
+                            }
+                            prevStatsRef.current.totalPacketSendDelay = report.totalPacketSendDelay;
+                            prevStatsRef.current.packetsSent = report.packetsSent;
+                        }
+
+                        // INBOUND: jitter buffer delay on received processed video
+                        if (report.type === 'inbound-rtp' && report.kind === 'video') {
+                            const prev = prevStatsRef.current;
+                            const deltaDelay = report.jitterBufferDelay - prev.jitterBufferDelay;
+                            const deltaCount = report.jitterBufferEmittedCount - prev.jitterBufferEmittedCount;
+                            if (deltaCount > 0) {
+                                jbDelayMs = (deltaDelay / deltaCount) * 1000;
+                                inboundHasNewFrames = true;
+                            }
+                            prevStatsRef.current.jitterBufferDelay = report.jitterBufferDelay;
+                            prevStatsRef.current.jitterBufferEmittedCount = report.jitterBufferEmittedCount;
+                        }
+                    }
+
+                    if (inboundHasNewFrames) {
+                        // Normal: compute full pipeline latency
+                        // send_queue + network_RTT + server_GPU + receive_jitter_buffer
+                        const totalLatency = Math.round(sendDelayMs + iceRttMs + 75 + jbDelayMs);
+                        prevStatsRef.current.lastFrameTime = Date.now();
+                        prevStatsRef.current.lastBaseLatency = totalLatency;
+                        if (onLatencyRef.current) onLatencyRef.current(totalLatency);
+                    } else {
+                        // Video stalled: no new frames emitted from jitter buffer.
+                        // Latency = time since last frame + last known pipeline delay.
+                        // This climbs in real-time during stalls, matching what the user sees.
+                        const stallMs = Date.now() - prevStatsRef.current.lastFrameTime;
+                        const totalLatency = Math.round(prevStatsRef.current.lastBaseLatency + stallMs);
+                        if (onLatencyRef.current) onLatencyRef.current(totalLatency);
+                    }
+                } catch (_) { /* ignore */ }
+            }, 1000);
 
             localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
 
@@ -148,6 +244,18 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream) {
     }, [serverUrl, sessionId, onRemoteStream, applyQuality]);
 
     const disconnect = useCallback(() => {
+        if (pingIntervalRef.current) {
+            clearInterval(pingIntervalRef.current);
+            pingIntervalRef.current = null;
+        }
+        if (latencyPollRef.current) {
+            clearInterval(latencyPollRef.current);
+            latencyPollRef.current = null;
+        }
+        if (dcRef.current) {
+            try { dcRef.current.close(); } catch (_) {}
+            dcRef.current = null;
+        }
         if (pcRef.current) {
             pcRef.current.close();
             pcRef.current = null;
