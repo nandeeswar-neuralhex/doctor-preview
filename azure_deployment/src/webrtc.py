@@ -162,28 +162,96 @@ class AudioBuffer:
         return bytes(self._buffer), self._sample_rate
 
 
-class AudioRelayTrack(MediaStreamTrack):
-    """Relay incoming audio back to the client unchanged.
+class SyncClock:
+    """Tracks video processing latency so audio can be delayed to match.
 
-    This keeps the audio in the same WebRTC session as the processed video,
-    so the browser's built-in RTCP sync mechanism keeps them aligned.
-    Also feeds each frame into the AudioBuffer for lip-sync processing.
+    Without this, audio passes through in ~0ms while video takes ~100ms
+    for face-swap, causing audio to arrive before the matching video frame.
+    The measured delay is smoothed with an EMA to avoid jitter.
+    """
+    def __init__(self, initial_delay_s: float = 0.1):
+        self._delay = initial_delay_s
+        self._lock = threading.Lock()
+
+    @property
+    def delay(self) -> float:
+        with self._lock:
+            return self._delay
+
+    def update(self, measured_s: float):
+        with self._lock:
+            clamped = max(0.02, min(0.5, measured_s))
+            self._delay = 0.7 * self._delay + 0.3 * clamped
+
+
+class AudioRelayTrack(MediaStreamTrack):
+    """Relay incoming audio back to the client, delayed to match video processing.
+
+    Without delay, audio arrives ~100ms before the processed video because
+    face-swap takes ~70-100ms while audio passes through instantly.
+    This track buffers audio frames and releases them after the measured
+    video pipeline latency, keeping audio and video in sync.
     """
     kind = "audio"
 
-    def __init__(self, track: MediaStreamTrack, audio_buffer: AudioBuffer):
+    def __init__(self, track: MediaStreamTrack, audio_buffer: AudioBuffer, sync_clock: SyncClock):
         super().__init__()
         self.track = track
         self.audio_buffer = audio_buffer
+        self._sync_clock = sync_clock
+        self._queue: Optional[asyncio.Queue] = None
+        self._reader_task = None
+        self._started = False
+        self._log_count = 0
+
+    async def _read_loop(self):
+        """Continuously read audio frames and enqueue with arrival timestamp."""
+        try:
+            while True:
+                frame = await self.track.recv()
+                self.audio_buffer.append(frame)
+                arrival = time.monotonic()
+                try:
+                    self._queue.put_nowait((arrival, frame))
+                except asyncio.QueueFull:
+                    # Drop oldest frame if queue backs up
+                    try:
+                        self._queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                    try:
+                        self._queue.put_nowait((arrival, frame))
+                    except asyncio.QueueFull:
+                        pass
+        except Exception:
+            pass
 
     async def recv(self) -> AudioFrame:
-        frame = await self.track.recv()
-        # Feed into buffer for lip sync (non-blocking, same as before)
-        self.audio_buffer.append(frame)
-        # Return the exact same frame — zero processing, zero delay
+        if not self._started:
+            self._started = True
+            self._queue = asyncio.Queue(maxsize=200)
+            self._reader_task = asyncio.ensure_future(self._read_loop())
+
+        arrival, frame = await self._queue.get()
+
+        # Hold the frame until it's been waiting as long as video processing takes
+        target_delay = self._sync_clock.delay
+        elapsed = time.monotonic() - arrival
+        remaining = target_delay - elapsed
+        if remaining > 0.001:
+            await asyncio.sleep(remaining)
+
+        # Log every ~150 frames (~3s at 48kHz/960 samples per Opus frame)
+        self._log_count += 1
+        if self._log_count % 150 == 0:
+            actual_hold = time.monotonic() - arrival
+            print(f"[AudioSync] target={target_delay*1000:.0f}ms  held={actual_hold*1000:.0f}ms  queue={self._queue.qsize()}")
+
         return frame
 
     def stop(self):
+        if self._reader_task:
+            self._reader_task.cancel()
         super().stop()
 
 
@@ -210,6 +278,7 @@ class VideoTransformTrack(MediaStreamTrack):
         audio_buffer: AudioBuffer,
         session_settings: Optional[Dict[str, dict]] = None,
         target_bitrate: Optional[int] = None,
+        sync_clock: Optional[SyncClock] = None,
     ):
         super().__init__()
         self.track = track
@@ -219,9 +288,11 @@ class VideoTransformTrack(MediaStreamTrack):
         self.audio_buffer = audio_buffer
         self.session_settings = session_settings or {}
         self._target_bitrate = target_bitrate  # from client SDP b=AS hint
+        self._sync_clock = sync_clock
 
         # Shared state between input reader, GPU worker, and output
         self._latest_input = None       # latest raw frame (numpy BGR)
+        self._latest_input_time = 0.0   # monotonic time when input was captured
         self._latest_result = None      # latest processed frame (numpy BGR)
         self._input_lock = threading.Lock()
         self._result_lock = threading.Lock()
@@ -262,6 +333,7 @@ class VideoTransformTrack(MediaStreamTrack):
 
             with self._input_lock:
                 img = self._latest_input
+                input_time = self._latest_input_time
             if img is None:
                 continue
 
@@ -308,6 +380,13 @@ class VideoTransformTrack(MediaStreamTrack):
                 self._latest_result = result
             self._swap_count += 1
 
+            # Measure full pipeline delay (input capture → result ready)
+            # and add FRAME_INTERVAL because recv() sleeps one frame period.
+            # This tells AudioRelayTrack exactly how long to hold audio.
+            if self._sync_clock and input_time > 0:
+                pipeline_delay = time.monotonic() - input_time + self.FRAME_INTERVAL
+                self._sync_clock.update(pipeline_delay)
+
             # Signal the output that a new result is ready
             if self._loop:
                 self._loop.call_soon_threadsafe(self._result_event.set)
@@ -326,6 +405,7 @@ class VideoTransformTrack(MediaStreamTrack):
                     print(f"[WebRTC:{self.session_id}] Input resolution: {w}×{h}")
                 with self._input_lock:
                     self._latest_input = img
+                    self._latest_input_time = time.monotonic()
                 self._has_input.set()
         except Exception:
             pass
@@ -365,7 +445,8 @@ class VideoTransformTrack(MediaStreamTrack):
             out_fps = self._out_count / elapsed
             swap_fps = self._swap_count / elapsed
             h, w = result.shape[:2]
-            print(f"[WebRTC:{self.session_id}] output={out_fps:.1f}fps  swap={swap_fps:.1f}fps  res={w}×{h}")
+            sync_ms = self._sync_clock.delay * 1000 if self._sync_clock else 0
+            print(f"[WebRTC:{self.session_id}] output={out_fps:.1f}fps  swap={swap_fps:.1f}fps  res={w}×{h}  audio_delay={sync_ms:.0f}ms")
             self._out_count = 0
             self._swap_count = 0
             self._last_log = now
@@ -413,16 +494,18 @@ class WebRTCManager:
         self.pcs[session_id] = pc
 
         audio_buffer = AudioBuffer()
+        sync_clock = SyncClock(initial_delay_s=0.1)
+        print(f"[WebRTC:{session_id}] Audio sync enabled — audio will be delayed to match video processing")
 
         @pc.on("track")
         def on_track(track: MediaStreamTrack):
             if track.kind == "audio":
-                # Relay audio back to the client via WebRTC so the browser
-                # keeps it in sync with the processed video automatically.
-                # The relay track also feeds the AudioBuffer for lip sync.
+                # Relay audio back to the client, delayed by the measured
+                # video processing time so they arrive in sync.
                 local_audio = AudioRelayTrack(
                     self.relay.subscribe(track),
                     audio_buffer,
+                    sync_clock,
                 )
                 pc.addTrack(local_audio)
             elif track.kind == "video":
@@ -434,6 +517,7 @@ class WebRTCManager:
                     audio_buffer,
                     self.session_settings,
                     target_bitrate=client_bitrate,
+                    sync_clock=sync_clock,
                 )
                 pc.addTrack(local_video)
 
