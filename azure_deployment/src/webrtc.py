@@ -188,11 +188,25 @@ class FrameLogger:
 class SyncClock:
     """Tracks video processing latency so audio can be delayed to match.
 
-    Without this, audio passes through in ~0ms while video takes ~100ms
-    for face-swap, causing audio to arrive before the matching video frame.
-    The measured delay is smoothed with an EMA to avoid jitter.
+    Asymmetric EMA:
+    - Latency INCREASES (GPU stall / spike): adapt FAST (alpha=0.4)
+      → audio delay catches up in 2-3 video frames (~0.3s)
+      → prevents audio arriving before video
+    - Latency DECREASES (recovery): adapt SLOW (alpha=0.97)
+      → audio delay eases down over ~50 frames (~5s)
+      → effect: audio trails video by a few ms during recovery
+      → this is imperceptible and prevents the garbling that
+        happens when delay drops faster than audio can adapt
+
+    The client-side effect of the slow decrease:
+    Each 20ms audio frame is held slightly less than the previous one.
+    Over 5 seconds, the effective playback speedup is ~3% — inaudible.
+    Compare to instant delay changes which cause 20-50% speed jumps → garbled.
     """
-    def __init__(self, initial_delay_s: float = 0.1):
+    # VP8 encode + RTP packetization overhead (not measured in pipeline_delay)
+    ENCODE_OVERHEAD_S = 0.015
+
+    def __init__(self, initial_delay_s: float = 0.15):
         self._delay = initial_delay_s
         self._lock = threading.Lock()
 
@@ -202,38 +216,79 @@ class SyncClock:
             return self._delay
 
     def update(self, measured_s: float):
+        """Update with measured pipeline delay from VideoTransformTrack."""
         with self._lock:
-            clamped = max(0.02, min(0.5, measured_s))
-            self._delay = 0.7 * self._delay + 0.3 * clamped
+            clamped = max(0.04, min(0.8, measured_s + self.ENCODE_OVERHEAD_S))
+            if clamped > self._delay:
+                # Latency INCREASED → adapt fast to prevent audio-before-video
+                self._delay = 0.4 * self._delay + 0.6 * clamped
+            else:
+                # Latency DECREASED → adapt slowly to prevent audio garbling
+                self._delay = 0.97 * self._delay + 0.03 * clamped
 
 
 class AudioRelayTrack(MediaStreamTrack):
-    """Simple audio passthrough — no artificial delay.
+    """Relay audio back to client, delayed to match video processing latency.
 
-    How A/V sync works without any manual delay:
-    - Server relays audio with <1ms processing overhead
-    - Server face-swaps video with ~130ms GPU delay
-    - Both senders emit RTCP Sender Reports with current NTP wallclock time
-    - Chrome receiver sees audio RTCP SR is ~130ms "earlier" than video RTCP SR
-    - Chrome's built-in A/V synchronizer holds audio back by ~130ms to match video
-    - Result: lip-synced output at the <video> element, zero JavaScript delay code
+    Architecture:
+    - _read_loop(): continuously reads audio frames, enqueues with arrival timestamp
+    - recv(): dequeues and holds each frame until sync_clock.delay has elapsed
 
-    This is the same mechanism Google Meet uses. The jitter buffer handles all
-    latency swings (300ms→1000ms→300ms) automatically with no audio artifacts.
+    Each 20ms audio chunk is independently held for the target delay.
+    When delay changes via asymmetric EMA:
+    - Increase (300→500ms): next audio frame held 200ms longer. Sounds like
+      a tiny pause (~200ms) — same as network jitter, handled by client jitter buffer.
+    - Decrease (500→300ms): each successive frame held ~1ms less than previous.
+      Over ~5 seconds, all frames arrive ~3% faster — completely inaudible.
     """
     kind = "audio"
 
-    def __init__(self, track: MediaStreamTrack, audio_buffer: AudioBuffer):
+    def __init__(self, track: MediaStreamTrack, audio_buffer: AudioBuffer, sync_clock: SyncClock):
         super().__init__()
         self.track = track
         self.audio_buffer = audio_buffer
+        self._sync_clock = sync_clock
+        self._queue: Optional[asyncio.Queue] = None
+        self._reader_task = None
+        self._started = False
+        self._log_count = 0
+
+    async def _read_loop(self):
+        """Continuously read audio frames and enqueue with arrival timestamp."""
+        try:
+            while True:
+                frame = await self.track.recv()
+                self.audio_buffer.append(frame)
+                await self._queue.put((time.monotonic(), frame))
+        except Exception:
+            pass
 
     async def recv(self) -> AudioFrame:
-        frame = await self.track.recv()
-        self.audio_buffer.append(frame)
+        if not self._started:
+            self._started = True
+            self._queue = asyncio.Queue()  # unbounded — frames are tiny (20ms)
+            self._reader_task = asyncio.ensure_future(self._read_loop())
+
+        arrival, frame = await self._queue.get()
+
+        # Hold frame until sync_clock.delay time has passed since arrival
+        target_delay = self._sync_clock.delay
+        elapsed = time.monotonic() - arrival
+        remaining = target_delay - elapsed
+        if remaining > 0.001:
+            await asyncio.sleep(remaining)
+
+        # Periodic stdout log (every ~3 seconds at 48kHz/960 samples = 50 fps)
+        self._log_count += 1
+        if self._log_count % 150 == 0:
+            actual_hold = time.monotonic() - arrival
+            print(f"[AudioSync] target={target_delay*1000:.0f}ms  held={actual_hold*1000:.0f}ms  queue={self._queue.qsize()}")
+
         return frame
 
     def stop(self):
+        if self._reader_task:
+            self._reader_task.cancel()
         super().stop()
 
 
@@ -486,19 +541,17 @@ class WebRTCManager:
         self.pcs[session_id] = pc
 
         audio_buffer = AudioBuffer()
+        sync_clock = SyncClock(initial_delay_s=0.15)
         frame_logger = FrameLogger(f"/tmp/frame_log_{session_id}.csv")
-        print(f"[WebRTC:{session_id}] Audio relay enabled — browser A/V sync via RTCP SR")
+        print(f"[WebRTC:{session_id}] Audio sync: server-side delay, asymmetric EMA, initial=150ms")
 
         @pc.on("track")
         def on_track(track: MediaStreamTrack):
             if track.kind == "audio":
-                # Simple passthrough — no artificial delay.
-                # Chrome's jitter buffer syncs audio to video automatically via
-                # RTCP Sender Reports. It sees video arrives ~130ms after audio
-                # (face-swap processing time) and holds audio back to match.
                 local_audio = AudioRelayTrack(
                     self.relay.subscribe(track),
                     audio_buffer,
+                    sync_clock,
                 )
                 pc.addTrack(local_audio)
             elif track.kind == "video":
@@ -510,7 +563,7 @@ class WebRTCManager:
                     audio_buffer,
                     self.session_settings,
                     target_bitrate=client_bitrate,
-                    sync_clock=None,
+                    sync_clock=sync_clock,
                     frame_logger=frame_logger,
                 )
                 pc.addTrack(local_video)
