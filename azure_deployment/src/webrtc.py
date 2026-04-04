@@ -39,13 +39,7 @@ from av import VideoFrame, AudioFrame
 
 from face_swapper import FaceSwapper
 from lip_syncer import LipSyncer
-from config import (
-    ENABLE_LIPSYNC,
-    LIPSYNC_AUDIO_WINDOW_MS,
-    WEBRTC_SYNC_MAX_DELAY_MS,
-    WEBRTC_SYNC_MIN_DELAY_MS,
-    WEBRTC_SYNC_SAFETY_MARGIN_MS,
-)
+from config import ENABLE_LIPSYNC, LIPSYNC_AUDIO_WINDOW_MS
 
 # ── Monkey-patch aiortc's VP8 encoder for higher quality ──
 # aiortc defaults: qmax=56, cpu-used=-6 (fastest/ugliest), 500 Kbps.
@@ -168,44 +162,6 @@ class AudioBuffer:
         return bytes(self._buffer), self._sample_rate
 
 
-class AVSyncController:
-    """Shared playout delay for outbound audio/video.
-
-    Audio is buffered to match the face-swap video processing delay. Video uses
-    the same shared playout target instead of inventing its own 30 FPS clock.
-    """
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._min_delay_s = WEBRTC_SYNC_MIN_DELAY_MS / 1000.0
-        self._max_delay_s = WEBRTC_SYNC_MAX_DELAY_MS / 1000.0
-        self._safety_margin_s = WEBRTC_SYNC_SAFETY_MARGIN_MS / 1000.0
-        self._target_delay_s = self._min_delay_s
-
-    def observe_video_processing_delay(self, processing_delay_s: float) -> float:
-        desired_delay_s = min(
-            self._max_delay_s,
-            max(self._min_delay_s, processing_delay_s + self._safety_margin_s),
-        )
-        with self._lock:
-            if desired_delay_s > self._target_delay_s:
-                self._target_delay_s = desired_delay_s
-            else:
-                # Decay slowly so audio/video stay locked even when processing time jitters.
-                self._target_delay_s = max(
-                    self._min_delay_s,
-                    (self._target_delay_s * 0.98) + (desired_delay_s * 0.02),
-                )
-            return self._target_delay_s
-
-    def current_delay_s(self) -> float:
-        with self._lock:
-            return self._target_delay_s
-
-    def play_at(self, captured_at: float) -> float:
-        return captured_at + self.current_delay_s()
-
-
 class AudioRelayTrack(MediaStreamTrack):
     """Relay incoming audio back to the client unchanged.
 
@@ -215,36 +171,16 @@ class AudioRelayTrack(MediaStreamTrack):
     """
     kind = "audio"
 
-    def __init__(self, track: MediaStreamTrack, audio_buffer: AudioBuffer, av_sync: AVSyncController):
+    def __init__(self, track: MediaStreamTrack, audio_buffer: AudioBuffer):
         super().__init__()
         self.track = track
         self.audio_buffer = audio_buffer
-        self.av_sync = av_sync
-        self._pts = 0
-        self._time_base: Optional[Fraction] = None
-        self._sample_rate: Optional[int] = None
-        self._frame_count = 0
 
     async def recv(self) -> AudioFrame:
         frame = await self.track.recv()
-        self._frame_count += 1
-        if self._frame_count <= 5 or self._frame_count % 500 == 0:
-            print(f"[AudioRelay] recv frame #{self._frame_count}: samples={frame.samples}, rate={frame.sample_rate}, format={frame.format.name}")
-        captured_at = time.monotonic()
         # Feed into buffer for lip sync (non-blocking, same as before)
         self.audio_buffer.append(frame)
-
-        play_delay_s = self.av_sync.play_at(captured_at) - time.monotonic()
-        if play_delay_s > 0:
-            await asyncio.sleep(play_delay_s)
-
-        if self._sample_rate != frame.sample_rate or self._time_base is None:
-            self._sample_rate = frame.sample_rate
-            self._time_base = Fraction(1, frame.sample_rate)
-
-        frame.pts = self._pts
-        frame.time_base = self._time_base
-        self._pts += frame.samples
+        # Return the exact same frame — zero processing, zero delay
         return frame
 
     def stop(self):
@@ -272,7 +208,6 @@ class VideoTransformTrack(MediaStreamTrack):
         lip_syncer: Optional[LipSyncer],
         session_id: str,
         audio_buffer: AudioBuffer,
-        av_sync: AVSyncController,
         session_settings: Optional[Dict[str, dict]] = None,
         target_bitrate: Optional[int] = None,
     ):
@@ -282,21 +217,20 @@ class VideoTransformTrack(MediaStreamTrack):
         self.lip_syncer = lip_syncer
         self.session_id = session_id
         self.audio_buffer = audio_buffer
-        self.av_sync = av_sync
         self.session_settings = session_settings or {}
         self._target_bitrate = target_bitrate  # from client SDP b=AS hint
 
         # Shared state between input reader, GPU worker, and output
-        self._latest_input = None       # latest raw frame bundle
-        self._latest_result = None      # latest processed frame bundle
+        self._latest_input = None       # latest raw frame (numpy BGR)
+        self._latest_result = None      # latest processed frame (numpy BGR)
         self._input_lock = threading.Lock()
         self._result_lock = threading.Lock()
         self._result_event = asyncio.Event()
 
         # Output timing
+        self._pts = 0
         self._time_base = Fraction(1, 90000)
-        self._first_play_at = None
-        self._last_pts = -1
+        self._pts_step = int(self.FRAME_INTERVAL / self._time_base)
         self._started = False
 
         # Stats
@@ -327,12 +261,9 @@ class VideoTransformTrack(MediaStreamTrack):
             self._has_input.clear()
 
             with self._input_lock:
-                input_item = self._latest_input
-            if input_item is None:
+                img = self._latest_input
+            if img is None:
                 continue
-
-            img = input_item["image"]
-            captured_at = input_item["captured_at"]
 
             # Normalize to exactly TARGET_HEIGHT (e.g. 540p) regardless of input.
             # WebRTC auto-negotiates resolution upward (360→540→720→1080) as
@@ -373,16 +304,8 @@ class VideoTransformTrack(MediaStreamTrack):
                                 result, (x1, y1, x2, y2), synced
                             )
 
-            ready_at = time.monotonic()
-            processing_delay_s = ready_at - captured_at
-            target_delay_s = self.av_sync.observe_video_processing_delay(processing_delay_s)
-            play_at = captured_at + target_delay_s
-
             with self._result_lock:
-                self._latest_result = {
-                    "image": result,
-                    "play_at": play_at,
-                }
+                self._latest_result = result
             self._swap_count += 1
 
             # Signal the output that a new result is ready
@@ -396,17 +319,13 @@ class VideoTransformTrack(MediaStreamTrack):
             while not self._stop.is_set():
                 frame = await self.track.recv()
                 img = frame.to_ndarray(format="bgr24")
-                captured_at = time.monotonic()
                 h, w = img.shape[:2]
                 res_key = (w, h)
                 if res_key != last_logged_res:
                     last_logged_res = res_key
                     print(f"[WebRTC:{self.session_id}] Input resolution: {w}×{h}")
                 with self._input_lock:
-                    self._latest_input = {
-                        "image": img,
-                        "captured_at": captured_at,
-                    }
+                    self._latest_input = img
                 self._has_input.set()
         except Exception:
             pass
@@ -426,32 +345,17 @@ class VideoTransformTrack(MediaStreamTrack):
 
         # Get latest processed result
         with self._result_lock:
-            result_item = self._latest_result
+            result = self._latest_result
 
-        if result_item is None:
+        if result is None:
             # Shouldn't happen, but fallback to a black frame
             result = np.zeros((480, 640, 3), dtype=np.uint8)
-            play_at = time.monotonic()
-        else:
-            result = result_item["image"]
-            play_at = result_item["play_at"]
 
-        wait_s = play_at - time.monotonic()
-        if wait_s > 0:
-            await asyncio.sleep(wait_s)
-
-        if self._first_play_at is None:
-            self._first_play_at = play_at
-
-        pts = int((play_at - self._first_play_at) / self._time_base)
-        if pts <= self._last_pts:
-            pts = self._last_pts + 1
-        self._last_pts = pts
-
-        # Build output frame on the shared delayed playout timeline.
+        # Build output frame at steady 30 FPS cadence
         new_frame = VideoFrame.from_ndarray(result, format="bgr24")
-        new_frame.pts = pts
+        new_frame.pts = self._pts
         new_frame.time_base = self._time_base
+        self._pts += self._pts_step
 
         # Periodic logging
         self._out_count += 1
@@ -465,6 +369,9 @@ class VideoTransformTrack(MediaStreamTrack):
             self._out_count = 0
             self._swap_count = 0
             self._last_log = now
+
+        # Pace output to ~30 FPS
+        await asyncio.sleep(self.FRAME_INTERVAL)
         return new_frame
 
     def stop(self):
@@ -506,25 +413,18 @@ class WebRTCManager:
         self.pcs[session_id] = pc
 
         audio_buffer = AudioBuffer()
-        av_sync = AVSyncController()
 
         @pc.on("track")
         def on_track(track: MediaStreamTrack):
-            print(f"[WebRTC:{session_id}] on_track fired — kind={track.kind}, id={track.id}")
             if track.kind == "audio":
                 # Relay audio back to the client via WebRTC so the browser
                 # keeps it in sync with the processed video automatically.
                 # The relay track also feeds the AudioBuffer for lip sync.
-                # Use relay.subscribe() so the raw track can be consumed by
-                # multiple readers (matching the video pattern).
-                relayed_audio = self.relay.subscribe(track)
                 local_audio = AudioRelayTrack(
-                    relayed_audio,
+                    self.relay.subscribe(track),
                     audio_buffer,
-                    av_sync,
                 )
                 pc.addTrack(local_audio)
-                print(f"[WebRTC:{session_id}] AudioRelayTrack added to peer connection")
             elif track.kind == "video":
                 local_video = VideoTransformTrack(
                     self.relay.subscribe(track),
@@ -532,7 +432,6 @@ class WebRTCManager:
                     self.lip_syncer,
                     session_id,
                     audio_buffer,
-                    av_sync,
                     self.session_settings,
                     target_bitrate=client_bitrate,
                 )
