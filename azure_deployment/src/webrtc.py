@@ -208,78 +208,32 @@ class SyncClock:
 
 
 class AudioRelayTrack(MediaStreamTrack):
-    """Relay incoming audio back to the client, delayed to match video processing.
+    """Simple audio passthrough — no artificial delay.
 
-    Without delay, audio arrives ~100ms before the processed video because
-    face-swap takes ~70-100ms while audio passes through instantly.
-    This track buffers audio frames and releases them after the measured
-    video pipeline latency, keeping audio and video in sync.
+    How A/V sync works without any manual delay:
+    - Server relays audio with <1ms processing overhead
+    - Server face-swaps video with ~130ms GPU delay
+    - Both senders emit RTCP Sender Reports with current NTP wallclock time
+    - Chrome receiver sees audio RTCP SR is ~130ms "earlier" than video RTCP SR
+    - Chrome's built-in A/V synchronizer holds audio back by ~130ms to match video
+    - Result: lip-synced output at the <video> element, zero JavaScript delay code
+
+    This is the same mechanism Google Meet uses. The jitter buffer handles all
+    latency swings (300ms→1000ms→300ms) automatically with no audio artifacts.
     """
     kind = "audio"
 
-    def __init__(self, track: MediaStreamTrack, audio_buffer: AudioBuffer, sync_clock: SyncClock, frame_logger: Optional[FrameLogger] = None):
+    def __init__(self, track: MediaStreamTrack, audio_buffer: AudioBuffer):
         super().__init__()
         self.track = track
         self.audio_buffer = audio_buffer
-        self._sync_clock = sync_clock
-        self._frame_logger = frame_logger
-        self._queue: Optional[asyncio.Queue] = None
-        self._reader_task = None
-        self._started = False
-        self._log_count = 0
-
-    async def _read_loop(self):
-        """Continuously read audio frames and enqueue with arrival timestamp."""
-        try:
-            while True:
-                frame = await self.track.recv()
-                self.audio_buffer.append(frame)
-                arrival = time.monotonic()
-                try:
-                    self._queue.put_nowait((arrival, frame))
-                except asyncio.QueueFull:
-                    # Drop oldest frame if queue backs up
-                    try:
-                        self._queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
-                    try:
-                        self._queue.put_nowait((arrival, frame))
-                    except asyncio.QueueFull:
-                        pass
-        except Exception:
-            pass
 
     async def recv(self) -> AudioFrame:
-        if not self._started:
-            self._started = True
-            self._queue = asyncio.Queue(maxsize=200)
-            self._reader_task = asyncio.ensure_future(self._read_loop())
-
-        arrival, frame = await self._queue.get()
-
-        # Hold the frame until it's been waiting as long as video processing takes
-        target_delay = self._sync_clock.delay
-        elapsed = time.monotonic() - arrival
-        remaining = target_delay - elapsed
-        if remaining > 0.001:
-            await asyncio.sleep(remaining)
-
-        # Per-frame CSV log
-        actual_hold = time.monotonic() - arrival
-        if self._frame_logger:
-            self._frame_logger.audio(actual_hold * 1000, target_delay * 1000, self._queue.qsize())
-
-        # Periodic stdout log
-        self._log_count += 1
-        if self._log_count % 150 == 0:
-            print(f"[AudioSync] target={target_delay*1000:.0f}ms  held={actual_hold*1000:.0f}ms  queue={self._queue.qsize()}")
-
+        frame = await self.track.recv()
+        self.audio_buffer.append(frame)
         return frame
 
     def stop(self):
-        if self._reader_task:
-            self._reader_task.cancel()
         super().stop()
 
 
@@ -533,23 +487,20 @@ class WebRTCManager:
 
         audio_buffer = AudioBuffer()
         frame_logger = FrameLogger(f"/tmp/frame_log_{session_id}.csv")
-        print(f"[WebRTC:{session_id}] Client-side audio sync — server sends video only")
+        print(f"[WebRTC:{session_id}] Audio relay enabled — browser A/V sync via RTCP SR")
 
         @pc.on("track")
         def on_track(track: MediaStreamTrack):
             if track.kind == "audio":
-                # Don't relay audio back — client handles its own audio
-                # delay via a local DelayNode (same proven approach as WS mode).
-                # We only consume audio for the lip-sync buffer.
-                relayed = self.relay.subscribe(track)
-                async def _consume_audio():
-                    try:
-                        while True:
-                            frame = await relayed.recv()
-                            audio_buffer.append(frame)
-                    except Exception:
-                        pass
-                asyncio.ensure_future(_consume_audio())
+                # Simple passthrough — no artificial delay.
+                # Chrome's jitter buffer syncs audio to video automatically via
+                # RTCP Sender Reports. It sees video arrives ~130ms after audio
+                # (face-swap processing time) and holds audio back to match.
+                local_audio = AudioRelayTrack(
+                    self.relay.subscribe(track),
+                    audio_buffer,
+                )
+                pc.addTrack(local_audio)
             elif track.kind == "video":
                 local_video = VideoTransformTrack(
                     self.relay.subscribe(track),

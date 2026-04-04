@@ -120,10 +120,11 @@ window.addEventListener('beforeunload', () => bc.close());
     const processedFrameFilter = `brightness(${Math.max(0.4, 1 + exposureAdjust / 100)})`;
 
     // Custom hooks for webcam and WebSocket
-    // Always use the local DelayNode for audio lip-sync. The server only sends
-    // face-swapped video back — audio sync is handled client-side via a
-    // WebAudio DelayNode calibrated to the measured video latency.
-    const skipVirtualAudio = false;
+    // In WebRTC mode, skip the virtual audio delay pipeline — the server
+    // relays audio back via a simple passthrough, and Chrome's built-in A/V
+    // sync (RTCP Sender Reports) holds audio to match the ~130ms video delay.
+    // The processed <video> element's audio is routed to BlackHole via setSinkId.
+    const skipVirtualAudio = transportMode === 'webrtc';
     const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true, audioDelayMs, skipVirtualAudio);
     // WebSocket hook – render into the dedicated <img> ref
     const handleWsFrame = useCallback((frameData, wsLatency, isBinary) => {
@@ -221,17 +222,20 @@ window.addEventListener('beforeunload', () => bc.close());
     const audioRoutedToBlackHoleRef = useRef(false);
 
     // Attach remote stream to video element once it renders, and route
-    // audio to BlackHole. ontrack fires before <video> exists, so this
-    // useEffect is where the real work happens.
+    // audio to BlackHole. Two race conditions to handle:
+    // 1. ontrack fires before <video> exists — useEffect waits for isStreaming+isConnected
+    // 2. Audio ontrack fires AFTER video ontrack. When isConnected first fires,
+    //    the stream may only have video. Adding remoteMedia.audioTracks to deps
+    //    re-runs this effect the moment the audio track arrives.
     useEffect(() => {
         if (!isStreaming || !isConnected || !processedVideoRef.current || !remoteStreamRef.current) return;
 
         const videoEl = processedVideoRef.current;
         videoEl.srcObject = remoteStreamRef.current;
 
-        // Route audio to BlackHole — only once per connection
+        // Route audio to BlackHole — only possible after audio track has arrived
         const audioTracks = remoteStreamRef.current.getAudioTracks();
-        if (audioTracks.length === 0) return;
+        if (audioTracks.length === 0) return;  // will re-run when audio track arrives
 
         let cancelled = false;
         (async () => {
@@ -261,7 +265,7 @@ window.addEventListener('beforeunload', () => bc.close());
         })();
 
         return () => { cancelled = true; };
-    }, [isStreaming, isConnected]);
+    }, [isStreaming, isConnected, diagnostics.remoteMedia?.audioTracks]);
 
     // Fallback logic: If WebRTC fails or disconnects, try WebSocket
     useEffect(() => {
