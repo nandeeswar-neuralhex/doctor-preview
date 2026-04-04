@@ -12,6 +12,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     const wsCanvasRef = useRef(null);  // Direct canvas paint — zero flicker
     const wsFrameCountRef = useRef(0);
     const wsLastFpsTimeRef = useRef(performance.now());
+    const remoteAudioElRef = useRef(null);  // Hidden Audio element for BlackHole routing
     const audioCtxRef = useRef(null);
     const audioBufferRef = useRef(new Int16Array(0));
     const audioSampleRateRef = useRef(16000);
@@ -27,6 +28,8 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     const [extraAudioDelayMs, setExtraAudioDelayMs] = useState(0);
     const audioDelayMs = autoSyncAudio ? latency + extraAudioDelayMs : extraAudioDelayMs;
     const [exposureAdjust, setExposureAdjust] = useState(0);
+    const [remoteAudioReady, setRemoteAudioReady] = useState(false);
+    const [audioDebug, setAudioDebug] = useState('idle');
     const [diagnostics, setDiagnostics] = useState({
         health: null,
         upload: null,
@@ -120,7 +123,11 @@ window.addEventListener('beforeunload', () => bc.close());
     const processedFrameFilter = `brightness(${Math.max(0.4, 1 + exposureAdjust / 100)})`;
 
     // Custom hooks for webcam and WebSocket
-    const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true, audioDelayMs);
+    // In WebRTC mode, skip the virtual audio delay pipeline — the server
+    // relays audio back in sync with video, routed to BlackHole via setSinkId
+    // on the processed <video> element instead.
+    const skipVirtualAudio = transportMode === 'webrtc';
+    const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true, audioDelayMs, skipVirtualAudio);
     // WebSocket hook – render into the dedicated <img> ref
     const handleWsFrame = useCallback((frameData, wsLatency, isBinary) => {
         // Direct canvas painting: decode blob → drawImage → done.
@@ -196,8 +203,16 @@ window.addEventListener('beforeunload', () => bc.close());
         applyQuality
     } = useWebRTC(serverUrl, sessionId, (remoteStream) => {
         remoteStreamRef.current = remoteStream;
+        // NOTE: processedVideoRef.current is usually null here because
+        // ontrack fires before isStreaming=true renders the <video>.
+        // The useEffect below handles attaching + BlackHole routing.
         if (processedVideoRef.current) {
             processedVideoRef.current.srcObject = remoteStream;
+        }
+        // Signal that remote audio tracks are available so the
+        // BlackHole-routing useEffect re-runs.
+        if (remoteStream.getAudioTracks().length > 0) {
+            setRemoteAudioReady(true);
         }
         setDiagnostics(prev => ({
             ...prev,
@@ -210,13 +225,125 @@ window.addEventListener('beforeunload', () => bc.close());
         setLatency(rtt);
     });
 
-    // Attach remote stream to video element once it renders (WebRTC ontrack
-    // fires before isStreaming flips to true, so the <video> doesn't exist yet)
+    // Attach remote stream to video element (video only, always muted).
+    // Route remote audio to BlackHole using the EXACT same pattern as useWebcam.js:
+    //   AudioContext → MediaStreamSource → MediaStreamDestination → hidden Audio element → setSinkId(BlackHole)
+    const bhAudioCtxRef = useRef(null);
+    const bhAudioElRef = useRef(null);
+    const analyserIntervalRef = useRef(null);
     useEffect(() => {
-        if (isStreaming && isConnected && processedVideoRef.current && remoteStreamRef.current) {
-            processedVideoRef.current.srcObject = remoteStreamRef.current;
+        if (!isStreaming || !isConnected || !remoteAudioReady) {
+            setAudioDebug(prev => prev === 'idle' ? prev : `waiting: streaming=${isStreaming} connected=${isConnected} audioReady=${remoteAudioReady}`);
+            return;
         }
-    }, [isStreaming, isConnected]);
+        if (!processedVideoRef.current || !remoteStreamRef.current) {
+            setAudioDebug('waiting: refs not ready');
+            return;
+        }
+
+        const videoEl = processedVideoRef.current;
+        videoEl.srcObject = remoteStreamRef.current;
+        videoEl.muted = true;
+
+        const audioTracks = remoteStreamRef.current.getAudioTracks();
+        if (audioTracks.length === 0) {
+            setAudioDebug('NO AUDIO TRACKS in remote stream');
+            return;
+        }
+
+        let ctx = null;
+        let audioEl = null;
+        let cancelled = false;
+
+        (async () => {
+            try {
+                // Step 1: Find BlackHole output device
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                if (cancelled) return;
+
+                const bh = devices.find(d =>
+                    d.kind === 'audiooutput' &&
+                    (d.label.toLowerCase().includes('blackhole') ||
+                     d.label.toLowerCase().includes('vb-audio'))
+                );
+
+                if (!bh) {
+                    setAudioDebug('FAIL: BlackHole not found in audio outputs');
+                    return;
+                }
+
+                // Step 2: AudioContext — same as useWebcam.js (default output, NOT sinkId)
+                ctx = new AudioContext();
+                bhAudioCtxRef.current = ctx;
+
+                // Step 3: Source from remote audio tracks
+                const audioStream = new MediaStream(audioTracks);
+                const source = ctx.createMediaStreamSource(audioStream);
+
+                // Step 4: Analyser for level metering
+                const analyser = ctx.createAnalyser();
+                analyser.fftSize = 256;
+
+                // Step 5: MediaStreamDestination — converts back to a MediaStream
+                const destination = ctx.createMediaStreamDestination();
+
+                // Wire: source → analyser → destination
+                source.connect(analyser);
+                analyser.connect(destination);
+
+                // Step 6: Hidden Audio element with setSinkId — EXACT useWebcam.js pattern
+                audioEl = new Audio();
+                audioEl.srcObject = destination.stream;
+                audioEl.muted = true; // mute until setSinkId succeeds
+
+                if (typeof audioEl.setSinkId === 'function') {
+                    await audioEl.setSinkId(bh.deviceId);
+                    if (cancelled) { ctx.close(); return; }
+                    audioEl.muted = false;
+                    await audioEl.play();
+                    bhAudioElRef.current = audioEl;
+                    console.log(`[AudioDebug] SUCCESS — routed server audio to ${bh.label} via setSinkId`);
+                } else {
+                    setAudioDebug('FAIL: setSinkId not supported');
+                    ctx.close(); ctx = null; return;
+                }
+
+                // Resume if suspended
+                if (ctx.state === 'suspended') await ctx.resume();
+
+                // Step 7: Poll audio levels every 500ms
+                const dataArray = new Uint8Array(analyser.frequencyBinCount);
+                analyserIntervalRef.current = setInterval(() => {
+                    analyser.getByteFrequencyData(dataArray);
+                    const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+                    const peak = Math.max(...dataArray);
+                    const trackState = audioTracks[0]?.readyState || '?';
+                    const bar = '█'.repeat(Math.round(avg / 10)) || '░';
+                    setAudioDebug(`→ ${bh.label} | lvl=${avg.toFixed(0)} pk=${peak} ${bar} | track:${trackState} | el.paused=${audioEl.paused}`);
+                }, 500);
+            } catch (e) {
+                setAudioDebug(`ERROR: ${e.message}`);
+                console.error('[AudioDebug] Failed:', e);
+            }
+        })();
+
+        return () => {
+            cancelled = true;
+            if (analyserIntervalRef.current) {
+                clearInterval(analyserIntervalRef.current);
+                analyserIntervalRef.current = null;
+            }
+            if (audioEl) {
+                audioEl.pause();
+                audioEl.srcObject = null;
+            }
+            bhAudioElRef.current = null;
+            if (ctx) {
+                try { ctx.close(); } catch (_) {}
+            }
+            bhAudioCtxRef.current = null;
+        };
+    }, [isStreaming, isConnected, remoteAudioReady]);
 
     // Fallback logic: If WebRTC fails or disconnects, try WebSocket
     useEffect(() => {
@@ -460,6 +587,10 @@ window.addEventListener('beforeunload', () => bc.close());
                 if (processedVideoRef.current && remoteStreamRef.current && isConnected) {
                     processedVideoRef.current.srcObject = remoteStreamRef.current;
                     processedVideoRef.current.play().catch(() => {});
+                }
+                // Resume hidden audio element if it was paused
+                if (remoteAudioElRef.current && remoteAudioElRef.current.paused) {
+                    remoteAudioElRef.current.play().catch(() => {});
                 }
                 // Ensure camera track is still enabled
                 if (originalVideoRef.current?.srcObject) {
@@ -891,10 +1022,34 @@ window.addEventListener('beforeunload', () => bc.close());
     };
 
     const handleStop = () => {
-        setIsStreaming(false);  // Set first to stop send loops immediately
+        setIsStreaming(false);
+        setRemoteAudioReady(false);
+        setAudioDebug('idle');
         disconnectWs();
         disconnect();
         stopWebcam();
+        // Clean up audio level meter
+        if (analyserIntervalRef.current) {
+            clearInterval(analyserIntervalRef.current);
+            analyserIntervalRef.current = null;
+        }
+        // Clean up BlackHole audio element (proven pattern)
+        if (bhAudioElRef.current) {
+            bhAudioElRef.current.pause();
+            bhAudioElRef.current.srcObject = null;
+            bhAudioElRef.current = null;
+        }
+        // Clean up BlackHole AudioContext
+        if (bhAudioCtxRef.current) {
+            try { bhAudioCtxRef.current.close(); } catch (_) {}
+            bhAudioCtxRef.current = null;
+        }
+        // Clean up hidden audio element (legacy)
+        if (remoteAudioElRef.current) {
+            remoteAudioElRef.current.pause();
+            remoteAudioElRef.current.srcObject = null;
+            remoteAudioElRef.current = null;
+        }
         setFps(0);
         setLatency(0);
         audioBufferRef.current = new Int16Array(0);
@@ -1214,6 +1369,12 @@ window.addEventListener('beforeunload', () => bc.close());
                         : diagnostics.remoteMedia
                             ? `video=${diagnostics.remoteMedia.videoTracks}, audio=${diagnostics.remoteMedia.audioTracks}`
                             : '—'}
+                </div>
+                <div>
+                    <span className={audioDebug.startsWith('PLAYING') || audioDebug.startsWith('RESUMED') ? 'text-green-400' : audioDebug.startsWith('FAIL') || audioDebug.startsWith('ERROR') || audioDebug.startsWith('NO ') ? 'text-red-400' : 'text-yellow-400'}>
+                        Audio→BH:
+                    </span>{' '}
+                    {audioDebug}
                 </div>
             </div>
         </div>

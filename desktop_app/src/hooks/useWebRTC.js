@@ -152,10 +152,15 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream, onLatency) {
 
             localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
 
+            // Collect all remote tracks into one MediaStream so audio+video
+            // are on the same stream object for the <video> element.
+            const combinedStream = new MediaStream();
+
             pc.ontrack = (event) => {
-                const [remoteStream] = event.streams;
+                combinedStream.addTrack(event.track);
+                console.log(`[WebRTC] Got remote ${event.track.kind} track (total: ${combinedStream.getTracks().length})`);
                 if (onRemoteStream) {
-                    onRemoteStream(remoteStream);
+                    onRemoteStream(combinedStream);
                 }
             };
 

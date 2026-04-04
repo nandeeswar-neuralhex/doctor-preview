@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 
-function useWebcam(withAudio = false, audioDelayMs = 300) {
+function useWebcam(withAudio = false, audioDelayMs = 300, skipVirtualAudio = false) {
     const [stream, setStream] = useState(null);
     const [error, setError] = useState(null);
     const virtualAudioRef = useRef(null);
@@ -33,7 +33,7 @@ function useWebcam(withAudio = false, audioDelayMs = 300) {
                 console.log(`[Webcam] Requested ${requestWidth}×${requestHeight}, got ${s.width}×${s.height} @ ${s.frameRate}fps`);
             }
 
-            if (withAudio) {
+            if (withAudio && !skipVirtualAudio) {
                 // Enumerate all devices and log them for debugging
                 const devices = await navigator.mediaDevices.enumerateDevices();
                 console.log('[VirtualMic] All audio devices:');
@@ -93,7 +93,7 @@ function useWebcam(withAudio = false, audioDelayMs = 300) {
             console.error('Webcam error:', err);
             return null;
         }
-    }, [withAudio, audioDelayMs]);
+    }, [withAudio, audioDelayMs, skipVirtualAudio]);
 
     const stopWebcam = useCallback(() => {
         if (stream) {
