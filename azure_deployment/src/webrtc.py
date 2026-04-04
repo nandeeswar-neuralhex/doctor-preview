@@ -532,20 +532,24 @@ class WebRTCManager:
         self.pcs[session_id] = pc
 
         audio_buffer = AudioBuffer()
-        sync_clock = SyncClock(initial_delay_s=0.1)
         frame_logger = FrameLogger(f"/tmp/frame_log_{session_id}.csv")
-        print(f"[WebRTC:{session_id}] Audio sync enabled — per-frame log: /tmp/frame_log_{session_id}.csv")
+        print(f"[WebRTC:{session_id}] Client-side audio sync — server sends video only")
 
         @pc.on("track")
         def on_track(track: MediaStreamTrack):
             if track.kind == "audio":
-                local_audio = AudioRelayTrack(
-                    self.relay.subscribe(track),
-                    audio_buffer,
-                    sync_clock,
-                    frame_logger,
-                )
-                pc.addTrack(local_audio)
+                # Don't relay audio back — client handles its own audio
+                # delay via a local DelayNode (same proven approach as WS mode).
+                # We only consume audio for the lip-sync buffer.
+                relayed = self.relay.subscribe(track)
+                async def _consume_audio():
+                    try:
+                        while True:
+                            frame = await relayed.recv()
+                            audio_buffer.append(frame)
+                    except Exception:
+                        pass
+                asyncio.ensure_future(_consume_audio())
             elif track.kind == "video":
                 local_video = VideoTransformTrack(
                     self.relay.subscribe(track),
@@ -555,7 +559,7 @@ class WebRTCManager:
                     audio_buffer,
                     self.session_settings,
                     target_bitrate=client_bitrate,
-                    sync_clock=sync_clock,
+                    sync_clock=None,
                     frame_logger=frame_logger,
                 )
                 pc.addTrack(local_video)

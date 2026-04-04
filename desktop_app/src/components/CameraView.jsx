@@ -120,10 +120,10 @@ window.addEventListener('beforeunload', () => bc.close());
     const processedFrameFilter = `brightness(${Math.max(0.4, 1 + exposureAdjust / 100)})`;
 
     // Custom hooks for webcam and WebSocket
-    // In WebRTC mode, skip the virtual audio delay pipeline — the server
-    // relays audio back in sync with video, routed to BlackHole via setSinkId
-    // on the processed <video> element instead.
-    const skipVirtualAudio = transportMode === 'webrtc';
+    // Always use the local DelayNode for audio lip-sync. The server only sends
+    // face-swapped video back — audio sync is handled client-side via a
+    // WebAudio DelayNode calibrated to the measured video latency.
+    const skipVirtualAudio = false;
     const { stream, error: webcamError, startWebcam, stopWebcam } = useWebcam(true, audioDelayMs, skipVirtualAudio);
     // WebSocket hook – render into the dedicated <img> ref
     const handleWsFrame = useCallback((frameData, wsLatency, isBinary) => {

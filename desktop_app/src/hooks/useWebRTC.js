@@ -133,7 +133,10 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream, onLatency) {
                     }
 
                     if (inboundHasNewFrames) {
-                        const totalLatency = Math.round(sendDelayMs + iceRttMs + 75 + jbDelayMs);
+                        // Server-side face-swap processing takes ~100-150ms (GPU).
+                        // 130ms is a safe middle estimate for the processing + VP8 encode.
+                        const SERVER_PROCESSING_MS = 130;
+                        const totalLatency = Math.round(sendDelayMs + iceRttMs + SERVER_PROCESSING_MS + jbDelayMs);
                         prevStatsRef.current.lastFrameTime = Date.now();
                         prevStatsRef.current.lastBaseLatency = totalLatency;
                         if (onLatencyRef.current) {
