@@ -211,7 +211,8 @@ window.addEventListener('beforeunload', () => bc.close());
         // ontrack fires before isStreaming=true renders the <video>.
         // The useEffect below handles attaching + BlackHole routing.
         if (processedVideoRef.current) {
-            processedVideoRef.current.srcObject = remoteStream;
+            processedVideoRef.current.srcObject = new MediaStream(remoteStream.getVideoTracks());
+            processedVideoRef.current.muted = true;
         }
         setDiagnostics(prev => ({
             ...prev,
@@ -258,7 +259,8 @@ window.addEventListener('beforeunload', () => bc.close());
         if (!isStreaming || !isConnected || !processedVideoRef.current || !remoteStreamRef.current) return;
 
         const videoEl = processedVideoRef.current;
-        videoEl.srcObject = remoteStreamRef.current;
+        videoEl.srcObject = new MediaStream(remoteStreamRef.current.getVideoTracks());
+        videoEl.muted = true;
 
         if (transportMode !== 'webrtc') return;
 
@@ -566,11 +568,8 @@ window.addEventListener('beforeunload', () => bc.close());
                 }
                 // Re-attach remote stream to wake up the frozen <video> element
                 if (processedVideoRef.current && remoteStreamRef.current && isConnected) {
-                    processedVideoRef.current.srcObject = remoteStreamRef.current;
-                    // Re-assert un-mute if BlackHole routing was already done
-                    if (audioRoutedToBlackHoleRef.current) {
-                        processedVideoRef.current.muted = false;
-                    }
+                    processedVideoRef.current.srcObject = new MediaStream(remoteStreamRef.current.getVideoTracks());
+                    processedVideoRef.current.muted = true;
                     processedVideoRef.current.play().catch(() => {});
                 }
                 // Ensure camera track is still enabled
