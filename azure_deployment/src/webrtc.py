@@ -230,18 +230,37 @@ class SyncClock:
 class AudioRelayTrack(MediaStreamTrack):
     """Relay audio back to client, delayed to match video processing latency.
 
-    Architecture:
-    - _read_loop(): continuously reads audio frames, enqueues with arrival timestamp
-    - recv(): dequeues and holds each frame until sync_clock.delay has elapsed
+    Two mechanisms prevent audio artifacts during latency swings:
 
-    Each 20ms audio chunk is independently held for the target delay.
-    When delay changes via asymmetric EMA:
-    - Increase (300→500ms): next audio frame held 200ms longer. Sounds like
-      a tiny pause (~200ms) — same as network jitter, handled by client jitter buffer.
-    - Decrease (500→300ms): each successive frame held ~1ms less than previous.
-      Over ~5 seconds, all frames arrive ~3% faster — completely inaudible.
+    1. RATE-LIMITED DELAY RAMPING
+       _current_delay moves toward sync_clock.delay by at most ±2ms per
+       audio frame (~50 frames/sec = ±100ms/sec max ramp rate).
+
+       - Latency jump 200→500ms: ramp takes ~3 seconds to reach new delay.
+         During ramp, audio leads video by up to ~150ms at the midpoint.
+         This is within lip-sync tolerance (±80ms is "good", ±160ms is
+         "acceptable" per ITU-R BT.1359).
+       - Latency drop 500→200ms: ramp takes ~3 seconds to ease down.
+         Audio briefly trails video. Imperceptible.
+
+       Without ramping: a 200ms jump creates a 200ms silence gap = word cutoff.
+       With 2ms/frame ramping: the gap is spread over 100 frames as 2ms each
+       = completely inaudible micro-pauses.
+
+    2. MINIMUM OUTPUT PACING
+       recv() never returns faster than FRAME_DURATION (20ms) between calls.
+       This prevents burst delivery when queued frames have already waited
+       past their target delay. The client receives frames at a steady rate
+       regardless of server-side queue backlogs.
+
+       Without pacing: if 5 frames are "ready", they'd be sent back-to-back
+       in <1ms → client plays them at 100x speed → garbled burst.
+       With pacing: 5 ready frames come out over 100ms at normal rate.
     """
     kind = "audio"
+
+    FRAME_DURATION = 0.020   # 20ms per audio frame (48kHz / 960 samples)
+    MAX_RAMP_PER_FRAME = 0.002  # ±2ms per frame = ±100ms/sec
 
     def __init__(self, track: MediaStreamTrack, audio_buffer: AudioBuffer, sync_clock: SyncClock):
         super().__init__()
@@ -251,6 +270,8 @@ class AudioRelayTrack(MediaStreamTrack):
         self._queue: Optional[asyncio.Queue] = None
         self._reader_task = None
         self._started = False
+        self._current_delay = sync_clock.delay
+        self._last_output_time = 0.0
         self._log_count = 0
 
     async def _read_loop(self):
@@ -266,23 +287,57 @@ class AudioRelayTrack(MediaStreamTrack):
     async def recv(self) -> AudioFrame:
         if not self._started:
             self._started = True
-            self._queue = asyncio.Queue()  # unbounded — frames are tiny (20ms)
+            self._queue = asyncio.Queue()
             self._reader_task = asyncio.ensure_future(self._read_loop())
+            self._last_output_time = time.monotonic()
+            self._current_delay = self._sync_clock.delay
 
         arrival, frame = await self._queue.get()
 
-        # Hold frame until sync_clock.delay time has passed since arrival
-        target_delay = self._sync_clock.delay
+        # ── Rate-limited delay ramping ──
+        # Move _current_delay toward sync target, max ±2ms per frame.
+        target = self._sync_clock.delay
+        diff = target - self._current_delay
+        if abs(diff) <= self.MAX_RAMP_PER_FRAME:
+            self._current_delay = target
+        elif diff > 0:
+            self._current_delay += self.MAX_RAMP_PER_FRAME
+        else:
+            self._current_delay -= self.MAX_RAMP_PER_FRAME
+
+        # ── Hold frame for the ramped delay ──
         elapsed = time.monotonic() - arrival
-        remaining = target_delay - elapsed
+        remaining = self._current_delay - elapsed
         if remaining > 0.001:
             await asyncio.sleep(remaining)
 
-        # Periodic stdout log (every ~3 seconds at 48kHz/960 samples = 50 fps)
+        # ── Minimum output pacing ──
+        # Prevent burst delivery: at least FRAME_DURATION between outputs.
+        now = time.monotonic()
+        min_next = self._last_output_time + self.FRAME_DURATION
+        if now < min_next:
+            await asyncio.sleep(min_next - now)
+        self._last_output_time = time.monotonic()
+
+        # ── Queue overflow protection ──
+        # If > 1.5 seconds of audio backed up, drop oldest frames.
+        # This caps max desync to ~1.5s during extreme latency spikes.
+        max_queue = int(1.5 / self.FRAME_DURATION)  # ~75 frames
+        dropped = 0
+        while self._queue.qsize() > max_queue:
+            try:
+                self._queue.get_nowait()
+                dropped += 1
+            except asyncio.QueueEmpty:
+                break
+        if dropped > 0:
+            print(f"[AudioSync] Dropped {dropped} old frames (queue overflow)")
+
+        # ── Periodic logging ──
         self._log_count += 1
         if self._log_count % 150 == 0:
-            actual_hold = time.monotonic() - arrival
-            print(f"[AudioSync] target={target_delay*1000:.0f}ms  held={actual_hold*1000:.0f}ms  queue={self._queue.qsize()}")
+            actual_hold = self._last_output_time - arrival
+            print(f"[AudioSync] target={target*1000:.0f}ms  ramp={self._current_delay*1000:.0f}ms  held={actual_hold*1000:.0f}ms  queue={self._queue.qsize()}")
 
         return frame
 
