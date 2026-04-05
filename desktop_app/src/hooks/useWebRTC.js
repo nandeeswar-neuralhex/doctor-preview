@@ -94,6 +94,7 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream, onLatency) {
                 packetsSent: 0,
                 lastFrameTime: Date.now(),
                 lastBaseLatency: 0,
+                smoothedLatency: 0,
             };
 
             // ── Latency recorder: stores every sample for analysis ──
@@ -147,7 +148,7 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream, onLatency) {
                             if (deltaCount > 0) {
                                 jbDelayMs = (deltaDelay / deltaCount) * 1000;
                                 inboundHasNewFrames = true;
-                                inboundFps = deltaCount;  // frames in last 1s
+                                inboundFps = deltaCount;
                             }
                             prevStatsRef.current.jitterBufferDelay = report.jitterBufferDelay;
                             prevStatsRef.current.jitterBufferEmittedCount = report.jitterBufferEmittedCount;
@@ -158,25 +159,41 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream, onLatency) {
 
                     const SERVER_PROCESSING_MS = 130;
                     let stallMs = 0;
-                    let totalLatency;
 
+                    // Only update latency when we have fresh frame data.
+                    // Chrome's getStats() flushes jitterBufferEmittedCount in
+                    // batches — some polls get deltaCount=0 even though frames
+                    // are flowing fine. The old code added a "stall" timer on
+                    // those polls, causing latency to swing 300→1000→300→1000.
+                    // Fix: use EMA smoothing and skip stale polls entirely.
                     if (inboundHasNewFrames) {
-                        totalLatency = Math.round(sendDelayMs + iceRttMs + SERVER_PROCESSING_MS + jbDelayMs);
+                        const rawLatency = sendDelayMs + iceRttMs + SERVER_PROCESSING_MS + jbDelayMs;
+                        const prev = prevStatsRef.current.smoothedLatency;
+                        // EMA: 70% old + 30% new — smooths out measurement noise
+                        const smoothed = prev > 0
+                            ? Math.round(0.7 * prev + 0.3 * rawLatency)
+                            : Math.round(rawLatency);
+                        prevStatsRef.current.smoothedLatency = smoothed;
                         prevStatsRef.current.lastFrameTime = Date.now();
-                        prevStatsRef.current.lastBaseLatency = totalLatency;
+                        prevStatsRef.current.lastBaseLatency = smoothed;
+
+                        if (onLatencyRef.current) {
+                            onLatencyRef.current(smoothed);
+                        }
                     } else {
+                        // No fresh stats — keep showing last known good value.
+                        // Only indicate a stall if genuinely no frames for >3 seconds.
                         stallMs = Date.now() - prevStatsRef.current.lastFrameTime;
-                        totalLatency = Math.round(prevStatsRef.current.lastBaseLatency + stallMs);
+                        if (stallMs > 3000 && onLatencyRef.current) {
+                            onLatencyRef.current(prevStatsRef.current.lastBaseLatency + stallMs);
+                        }
+                        // Otherwise: don't update the UI, keep showing last good value.
                     }
 
-                    if (onLatencyRef.current) {
-                        onLatencyRef.current(totalLatency);
-                    }
-
-                    // Record every sample for analysis
+                    // Record every sample for analysis (even stale ones)
                     latencyLog.push({
                         t: ((Date.now() - t0) / 1000).toFixed(1),
-                        total: totalLatency,
+                        total: prevStatsRef.current.smoothedLatency,
                         rtt: Math.round(iceRttMs),
                         send: Math.round(sendDelayMs),
                         server: SERVER_PROCESSING_MS,
