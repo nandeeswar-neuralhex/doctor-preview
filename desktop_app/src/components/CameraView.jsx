@@ -13,6 +13,9 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     const wsFrameCountRef = useRef(0);
     const wsLastFpsTimeRef = useRef(performance.now());
     const audioCtxRef = useRef(null);
+    const remoteAudioCtxRef = useRef(null);
+    const remoteAudioDelayNodeRef = useRef(null);
+    const remoteAudioElRef = useRef(null);
     const audioBufferRef = useRef(new Int16Array(0));
     const audioSampleRateRef = useRef(16000);
 
@@ -26,6 +29,9 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     const [autoSyncAudio, setAutoSyncAudio] = useState(true);
     const [extraAudioDelayMs, setExtraAudioDelayMs] = useState(0);
     const audioDelayMs = autoSyncAudio ? latency + extraAudioDelayMs : extraAudioDelayMs;
+    const displayedAudioDelay = transportMode === 'webrtc'
+        ? `+${extraAudioDelayMs}ms extra`
+        : `${autoSyncAudio ? `${latency}+${extraAudioDelayMs}=` : ''}${audioDelayMs}ms`;
     const [exposureAdjust, setExposureAdjust] = useState(0);
     const [diagnostics, setDiagnostics] = useState({
         health: null,
@@ -220,38 +226,47 @@ window.addEventListener('beforeunload', () => bc.close());
 
     // Track whether we successfully routed audio to BlackHole
     const audioRoutedToBlackHoleRef = useRef(false);
-    // WebRTC audio delay chain: remoteAudio → DelayNode → BlackHole
-    const rtcAudioCtxRef = useRef(null);
-    const rtcDelayNodeRef = useRef(null);
-    const rtcAudioElRef = useRef(null);
 
-    // Dynamically update the WebRTC delay node when the slider changes
-    useEffect(() => {
-        if (rtcDelayNodeRef.current) {
-            rtcDelayNodeRef.current.delayTime.value = extraAudioDelayMs / 1000;
-            console.log(`[WebRTC] Extra audio delay updated to ${extraAudioDelayMs}ms`);
+    const cleanupRemoteAudioRouting = useCallback(() => {
+        if (remoteAudioElRef.current) {
+            remoteAudioElRef.current.pause();
+            remoteAudioElRef.current.srcObject = null;
+            remoteAudioElRef.current = null;
         }
-    }, [extraAudioDelayMs]);
+        if (remoteAudioCtxRef.current) {
+            remoteAudioCtxRef.current.close().catch(() => {});
+            remoteAudioCtxRef.current = null;
+        }
+        remoteAudioDelayNodeRef.current = null;
+        audioRoutedToBlackHoleRef.current = false;
+    }, []);
+
+    useEffect(() => {
+        if (transportMode === 'webrtc' && remoteAudioDelayNodeRef.current) {
+            remoteAudioDelayNodeRef.current.delayTime.value = extraAudioDelayMs / 1000;
+            console.log(`[WebRTC] Remote audio extra delay updated to ${extraAudioDelayMs}ms`);
+        }
+    }, [extraAudioDelayMs, transportMode]);
 
     // Attach remote stream to video element once it renders, and route
-    // audio through a DelayNode to BlackHole. The extra delay slider adds
-    // on top of the server-side sync delay (which handles pipeline latency).
-    // Flow: remote audio → WebAudio DelayNode → hidden <audio> → BlackHole
+    // audio to BlackHole. Two race conditions to handle:
+    // 1. ontrack fires before <video> exists — useEffect waits for isStreaming+isConnected
+    // 2. Audio ontrack fires AFTER video ontrack. When isConnected first fires,
+    //    the stream may only have video. Adding remoteMedia.audioTracks to deps
+    //    re-runs this effect the moment the audio track arrives.
     useEffect(() => {
         if (!isStreaming || !isConnected || !processedVideoRef.current || !remoteStreamRef.current) return;
 
         const videoEl = processedVideoRef.current;
         videoEl.srcObject = remoteStreamRef.current;
-        // Mute the <video> element — audio goes through the DelayNode chain instead
-        videoEl.muted = true;
 
+        if (transportMode !== 'webrtc') return;
+
+        // Route audio to BlackHole — only possible after audio track has arrived
         const audioTracks = remoteStreamRef.current.getAudioTracks();
-        if (audioTracks.length === 0) return;
+        if (audioTracks.length === 0) return;  // will re-run when audio track arrives
 
         let cancelled = false;
-        let audioCtx = null;
-        let audioEl = null;
-
         (async () => {
             try {
                 const devices = await navigator.mediaDevices.enumerateDevices();
@@ -261,59 +276,55 @@ window.addEventListener('beforeunload', () => bc.close());
                     (d.label.toLowerCase().includes('blackhole') ||
                      d.label.toLowerCase().includes('vb-audio'))
                 );
-                if (!virtualOutput || typeof HTMLAudioElement.prototype.setSinkId !== 'function') {
+                if (virtualOutput && typeof HTMLMediaElement.prototype.setSinkId === 'function') {
+                    cleanupRemoteAudioRouting();
+
+                    const remoteAudioStream = new MediaStream(audioTracks);
+                    const remoteAudioCtx = new AudioContext();
+                    const remoteSource = remoteAudioCtx.createMediaStreamSource(remoteAudioStream);
+                    const remoteDelayNode = remoteAudioCtx.createDelay(6.0);
+                    const remoteDest = remoteAudioCtx.createMediaStreamDestination();
+                    const remoteAudioEl = new Audio();
+
+                    remoteDelayNode.delayTime.value = extraAudioDelayMs / 1000;
+                    remoteSource.connect(remoteDelayNode);
+                    remoteDelayNode.connect(remoteDest);
+
+                    remoteAudioCtxRef.current = remoteAudioCtx;
+                    remoteAudioDelayNodeRef.current = remoteDelayNode;
+                    remoteAudioElRef.current = remoteAudioEl;
+
+                    remoteAudioEl.srcObject = remoteDest.stream;
+                    remoteAudioEl.muted = true;
+                    remoteAudioEl.autoplay = false;
+
+                    if (remoteAudioCtx.state === 'suspended') {
+                        await remoteAudioCtx.resume().catch(() => {});
+                    }
+                    await remoteAudioEl.setSinkId(virtualOutput.deviceId);
+                    if (cancelled) return;
+
+                    videoEl.muted = true;
+                    remoteAudioEl.muted = false;
+                    await remoteAudioEl.play();
+                    audioRoutedToBlackHoleRef.current = true;
+                    console.log(`[WebRTC] Remote audio routed to BlackHole: ${virtualOutput.label} (+${extraAudioDelayMs}ms)`);
+                } else {
                     console.warn('[WebRTC] BlackHole/VB-Audio not found — audio stays muted');
                     audioRoutedToBlackHoleRef.current = false;
-                    return;
                 }
-                if (cancelled) return;
-
-                // Build WebAudio chain: remote audio → DelayNode → BlackHole
-                audioCtx = new AudioContext();
-                const audioOnlyStream = new MediaStream(audioTracks);
-                const source = audioCtx.createMediaStreamSource(audioOnlyStream);
-                const delayNode = audioCtx.createDelay(6.0); // max 6 seconds
-                delayNode.delayTime.value = extraAudioDelayMs / 1000;
-                const dest = audioCtx.createMediaStreamDestination();
-
-                source.connect(delayNode);
-                delayNode.connect(dest);
-
-                // Hidden <audio> element to pipe delayed stream to BlackHole
-                audioEl = new Audio();
-                audioEl.srcObject = dest.stream;
-                audioEl.muted = true;
-                await audioEl.setSinkId(virtualOutput.deviceId);
-                if (cancelled) { audioCtx.close(); return; }
-                audioEl.muted = false;
-                audioEl.play().catch(e => console.error('[WebRTC] Audio play error:', e));
-
-                // Store refs so the delay slider can update dynamically
-                rtcAudioCtxRef.current = audioCtx;
-                rtcDelayNodeRef.current = delayNode;
-                rtcAudioElRef.current = audioEl;
-                audioRoutedToBlackHoleRef.current = true;
-                console.log(`[WebRTC] Audio → DelayNode(${extraAudioDelayMs}ms) → BlackHole: ${virtualOutput.label}`);
             } catch (e) {
                 console.warn('[WebRTC] Failed to route audio:', e.message);
+                cleanupRemoteAudioRouting();
                 audioRoutedToBlackHoleRef.current = false;
             }
         })();
 
         return () => {
             cancelled = true;
-            if (rtcAudioElRef.current) {
-                rtcAudioElRef.current.pause();
-                rtcAudioElRef.current.srcObject = null;
-                rtcAudioElRef.current = null;
-            }
-            if (rtcAudioCtxRef.current) {
-                rtcAudioCtxRef.current.close().catch(() => {});
-                rtcAudioCtxRef.current = null;
-            }
-            rtcDelayNodeRef.current = null;
+            cleanupRemoteAudioRouting();
         };
-    }, [isStreaming, isConnected, diagnostics.remoteMedia?.audioTracks]);
+    }, [isStreaming, isConnected, diagnostics.remoteMedia?.audioTracks, transportMode, cleanupRemoteAudioRouting]);
 
     // Fallback logic: If WebRTC fails or disconnects, try WebSocket
     useEffect(() => {
@@ -1142,7 +1153,7 @@ window.addEventListener('beforeunload', () => bc.close());
                         className="w-16 md:w-24 accent-blue-500"
                     />
                     <span className="font-mono text-blue-400 font-semibold text-right whitespace-nowrap">
-                        {autoSyncAudio ? `${latency}+${extraAudioDelayMs}=` : ''}{audioDelayMs}ms
+                        {displayedAudioDelay}
                     </span>
                 </div>
                 <div className="flex items-center gap-2 text-xs md:text-sm text-gray-300">
