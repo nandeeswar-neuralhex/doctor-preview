@@ -36,6 +36,7 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
         localMedia: null,
         remoteMedia: null
     });
+    const [syncMetrics, setSyncMetrics] = useState(null); // A/V sync pipeline metrics
     const [fullScreenView, setFullScreenView] = useState(null); // 'original' | 'processed' | null
 
     // Function to mask MJPEG URL - shows only last 2 digits of IP and session timestamp
@@ -210,7 +211,8 @@ window.addEventListener('beforeunload', () => bc.close());
         connectionState,
         connect,
         disconnect,
-        applyQuality
+        applyQuality,
+        syncAudioActive
     } = useWebRTC(serverUrl, sessionId, (remoteStream) => {
         remoteStreamRef.current = remoteStream;
         if (processedVideoRef.current) {
@@ -993,6 +995,7 @@ window.addEventListener('beforeunload', () => bc.close());
         stopWebcam();
         setFps(0);
         setLatency(0);
+        setSyncMetrics(null);
         audioBufferRef.current = new Int16Array(0);
         setDiagnostics({ health: null, upload: null, settings: null, webrtc: null, localMedia: null, remoteMedia: null });
     };
@@ -1021,6 +1024,27 @@ window.addEventListener('beforeunload', () => bc.close());
             setDiagnostics(prev => ({ ...prev, health: `Health error: ${err.message}` }));
         }
     };
+
+    // ── A/V Sync Pipeline metrics polling ──────────────────────
+    useEffect(() => {
+        if (!isStreaming || !isConnected || !syncAudioActive || !serverUrl) {
+            setSyncMetrics(null);
+            return;
+        }
+        let active = true;
+        const poll = async () => {
+            try {
+                const res = await fetch(`${serverUrl}/session/${sessionId}/sync-metrics`);
+                if (res.ok && active) {
+                    const data = await res.json();
+                    setSyncMetrics(data);
+                }
+            } catch (_) { /* server unreachable — keep last value */ }
+        };
+        poll(); // immediate first fetch
+        const interval = setInterval(poll, 3000);
+        return () => { active = false; clearInterval(interval); };
+    }, [isStreaming, isConnected, syncAudioActive, serverUrl, sessionId]);
 
     return (
         <div className="h-full flex flex-col">
@@ -1095,6 +1119,33 @@ window.addEventListener('beforeunload', () => bc.close());
                                 {isConnected ? 'WebRTC' : isWsConnected ? 'WS' : 'Off'}
                             </span>
                         </div>
+                        {syncMetrics && (
+                            <>
+                                <div className="flex items-center gap-1" title="Audio-Video Offset P95 (lower is better)">
+                                    <span className="text-gray-400">AVO:</span>
+                                    <span className={`font-mono font-semibold ${
+                                        syncMetrics.avo_p95_ms <= 30 ? 'text-green-400' :
+                                        syncMetrics.avo_p95_ms <= 60 ? 'text-yellow-400' : 'text-red-400'
+                                    }`}>{syncMetrics.avo_p95_ms?.toFixed(1) ?? '—'}ms</span>
+                                </div>
+                                <div className="flex items-center gap-1" title="Audio buffer fill (50-80% ideal)">
+                                    <span className="text-gray-400">Buf:</span>
+                                    <span className={`font-mono font-semibold ${
+                                        syncMetrics.buffer_fill_pct <= 85 ? 'text-green-400' : 'text-yellow-400'
+                                    }`}>{syncMetrics.buffer_fill_pct?.toFixed(0) ?? '—'}%</span>
+                                </div>
+                                <div className="flex items-center gap-1" title="Sync pipeline health">
+                                    <span className={`w-2 h-2 rounded-full ${
+                                        syncMetrics.pipeline_healthy ? 'bg-green-500' :
+                                        syncMetrics.fallback_active ? 'bg-yellow-500' : 'bg-red-500'
+                                    }`}></span>
+                                    <span className="text-gray-400">
+                                        {syncMetrics.pipeline_healthy ? 'Sync' :
+                                         syncMetrics.fallback_active ? 'Fallback' : 'Degraded'}
+                                    </span>
+                                </div>
+                            </>
+                        )}
                     </div>
                 )}
 
@@ -1261,7 +1312,7 @@ window.addEventListener('beforeunload', () => bc.close());
                                     ref={processedVideoRef}
                                     autoPlay
                                     playsInline
-                                    muted
+                                    muted={!syncAudioActive}
                                     className="w-full h-full object-contain"
                                     style={{ filter: processedFrameFilter }}
                                 />
@@ -1309,6 +1360,26 @@ window.addEventListener('beforeunload', () => bc.close());
                             ? `video=${diagnostics.remoteMedia.videoTracks}, audio=${diagnostics.remoteMedia.audioTracks}`
                             : '—'}
                 </div>
+                {syncMetrics && (
+                    <div className="mt-2 pt-2 border-t border-gray-600 space-y-1">
+                        <div className="text-gray-400 font-semibold">🔊 A/V Sync Pipeline</div>
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-1">
+                            <div><span className="text-gray-400">AVO P95:</span> <span className={syncMetrics.avo_p95_ms <= 30 ? 'text-green-400' : syncMetrics.avo_p95_ms <= 60 ? 'text-yellow-400' : 'text-red-400'}>{syncMetrics.avo_p95_ms?.toFixed(1)}ms</span></div>
+                            <div><span className="text-gray-400">Swap:</span> {syncMetrics.swap_latency_ms?.toFixed(1)}ms</div>
+                            <div><span className="text-gray-400">E2E:</span> {syncMetrics.e2e_latency_ms?.toFixed(0)}ms</div>
+                            <div><span className="text-gray-400">Buffer:</span> {syncMetrics.buffer_fill_pct?.toFixed(0)}%</div>
+                            <div><span className="text-gray-400">In FPS:</span> {syncMetrics.input_video_fps?.toFixed(1)}</div>
+                            <div><span className="text-gray-400">Out FPS:</span> {syncMetrics.output_fps?.toFixed(1)}</div>
+                            <div><span className="text-gray-400">Drops:</span> {syncMetrics.frame_drop_pct?.toFixed(1)}%</div>
+                            <div>
+                                <span className="text-gray-400">Status:</span>{' '}
+                                <span className={syncMetrics.pipeline_healthy ? 'text-green-400' : syncMetrics.fallback_active ? 'text-yellow-400' : 'text-red-400'}>
+                                    {syncMetrics.pipeline_healthy ? '✅ Healthy' : syncMetrics.fallback_active ? '⚠️ Fallback' : '❌ Degraded'}
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                )}
             </div>
         </div>
     );

@@ -3,9 +3,11 @@ import QUALITY_PRESETS from '../qualityPresets';
 
 function useWebRTC(serverUrl, sessionId, onRemoteStream) {
     const pcRef = useRef(null);
+    const remoteStreamRef = useRef(null);
     const [error, setError] = useState(null);
     const [isConnected, setIsConnected] = useState(false);
     const [connectionState, setConnectionState] = useState('new');
+    const [syncAudioActive, setSyncAudioActive] = useState(false);
 
     /**
      * Apply bitrate / resolution constraints to all video senders.
@@ -65,9 +67,20 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream) {
             localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
 
             pc.ontrack = (event) => {
-                const [remoteStream] = event.streams;
+                // Accumulate all remote tracks into a single MediaStream
+                // (aiortc sends video and audio as separate tracks/streams;
+                // using event.streams[0] would overwrite video with audio-only)
+                if (!remoteStreamRef.current) {
+                    remoteStreamRef.current = new MediaStream();
+                }
+                remoteStreamRef.current.addTrack(event.track);
                 if (onRemoteStream) {
-                    onRemoteStream(remoteStream);
+                    onRemoteStream(remoteStreamRef.current);
+                }
+                // Detect if server is sending synced audio (A/V Sync Pipeline)
+                if (event.track.kind === 'audio') {
+                    console.log('[WebRTC] Server sending synced audio — A/V Sync Pipeline active');
+                    setSyncAudioActive(true);
                 }
             };
 
@@ -152,15 +165,17 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream) {
             pcRef.current.close();
             pcRef.current = null;
         }
+        remoteStreamRef.current = null;
         // Notify server to clean up session resources
         if (serverUrl && sessionId) {
             fetch(`${serverUrl}/session/${sessionId}`, { method: 'DELETE' }).catch(() => { });
         }
         setIsConnected(false);
         setConnectionState('closed');
+        setSyncAudioActive(false);
     }, [serverUrl, sessionId]);
 
-    return { connect, disconnect, isConnected, error, connectionState, applyQuality };
+    return { connect, disconnect, isConnected, error, connectionState, applyQuality, syncAudioActive };
 }
 
 export default useWebRTC;

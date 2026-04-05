@@ -73,3 +73,15 @@ LIVEPORTRAIT_MODEL_DIR = os.path.join(MODELS_DIR, "liveportrait")
 LIVEPORTRAIT_RESOLUTION = int(os.getenv("LIVEPORTRAIT_RESOLUTION", "256"))
 ENABLE_EYE_GAZE_CORRECTION = os.getenv("ENABLE_EYE_GAZE_CORRECTION", "true").lower() == "true"
 MOTION_SMOOTHING_ALPHA = float(os.getenv("MOTION_SMOOTHING_ALPHA", "0.7"))
+
+# ── Phase 4: A/V Sync Agent Pipeline (Approach 4: Server-Side Muxing) ──
+# When enabled, replaces the legacy VideoTransformTrack with the 7-agent
+# synchronized pipeline for broadcast-quality lip sync (target: AVO < 40ms).
+# Falls back to legacy mode if the pipeline fails (circuit breaker).
+ENABLE_AV_SYNC_PIPELINE = os.getenv("ENABLE_AV_SYNC_PIPELINE", "false").lower() == "true"
+AV_SYNC_AUDIO_BUFFER_MS = int(os.getenv("AV_SYNC_AUDIO_BUFFER_MS", "500"))
+AV_SYNC_MAX_AUDIO_WAIT_MS = int(os.getenv("AV_SYNC_MAX_AUDIO_WAIT_MS", "20"))
+AV_SYNC_DRIFT_RECAL_FRAMES = int(os.getenv("AV_SYNC_DRIFT_RECAL_FRAMES", "300"))
+AV_SYNC_AVO_WARNING_MS = float(os.getenv("AV_SYNC_AVO_WARNING_MS", "30"))
+AV_SYNC_AVO_CRITICAL_MS = float(os.getenv("AV_SYNC_AVO_CRITICAL_MS", "60"))
+

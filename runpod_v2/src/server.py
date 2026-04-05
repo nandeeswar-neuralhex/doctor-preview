@@ -1,6 +1,7 @@
 
 import asyncio
 import base64
+import logging
 import struct
 import time
 import uuid
@@ -13,11 +14,21 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
 
+# Configure logging for agent pipeline
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+# Reduce noise from third-party libs
+logging.getLogger("aiortc").setLevel(logging.WARNING)
+logging.getLogger("aioice").setLevel(logging.WARNING)
+
 import io
 from PIL import Image, ImageOps
 from face_swapper import FaceSwapper
 from lip_syncer import LipSyncer
-from config import JPEG_QUALITY, EXECUTION_PROVIDER, ENABLE_LIPSYNC, ENABLE_WEBRTC, SWAP_ENGINE
+from config import JPEG_QUALITY, EXECUTION_PROVIDER, ENABLE_LIPSYNC, ENABLE_WEBRTC, SWAP_ENGINE, ENABLE_AV_SYNC_PIPELINE
 from download_models import download_models
 
 # WebRTC manager (lazy init — only if ENABLE_WEBRTC=true)
@@ -107,9 +118,14 @@ async def startup_event():
     global webrtc_manager
     if ENABLE_WEBRTC:
         try:
-            from webrtc import WebRTCManager
-            webrtc_manager = WebRTCManager(swapper, lip_syncer)
-            print("✅ WebRTC enabled")
+            if ENABLE_AV_SYNC_PIPELINE:
+                from webrtc import SyncWebRTCManager
+                webrtc_manager = SyncWebRTCManager(swapper, lip_syncer)
+                print("✅ WebRTC enabled (A/V Sync Agent Pipeline — Approach 4)")
+            else:
+                from webrtc import WebRTCManager
+                webrtc_manager = WebRTCManager(swapper, lip_syncer)
+                print("✅ WebRTC enabled (legacy mode)")
         except ImportError as e:
             print(f"⚠️ WebRTC disabled (aiortc not installed): {e}")
     else:
@@ -123,6 +139,7 @@ async def health_check():
         "mode": "simple-flip",
         "gpu_active": gpu.get("gpu_active", False),
         "webrtc_enabled": webrtc_manager is not None,
+        "av_sync_pipeline": ENABLE_AV_SYNC_PIPELINE,
         "swap_engine": SWAP_ENGINE,
         "face_parsing": swapper.face_parser is not None and swapper.face_parser.is_ready() if swapper else False,
         "liveportrait": swapper.live_portrait is not None and swapper.live_portrait.is_ready() if swapper else False,
@@ -580,6 +597,27 @@ async def delete_session(session_id: str):
         await webrtc_manager.cleanup_session(session_id)
     print(f"Session {session_id} cleaned up")
     return {"status": "success", "message": "Session cleaned up"}
+
+
+@app.get("/session/{session_id}/sync-metrics")
+async def get_sync_metrics(session_id: str):
+    """Get real-time A/V sync pipeline metrics for a session."""
+    if not ENABLE_AV_SYNC_PIPELINE:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "A/V sync pipeline not enabled. Set ENABLE_AV_SYNC_PIPELINE=true"}
+        )
+    if not webrtc_manager:
+        return JSONResponse(status_code=400, content={"error": "WebRTC not enabled"})
+    metrics = None
+    if hasattr(webrtc_manager, 'get_pipeline_metrics'):
+        metrics = webrtc_manager.get_pipeline_metrics(session_id)
+    if metrics is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"No active pipeline for session {session_id}"}
+        )
+    return metrics
 
 if __name__ == "__main__":
     uvicorn.run(app, host=HOST, port=PORT)

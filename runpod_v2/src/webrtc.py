@@ -38,7 +38,11 @@ from av import VideoFrame, AudioFrame
 
 from face_swapper import FaceSwapper
 from lip_syncer import LipSyncer
-from config import ENABLE_LIPSYNC, LIPSYNC_AUDIO_WINDOW_MS
+from config import (
+    ENABLE_LIPSYNC, LIPSYNC_AUDIO_WINDOW_MS, ENABLE_AV_SYNC_PIPELINE,
+    AV_SYNC_AUDIO_BUFFER_MS, AV_SYNC_MAX_AUDIO_WAIT_MS,
+    AV_SYNC_DRIFT_RECAL_FRAMES, AV_SYNC_AVO_WARNING_MS, AV_SYNC_AVO_CRITICAL_MS,
+)
 
 # ── Monkey-patch aiortc's VP8 encoder for higher quality ──
 # aiortc defaults: qmax=56, cpu-used=-6 (fastest/ugliest), 500 Kbps.
@@ -474,3 +478,253 @@ class WebRTCManager:
             **self.session_settings.get(session_id, {}),
             **settings
         }
+
+
+# ═══════════════════════════════════════════════════════════════
+# Approach 4: Agent-Based A/V Sync Pipeline Manager
+# ═══════════════════════════════════════════════════════════════
+# When ENABLE_AV_SYNC_PIPELINE=true, this replaces the original
+# WebRTCManager with the 7-agent synchronized pipeline.
+# Falls back to the original approach if the pipeline fails.
+# ═══════════════════════════════════════════════════════════════
+
+class SyncWebRTCManager:
+    """
+    WebRTC manager using the 7-agent A/V sync pipeline.
+
+    Architecture:
+      Client → WebRTC → Agent 1 (Ingest) → Agent 2 (FaceSwap) → Agent 4 (PTSAlign)
+                                ↓                                       ↑
+                         Agent 3 (AudioBuffer) ─────────────────────────┘
+                                                       ↓
+                                                Agent 5 (MuxEncode)
+                                                   ↓         ↓
+                                          SyncedVideo   SyncedAudio → WebRTC → Client
+
+    Falls back to the original VideoTransformTrack approach if the
+    pipeline fails to start or the circuit breaker trips.
+    """
+
+    def __init__(self, swapper: FaceSwapper, lip_syncer: Optional[LipSyncer]):
+        self.swapper = swapper
+        self.lip_syncer = lip_syncer
+        self.pcs: Dict[str, RTCPeerConnection] = {}
+        self.pipelines: Dict[str, 'SyncPipeline'] = {}
+        self.relay = MediaRelay()
+        self.session_settings: Dict[str, dict] = {}
+        # Keep a fallback manager for circuit-breaker scenarios
+        self._fallback_manager = WebRTCManager(swapper, lip_syncer)
+
+    async def handle_offer(self, session_id: str, sdp: str, type: str) -> RTCSessionDescription:
+        """Handle WebRTC offer using the agent-based sync pipeline."""
+        from agents.pipeline import SyncPipeline
+        from agents.models import PipelineConfig
+
+        # Close any existing connection
+        if session_id in self.pcs:
+            await self.cleanup_session(session_id)
+
+        # Parse bitrate hint from SDP
+        client_bitrate = _parse_sdp_bitrate(sdp)
+        if not client_bitrate:
+            client_bitrate = 3_000_000
+        print(f"[SyncWebRTC:{session_id}] Bitrate: {client_bitrate // 1000} Kbps")
+
+        pc = RTCPeerConnection()
+        self.pcs[session_id] = pc
+
+        # Create the sync pipeline
+        settings = self.session_settings.get(session_id, {})
+        enable_lipsync = settings.get("enable_lipsync", ENABLE_LIPSYNC)
+
+        config = PipelineConfig(
+            video_bitrate=client_bitrate,
+            target_fps=30,
+            audio_buffer_capacity_ms=float(AV_SYNC_AUDIO_BUFFER_MS),
+            max_audio_wait_ms=float(AV_SYNC_MAX_AUDIO_WAIT_MS),
+            drift_recalibrate_frames=AV_SYNC_DRIFT_RECAL_FRAMES,
+            avo_warning_ms=AV_SYNC_AVO_WARNING_MS,
+            avo_critical_ms=AV_SYNC_AVO_CRITICAL_MS,
+        )
+
+        pipeline = SyncPipeline(
+            session_id=session_id,
+            swapper=self.swapper,
+            lip_syncer=self.lip_syncer,
+            config=config,
+            target_bitrate=client_bitrate,
+            enable_lipsync=enable_lipsync,
+            session_settings=settings,
+        )
+        self.pipelines[session_id] = pipeline
+
+        # Collect tracks as they arrive
+        received_tracks = {"video": None, "audio": None}
+        pipeline_started = {"started": False}
+
+        @pc.on("track")
+        def on_track(track: MediaStreamTrack):
+            if track.kind == "audio":
+                received_tracks["audio"] = track
+                print(f"[SyncWebRTC:{session_id}] Audio track received")
+            elif track.kind == "video":
+                received_tracks["video"] = self.relay.subscribe(track)
+                print(f"[SyncWebRTC:{session_id}] Video track received")
+
+            # Once video arrives, wait briefly for audio then start pipeline
+            if received_tracks["video"] and not pipeline_started["started"]:
+                pipeline_started["started"] = True
+                asyncio.ensure_future(
+                    self._wait_and_start_pipeline(
+                        session_id, pc, received_tracks, client_bitrate
+                    )
+                )
+
+        @pc.on("connectionstatechange")
+        async def on_state_change():
+            state = pc.connectionState
+            print(f"[SyncWebRTC:{session_id}] Connection state: {state}")
+            if state in ["failed", "closed", "disconnected"]:
+                await self.cleanup_session(session_id)
+
+        offer = RTCSessionDescription(sdp=sdp, type=type)
+        await pc.setRemoteDescription(offer)
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        return pc.localDescription
+
+    async def _wait_and_start_pipeline(
+        self,
+        session_id: str,
+        pc: RTCPeerConnection,
+        tracks: dict,
+        client_bitrate: int,
+    ) -> None:
+        """Wait briefly for audio track, then start pipeline."""
+        # Audio track may arrive slightly after video — wait up to 500ms
+        for _ in range(10):
+            if tracks.get("audio"):
+                break
+            await asyncio.sleep(0.05)
+
+        if not tracks.get("audio"):
+            print(f"[SyncWebRTC:{session_id}] No audio track after 500ms — starting video-only")
+
+        await self._start_pipeline(session_id, pc, tracks, client_bitrate)
+
+    async def _start_pipeline(
+        self,
+        session_id: str,
+        pc: RTCPeerConnection,
+        tracks: dict,
+        client_bitrate: int,
+    ) -> None:
+        """Start the agent pipeline and add output tracks to the peer connection."""
+        pipeline = self.pipelines.get(session_id)
+        if not pipeline:
+            return
+
+        try:
+            # Set input tracks
+            pipeline.set_tracks(tracks.get("video"), tracks.get("audio"))
+
+            # Start the 7-agent pipeline
+            await pipeline.start()
+
+            # Add synced output tracks to the peer connection
+            pc.addTrack(pipeline.video_output_track)
+
+            # Add synced audio track (relays processed + aligned audio)
+            if tracks.get("audio"):
+                pc.addTrack(pipeline.audio_output_track)
+
+            # Set encoder bitrate
+            async def _set_bitrate():
+                for sender in pc.getSenders():
+                    if sender.track == pipeline.video_output_track:
+                        for _ in range(50):
+                            enc = getattr(sender, '_RTCRtpSender__encoder', None)
+                            if enc and hasattr(enc, 'target_bitrate'):
+                                enc.target_bitrate = client_bitrate
+                                print(f"[SyncWebRTC:{session_id}] Encoder bitrate → {client_bitrate // 1000} Kbps")
+                                return
+                            await asyncio.sleep(0.1)
+            asyncio.ensure_future(_set_bitrate())
+
+            print(f"[SyncWebRTC:{session_id}] ✅ Agent pipeline started successfully")
+
+        except Exception as exc:
+            print(f"[SyncWebRTC:{session_id}] ❌ Pipeline start failed: {exc}")
+            print(f"[SyncWebRTC:{session_id}] Falling back to legacy mode")
+            # Fallback to original approach
+            await self._fallback_to_legacy(session_id, pc, tracks, client_bitrate)
+
+    async def _fallback_to_legacy(
+        self,
+        session_id: str,
+        pc: RTCPeerConnection,
+        tracks: dict,
+        client_bitrate: int,
+    ) -> None:
+        """Fall back to the original VideoTransformTrack approach."""
+        audio_buf = AudioBuffer()
+
+        # Set up legacy audio reader
+        if tracks.get("audio"):
+            async def recv_audio():
+                try:
+                    while True:
+                        frame = await tracks["audio"].recv()
+                        audio_buf.append(frame)
+                except Exception:
+                    pass
+            asyncio.ensure_future(recv_audio())
+
+        # Set up legacy video track
+        if tracks.get("video"):
+            local_video = VideoTransformTrack(
+                tracks["video"],
+                self.swapper,
+                self.lip_syncer,
+                session_id,
+                audio_buf,
+                self.session_settings,
+                target_bitrate=client_bitrate,
+            )
+            pc.addTrack(local_video)
+
+    async def cleanup_session(self, session_id: str):
+        """Clean up pipeline and peer connection for a session."""
+        # Stop the agent pipeline
+        if session_id in self.pipelines:
+            try:
+                await self.pipelines[session_id].stop()
+            except Exception as exc:
+                print(f"[SyncWebRTC:{session_id}] Pipeline stop error: {exc}")
+            del self.pipelines[session_id]
+
+        # Close peer connection
+        if session_id in self.pcs:
+            try:
+                await self.pcs[session_id].close()
+            except Exception:
+                pass
+            del self.pcs[session_id]
+
+        self.session_settings.pop(session_id, None)
+
+        if self.lip_syncer:
+            self.lip_syncer.cleanup_session(session_id)
+
+    def set_session_settings(self, session_id: str, settings: dict):
+        self.session_settings[session_id] = {
+            **self.session_settings.get(session_id, {}),
+            **settings
+        }
+
+    def get_pipeline_metrics(self, session_id: str) -> Optional[dict]:
+        """Get sync pipeline metrics for a session."""
+        pipeline = self.pipelines.get(session_id)
+        if pipeline:
+            return pipeline.get_metrics()
+        return None
