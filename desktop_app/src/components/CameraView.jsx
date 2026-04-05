@@ -15,7 +15,10 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     const audioCtxRef = useRef(null);
     const remoteAudioCtxRef = useRef(null);
     const remoteAudioDelayNodeRef = useRef(null);
+    const remoteAudioSourceRef = useRef(null);
+    const remoteAudioDestRef = useRef(null);
     const remoteAudioElRef = useRef(null);
+    const remoteAudioUnlockElRef = useRef(null);
     const audioBufferRef = useRef(new Int16Array(0));
     const audioSampleRateRef = useRef(16000);
 
@@ -237,10 +240,25 @@ window.addEventListener('beforeunload', () => bc.close());
             }
             remoteAudioElRef.current = null;
         }
+        if (remoteAudioUnlockElRef.current) {
+            remoteAudioUnlockElRef.current.pause();
+            remoteAudioUnlockElRef.current.srcObject = null;
+            remoteAudioUnlockElRef.current = null;
+        }
+
+        if (remoteAudioSourceRef.current) {
+            try { remoteAudioSourceRef.current.disconnect(); } catch (_) {}
+            remoteAudioSourceRef.current = null;
+        }
         if (remoteAudioDelayNodeRef.current) {
             try { remoteAudioDelayNodeRef.current.disconnect(); } catch (_) {}
             remoteAudioDelayNodeRef.current = null;
         }
+        if (remoteAudioDestRef.current) {
+            try { remoteAudioDestRef.current.disconnect(); } catch (_) {}
+            remoteAudioDestRef.current = null;
+        }
+
         if (closeCtx && remoteAudioCtxRef.current) {
             remoteAudioCtxRef.current.close().catch(() => {});
             remoteAudioCtxRef.current = null;
@@ -277,7 +295,6 @@ window.addEventListener('beforeunload', () => bc.close());
         let cancelled = false;
         (async () => {
             try {
-                console.log('[WebRTC-Audio] Starting BlackHole routing...');
                 const devices = await navigator.mediaDevices.enumerateDevices();
                 if (cancelled) return;
                 const virtualOutput = devices.find(d =>
@@ -285,75 +302,78 @@ window.addEventListener('beforeunload', () => bc.close());
                     (d.label.toLowerCase().includes('blackhole') ||
                      d.label.toLowerCase().includes('vb-audio'))
                 );
-                if (!virtualOutput || typeof HTMLMediaElement.prototype.setSinkId !== 'function') {
-                    console.warn('[WebRTC-Audio] BlackHole/VB-Audio not found — audio stays muted. Devices:', devices.filter(d => d.kind === 'audiooutput').map(d => d.label));
+                if (virtualOutput && typeof HTMLMediaElement.prototype.setSinkId === 'function') {
+                    cleanupRemoteAudioRouting(false);
+
+                    const remoteAudioStream = new MediaStream(audioTracks);
+
+                    // CRITICAL CHROMIUM BUG FIX: WebRTC audio tracks produce silence when plugged 
+                    // directly into WebAudio API createMediaStreamSource() UNLESS the track is also 
+                    // attached to a playing HTML Media Element. We attach it to a muted background audio tag.
+                    const unlockAudioEl = document.createElement('audio');
+                    unlockAudioEl.srcObject = remoteAudioStream;
+                    unlockAudioEl.muted = true;
+                    unlockAudioEl.play().catch(() => {});
+                    remoteAudioUnlockElRef.current = unlockAudioEl;
+
+                    let remoteAudioCtx = remoteAudioCtxRef.current;
+                    if (!remoteAudioCtx || remoteAudioCtx.state === 'closed') {
+                        remoteAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                        remoteAudioCtxRef.current = remoteAudioCtx;
+                        console.log('[WebRTC-Audio] Created fallback AudioContext outside Start click');
+                    }
+
+                    if (remoteAudioCtx.state === 'suspended') {
+                        await remoteAudioCtx.resume().catch(() => {});
+                    }
+
+                    const remoteSource = remoteAudioCtx.createMediaStreamSource(remoteAudioStream);
+                    const remoteDelayNode = remoteAudioCtx.createDelay(6.0);
+                    const remoteDest = remoteAudioCtx.createMediaStreamDestination();
+                    const remoteAudioEl = document.createElement('audio');
+
+                    remoteDelayNode.delayTime.value = extraAudioDelayMs / 1000;
+                    remoteSource.connect(remoteDelayNode);
+                    remoteDelayNode.connect(remoteDest);
+
+                    remoteAudioSourceRef.current = remoteSource;
+                    remoteAudioDelayNodeRef.current = remoteDelayNode;
+                    remoteAudioDestRef.current = remoteDest;
+                    remoteAudioElRef.current = remoteAudioEl;
+
+                    remoteAudioEl.srcObject = remoteDest.stream;
+                    remoteAudioEl.muted = true;
+                    remoteAudioEl.autoplay = false;
+                    remoteAudioEl.playsInline = true;
+                    remoteAudioEl.style.display = 'none';
+                    document.body.appendChild(remoteAudioEl);
+
+                    await remoteAudioEl.setSinkId(virtualOutput.deviceId);
+                    if (cancelled) return;
+
+                    videoEl.muted = true;
+                    remoteAudioEl.muted = false;
+                    remoteAudioEl.volume = 1.0;
+
+                    try {
+                        await remoteAudioEl.play();
+                        audioRoutedToBlackHoleRef.current = true;
+                        console.log(`[WebRTC-Audio] Remote audio routed to BlackHole: ${virtualOutput.label} (+${extraAudioDelayMs}ms)`);
+                    } catch (playErr) {
+                        console.warn('[WebRTC-Audio] play() blocked, waiting for user click:', playErr.message);
+                        document.addEventListener('click', () => {
+                            remoteAudioEl.play().then(() => {
+                                audioRoutedToBlackHoleRef.current = true;
+                                console.log('[WebRTC-Audio] Playback resumed after user click');
+                            }).catch(() => {});
+                        }, { once: true });
+                    }
+                } else {
+                    console.warn('[WebRTC] BlackHole/VB-Audio not found — audio stays muted');
                     audioRoutedToBlackHoleRef.current = false;
-                    return;
                 }
-                console.log('[WebRTC-Audio] Found virtual output:', virtualOutput.label);
-
-                // Clean up previous routing (but keep AudioContext alive)
-                cleanupRemoteAudioRouting(false);
-
-                // Re-use AudioContext created during user gesture, or create new one
-                let remoteAudioCtx = remoteAudioCtxRef.current;
-                if (!remoteAudioCtx || remoteAudioCtx.state === 'closed') {
-                    console.log('[WebRTC-Audio] Creating new AudioContext (no pre-existing one)');
-                    remoteAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-                    remoteAudioCtxRef.current = remoteAudioCtx;
-                }
-
-                // Resume AudioContext if suspended
-                if (remoteAudioCtx.state === 'suspended') {
-                    console.log('[WebRTC-Audio] AudioContext suspended, resuming...');
-                    await remoteAudioCtx.resume();
-                    console.log('[WebRTC-Audio] AudioContext state after resume:', remoteAudioCtx.state);
-                }
-                if (cancelled) return;
-
-                const remoteAudioStream = new MediaStream(audioTracks);
-                console.log('[WebRTC-Audio] Audio tracks:', audioTracks.map(t => `${t.label} (${t.readyState}, muted=${t.muted})`));
-
-                const remoteSource = remoteAudioCtx.createMediaStreamSource(remoteAudioStream);
-                const remoteDelayNode = remoteAudioCtx.createDelay(6.0);
-                remoteDelayNode.delayTime.value = extraAudioDelayMs / 1000;
-                const remoteDest = remoteAudioCtx.createMediaStreamDestination();
-
-                remoteSource.connect(remoteDelayNode);
-                remoteDelayNode.connect(remoteDest);
-                remoteAudioDelayNodeRef.current = remoteDelayNode;
-
-                // Create Audio element IN the DOM for reliable playback
-                const remoteAudioEl = document.createElement('audio');
-                remoteAudioEl.style.display = 'none';
-                document.body.appendChild(remoteAudioEl);
-                remoteAudioElRef.current = remoteAudioEl;
-
-                remoteAudioEl.srcObject = remoteDest.stream;
-
-                // Set sink BEFORE playing
-                await remoteAudioEl.setSinkId(virtualOutput.deviceId);
-                console.log('[WebRTC-Audio] setSinkId done:', virtualOutput.label);
-                if (cancelled) return;
-
-                remoteAudioEl.volume = 1.0;
-                try {
-                    await remoteAudioEl.play();
-                    console.log('[WebRTC-Audio] play() succeeded');
-                } catch (playErr) {
-                    console.warn('[WebRTC-Audio] play() blocked:', playErr.message, '— waiting for click');
-                    document.addEventListener('click', () => {
-                        remoteAudioEl.play().then(() => {
-                            console.log('[WebRTC-Audio] play() succeeded after click');
-                            audioRoutedToBlackHoleRef.current = true;
-                        }).catch(() => {});
-                    }, { once: true });
-                }
-
-                audioRoutedToBlackHoleRef.current = true;
-                console.log(`[WebRTC-Audio] Remote audio routed to BlackHole: ${virtualOutput.label} (+${extraAudioDelayMs}ms) | AudioContext: ${remoteAudioCtx.state} | paused: ${remoteAudioEl.paused}`);
             } catch (e) {
-                console.error('[WebRTC-Audio] Failed to route audio:', e.message, e);
+                console.warn('[WebRTC] Failed to route audio:', e.message);
                 cleanupRemoteAudioRouting(false);
                 audioRoutedToBlackHoleRef.current = false;
             }
@@ -1018,11 +1038,13 @@ window.addEventListener('beforeunload', () => bc.close());
             }
 
             if (transportMode === 'webrtc') {
-                // Pre-create AudioContext during user gesture so it starts 'running'
-                // (Chrome suspends AudioContext created outside user gestures)
                 if (!remoteAudioCtxRef.current || remoteAudioCtxRef.current.state === 'closed') {
                     remoteAudioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
-                    console.log('[WebRTC-Audio] Pre-created AudioContext in user gesture, state:', remoteAudioCtxRef.current.state);
+                    console.log('[WebRTC-Audio] Pre-created AudioContext during Start click:', remoteAudioCtxRef.current.state);
+                }
+                if (remoteAudioCtxRef.current.state === 'suspended') {
+                    await remoteAudioCtxRef.current.resume().catch(() => {});
+                    console.log('[WebRTC-Audio] AudioContext state after resume:', remoteAudioCtxRef.current.state);
                 }
                 try {
                     setDiagnostics(prev => ({ ...prev, webrtc: 'Trying WebRTC...' }));
@@ -1030,6 +1052,7 @@ window.addEventListener('beforeunload', () => bc.close());
                     setDiagnostics(prev => ({ ...prev, webrtc: 'WebRTC connected!' }));
                 } catch (rtcErr) {
                     console.log('WebRTC failed, falling back to WebSocket:', rtcErr.message);
+                    cleanupRemoteAudioRouting(true);
                     setDiagnostics(prev => ({ ...prev, webrtc: `WebRTC failed: ${rtcErr.message} → using WebSocket` }));
                     connectWs();
                 }
@@ -1049,7 +1072,7 @@ window.addEventListener('beforeunload', () => bc.close());
         disconnectWs();
         disconnect();
         stopWebcam();
-        cleanupRemoteAudioRouting(true);  // Close AudioContext on full stop
+        cleanupRemoteAudioRouting(true);
         setFps(0);
         setLatency(0);
         audioBufferRef.current = new Int16Array(0);
