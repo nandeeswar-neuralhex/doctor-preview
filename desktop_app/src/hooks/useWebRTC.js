@@ -95,6 +95,24 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream, onLatency) {
                 lastFrameTime: Date.now(),
                 lastBaseLatency: 0,
             };
+
+            // ── Latency recorder: stores every sample for analysis ──
+            const latencyLog = [];
+            const t0 = Date.now();
+            window.__latencyLog = latencyLog;
+            window.__downloadLatencyLog = () => {
+                const header = 'elapsed_s,total_ms,ice_rtt_ms,send_delay_ms,server_ms,jitter_buf_ms,stall_ms,inbound_fps,packets_lost,jitter\n';
+                const rows = latencyLog.map(r =>
+                    `${r.t},${r.total},${r.rtt},${r.send},${r.server},${r.jb},${r.stall},${r.fps},${r.lost},${r.jitter}`
+                ).join('\n');
+                const blob = new Blob([header + rows], { type: 'text/csv' });
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = `latency_log_${Date.now()}.csv`;
+                a.click();
+                console.log(`[LatencyLog] Downloaded ${latencyLog.length} samples`);
+            };
+
             latencyPollRef.current = setInterval(async () => {
                 try {
                     const stats = await pc.getStats();
@@ -102,6 +120,9 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream, onLatency) {
                     let jbDelayMs = 0;
                     let sendDelayMs = 0;
                     let inboundHasNewFrames = false;
+                    let inboundFps = 0;
+                    let packetsLost = 0;
+                    let jitter = 0;
 
                     for (const report of stats.values()) {
                         if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.currentRoundTripTime != null) {
@@ -126,29 +147,45 @@ function useWebRTC(serverUrl, sessionId, onRemoteStream, onLatency) {
                             if (deltaCount > 0) {
                                 jbDelayMs = (deltaDelay / deltaCount) * 1000;
                                 inboundHasNewFrames = true;
+                                inboundFps = deltaCount;  // frames in last 1s
                             }
                             prevStatsRef.current.jitterBufferDelay = report.jitterBufferDelay;
                             prevStatsRef.current.jitterBufferEmittedCount = report.jitterBufferEmittedCount;
+                            packetsLost = report.packetsLost || 0;
+                            jitter = report.jitter || 0;
                         }
                     }
 
+                    const SERVER_PROCESSING_MS = 130;
+                    let stallMs = 0;
+                    let totalLatency;
+
                     if (inboundHasNewFrames) {
-                        // Server-side face-swap processing takes ~100-150ms (GPU).
-                        // 130ms is a safe middle estimate for the processing + VP8 encode.
-                        const SERVER_PROCESSING_MS = 130;
-                        const totalLatency = Math.round(sendDelayMs + iceRttMs + SERVER_PROCESSING_MS + jbDelayMs);
+                        totalLatency = Math.round(sendDelayMs + iceRttMs + SERVER_PROCESSING_MS + jbDelayMs);
                         prevStatsRef.current.lastFrameTime = Date.now();
                         prevStatsRef.current.lastBaseLatency = totalLatency;
-                        if (onLatencyRef.current) {
-                            onLatencyRef.current(totalLatency);
-                        }
                     } else {
-                        const stallMs = Date.now() - prevStatsRef.current.lastFrameTime;
-                        const totalLatency = Math.round(prevStatsRef.current.lastBaseLatency + stallMs);
-                        if (onLatencyRef.current) {
-                            onLatencyRef.current(totalLatency);
-                        }
+                        stallMs = Date.now() - prevStatsRef.current.lastFrameTime;
+                        totalLatency = Math.round(prevStatsRef.current.lastBaseLatency + stallMs);
                     }
+
+                    if (onLatencyRef.current) {
+                        onLatencyRef.current(totalLatency);
+                    }
+
+                    // Record every sample for analysis
+                    latencyLog.push({
+                        t: ((Date.now() - t0) / 1000).toFixed(1),
+                        total: totalLatency,
+                        rtt: Math.round(iceRttMs),
+                        send: Math.round(sendDelayMs),
+                        server: SERVER_PROCESSING_MS,
+                        jb: Math.round(jbDelayMs),
+                        stall: Math.round(stallMs),
+                        fps: inboundFps,
+                        lost: packetsLost,
+                        jitter: jitter.toFixed(4),
+                    });
                 } catch (_) {
                 }
             }, 1000);

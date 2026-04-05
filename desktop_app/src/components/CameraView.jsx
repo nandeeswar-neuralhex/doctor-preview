@@ -250,9 +250,8 @@ window.addEventListener('beforeunload', () => bc.close());
                 if (virtualOutput && typeof videoEl.setSinkId === 'function') {
                     await videoEl.setSinkId(virtualOutput.deviceId);
                     if (cancelled) return;
-                    // Sink is set to BlackHole — safe to un-mute and ensure playing
+                    // Sink is set to BlackHole — safe to un-mute
                     videoEl.muted = false;
-                    videoEl.play().catch(() => {});
                     audioRoutedToBlackHoleRef.current = true;
                     console.log(`[WebRTC] Audio routed to BlackHole: ${virtualOutput.label}`);
                 } else {
@@ -1220,13 +1219,13 @@ window.addEventListener('beforeunload', () => bc.close());
                                 <video
                                     ref={(el) => {
                                         processedVideoRef.current = el;
-                                        // Start muted ONLY on first mount.
-                                        // Don't reset muted on re-renders — the BlackHole
-                                        // routing effect sets muted=false after setSinkId.
+                                        // Start muted; useEffect un-mutes after setSinkId → BlackHole
+                                        if (el && !audioRoutedToBlackHoleRef.current) {
+                                            el.muted = true;
+                                        }
                                     }}
                                     autoPlay
                                     playsInline
-                                    muted
                                     className="w-full h-full object-contain"
                                     style={{ filter: processedFrameFilter }}
                                 />
