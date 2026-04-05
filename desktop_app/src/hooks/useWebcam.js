@@ -55,7 +55,7 @@ function useWebcam(withAudio = false, audioDelayMs = 300, skipVirtualAudio = fal
                     audioCtxRef.current = audioCtx;
                     const source = audioCtx.createMediaStreamSource(mediaStream);
 
-                    const delayNode = audioCtx.createDelay(2.0); // max delay 2s
+                    const delayNode = audioCtx.createDelay(6.0); // max delay 6s
                     delayNode.delayTime.value = audioDelayMs / 1000;
                     delayNodeRef.current = delayNode;
 

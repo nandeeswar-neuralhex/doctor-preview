@@ -1087,7 +1087,7 @@ window.addEventListener('beforeunload', () => bc.close());
                     <input
                         type="range"
                         min="0"
-                        max="1000"
+                        max="5000"
                         step="50"
                         value={extraAudioDelayMs}
                         onChange={(e) => setExtraAudioDelayMs(Number(e.target.value))}
