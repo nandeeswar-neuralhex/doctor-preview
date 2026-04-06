@@ -66,7 +66,7 @@ sudo docker run -d \
   -e HOST=0.0.0.0 \
   -e ENABLE_WEBRTC=true \
   -e ENABLE_LIPSYNC=false \
-  -e JPEG_QUALITY=80 \
+  -e JPEG_QUALITY=95 \
   -e ENABLE_GFPGAN=true \
   -e ENABLE_FACE_PARSING=true \
   -e ENABLE_SEAMLESS_CLONE=false \
