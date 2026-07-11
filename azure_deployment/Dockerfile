@@ -78,6 +78,14 @@ RUN python3 -m pip install --no-cache-dir nvidia-cudnn-cu12==9.1.0.70
 # Step 6: Pin numpy back to 1.x after all installs (avoid binary compat issues)
 RUN python3 -m pip install --no-cache-dir "numpy>=1.24,<2.0"
 
+# Step 7: basicsr 1.4.2 imports torchvision.transforms.functional_tensor which
+# was removed in torchvision>=0.17 — patch the import so GFPGAN can load.
+RUN DEG=$(python3 -c "import basicsr, os; print(os.path.join(os.path.dirname(basicsr.__file__), 'data', 'degradations.py'))" 2>/dev/null) \
+    && [ -n "$DEG" ] \
+    && sed -i 's/from torchvision.transforms.functional_tensor import rgb_to_grayscale/from torchvision.transforms.functional import rgb_to_grayscale/' "$DEG" \
+    && python3 -c "from gfpgan import GFPGANer; print('GFPGAN import OK')" \
+    || echo "basicsr patch skipped"
+
 # Copy application source
 COPY src/ ./src/
 
