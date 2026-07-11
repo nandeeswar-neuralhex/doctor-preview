@@ -193,3 +193,7 @@ class LipSyncer:
         blended = face_region * (1.0 - mask_3d) + lip_region * mask_3d
         result[y1:y2, x1:x2] = blended.astype(np.uint8)
         return result
+
+    def cleanup_session(self, session_id: str) -> None:
+        """Release per-session state. This implementation is stateless — no-op."""
+        return

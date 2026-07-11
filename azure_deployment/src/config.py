@@ -43,6 +43,15 @@ ENABLE_LIPSYNC = os.getenv("ENABLE_LIPSYNC", "true").lower() == "true"
 WAV2LIP_MODEL_PATH = os.getenv("WAV2LIP_MODEL_PATH", os.path.join(MODELS_DIR, "wav2lip_gan_96.onnx"))
 LIPSYNC_AUDIO_WINDOW_MS = int(os.getenv("LIPSYNC_AUDIO_WINDOW_MS", "500"))
 
+# A/V sync: relay the client's mic audio back over the SAME WebRTC peer
+# connection, delayed to match the measured video pipeline latency. The
+# browser then aligns both tracks via RTCP sender reports, so voice and
+# mouth arrive in sync (and OBS captures them already synced).
+ENABLE_AUDIO_RELAY = os.getenv("ENABLE_AUDIO_RELAY", "true").lower() == "true"
+# Extra fixed delay (ms) on top of the measured video latency — use to
+# compensate for client-side render/display delay if needed.
+AUDIO_RELAY_EXTRA_DELAY_MS = int(os.getenv("AUDIO_RELAY_EXTRA_DELAY_MS", "0"))
+
 # Frame processing
 TARGET_FPS = int(os.getenv("TARGET_FPS", "24"))
 FRAME_TIMEOUT_MS = 1000 // TARGET_FPS  # ~41ms for 24 FPS

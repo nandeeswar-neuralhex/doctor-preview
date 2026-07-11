@@ -27,6 +27,7 @@ except Exception:
 import re
 import threading
 import time
+from collections import deque
 from typing import Dict, Optional
 from fractions import Fraction
 
@@ -39,9 +40,8 @@ from av import VideoFrame, AudioFrame
 from face_swapper import FaceSwapper
 from lip_syncer import LipSyncer
 from config import (
-    ENABLE_LIPSYNC, LIPSYNC_AUDIO_WINDOW_MS, ENABLE_AV_SYNC_PIPELINE,
-    AV_SYNC_AUDIO_BUFFER_MS, AV_SYNC_MAX_AUDIO_WAIT_MS,
-    AV_SYNC_DRIFT_RECAL_FRAMES, AV_SYNC_AVO_WARNING_MS, AV_SYNC_AVO_CRITICAL_MS,
+    ENABLE_LIPSYNC, LIPSYNC_AUDIO_WINDOW_MS,
+    ENABLE_AUDIO_RELAY, AUDIO_RELAY_EXTRA_DELAY_MS,
 )
 
 # ── Monkey-patch aiortc's VP8 encoder for higher quality ──
@@ -201,6 +201,7 @@ class VideoTransformTrack(MediaStreamTrack):
         audio_buffer: AudioBuffer,
         session_settings: Optional[Dict[str, dict]] = None,
         target_bitrate: Optional[int] = None,
+        latency_state: Optional[dict] = None,
     ):
         super().__init__()
         self.track = track
@@ -210,6 +211,11 @@ class VideoTransformTrack(MediaStreamTrack):
         self.audio_buffer = audio_buffer
         self.session_settings = session_settings or {}
         self._target_bitrate = target_bitrate  # from client SDP b=AS hint
+
+        # A/V sync: shared latency estimate (ms) — written here, read by
+        # DelayedAudioRelayTrack so relayed audio matches video timing.
+        self._latency_state = latency_state if latency_state is not None else {"ms": 100.0}
+        self._latest_input_ts = 0.0
 
         # Shared state between input reader, GPU worker, and output
         self._latest_input = None       # latest raw frame (numpy BGR)
@@ -253,6 +259,7 @@ class VideoTransformTrack(MediaStreamTrack):
 
             with self._input_lock:
                 img = self._latest_input
+                input_ts = self._latest_input_ts
             if img is None:
                 continue
 
@@ -264,16 +271,14 @@ class VideoTransformTrack(MediaStreamTrack):
                 new_h = self.MAX_PROCESS_HEIGHT
                 img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-            # Check if lip sync will run — if so, skip mouth preservation
+            # Check if lip sync will run
             settings = self.session_settings.get(self.session_id, {}) if self.session_settings else {}
             enable_lipsync = settings.get("enable_lipsync", ENABLE_LIPSYNC)
             will_lipsync = (enable_lipsync and self.lip_syncer
                            and self.lip_syncer.is_ready())
 
-            # Face swap (GPU) — with skip_mouth_preservation if lip sync active
-            result, faces = self.swapper.swap_face_with_faces(
-                self.session_id, img, skip_mouth_preservation=will_lipsync
-            )
+            # Face swap (GPU)
+            result, faces = self.swapper.swap_face_with_faces(self.session_id, img)
 
             # Lip sync — use the SWAPPED result so generated mouth
             # matches target skin tone (not original person's)
@@ -288,7 +293,7 @@ class VideoTransformTrack(MediaStreamTrack):
                     x2, y2 = min(result.shape[1], x2), min(result.shape[0], y2)
                     if x2 > x1 and y2 > y1:
                         face_crop = result[y1:y2, x1:x2]
-                        synced = self.lip_syncer.infer(face_crop, mel, self.session_id)
+                        synced = self.lip_syncer.infer(face_crop, mel)
                         if synced is not None:
                             result = self.lip_syncer.apply_mouth_only(
                                 result, (x1, y1, x2, y2), synced
@@ -301,6 +306,16 @@ class VideoTransformTrack(MediaStreamTrack):
             with self._result_lock:
                 self._latest_result = result
             self._swap_count += 1
+
+            # A/V sync: measure input→result latency and keep an asymmetric
+            # EMA. Rises fast (audio must never lead the mouth), falls slowly
+            # (avoids oscillating delay that clips words).
+            if input_ts > 0:
+                total_ms = (time.monotonic() - input_ts) * 1000.0 \
+                    + (self.FRAME_INTERVAL * 500.0)  # + avg output pacing wait
+                prev = self._latency_state.get("ms", 100.0)
+                alpha = 0.30 if total_ms > prev else 0.05
+                self._latency_state["ms"] = prev + alpha * (total_ms - prev)
 
             # Signal the output that a new result is ready
             if self._loop:
@@ -319,6 +334,7 @@ class VideoTransformTrack(MediaStreamTrack):
                     print(f"[WebRTC:{self.session_id}] Input resolution: {w}×{h}")
                 with self._input_lock:
                     self._latest_input = img
+                    self._latest_input_ts = time.monotonic()
                 self._has_input.set()
         except Exception:
             pass
@@ -379,6 +395,161 @@ class VideoTransformTrack(MediaStreamTrack):
         super().stop()
 
 
+class DelayedAudioRelayTrack(MediaStreamTrack):
+    """Relays the client's mic audio back, delayed to match video latency.
+
+    A/V sync (Option A): because this track shares the peer connection with
+    the processed video track, the receiving browser aligns both via RTCP
+    sender reports. Delaying the audio by the measured face-swap latency
+    means the audio content leaving the server at time T corresponds to the
+    same capture moment as the video content leaving at time T — so the
+    client plays voice and mouth in sync, and OBS captures them already
+    synced (any delay OBS adds applies to both equally).
+
+    Design:
+    - A reader task queues incoming frames with arrival timestamps and
+      feeds the lipsync AudioBuffer.
+    - recv() emits one frame per ~20 ms at a steady wallclock cadence.
+    - A queued frame is only released once it has aged `current_delay`;
+      until then silence is emitted (only while the delay builds up).
+    - The delay follows the video pipeline's latency EMA, ramped at a
+      limited rate so words are never clipped by sudden jumps.
+    """
+
+    kind = "audio"
+
+    RAMP_MS_PER_SEC = 60.0    # max delay change rate (no word cutoff)
+    MAX_QUEUE_SECONDS = 5.0   # hard cap on buffered audio
+
+    def __init__(
+        self,
+        source: MediaStreamTrack,
+        audio_buffer: AudioBuffer,
+        latency_state: dict,
+        extra_delay_ms: int = 0,
+    ):
+        super().__init__()
+        self._source = source
+        self._audio_buffer = audio_buffer
+        self._latency_state = latency_state
+        self._extra_delay_s = max(0, extra_delay_ms) / 1000.0
+
+        self._queue: deque = deque()
+        self._reader_task = None
+        self._started = False
+
+        # Output format — updated from the first real frame received
+        self._sample_rate = 48000
+        self._layout = "mono"
+        self._format = "s16"
+        self._samples = 960  # 20 ms @ 48 kHz
+        self._pts = 0
+        self._next_emit: Optional[float] = None
+
+        # Ramped delay state
+        self._current_delay_s = 0.0
+        self._last_ramp_ts = time.monotonic()
+        self._last_log = time.monotonic()
+
+    async def _read_source(self):
+        """Continuously pull frames from the client's mic track."""
+        try:
+            while True:
+                frame = await self._source.recv()
+                self._audio_buffer.append(frame)  # feed lipsync window
+                self._queue.append((time.monotonic(), frame))
+                max_frames = int(self.MAX_QUEUE_SECONDS * 50)  # ~20ms frames
+                while len(self._queue) > max_frames:
+                    self._queue.popleft()
+        except Exception:
+            pass
+
+    def _target_delay_s(self) -> float:
+        return (self._latency_state.get("ms", 100.0) / 1000.0) + self._extra_delay_s
+
+    def _ramp_delay(self):
+        """Move current delay toward target at a bounded rate."""
+        now = time.monotonic()
+        dt = max(0.0, now - self._last_ramp_ts)
+        self._last_ramp_ts = now
+        target = self._target_delay_s()
+        max_step = (self.RAMP_MS_PER_SEC / 1000.0) * dt
+        diff = target - self._current_delay_s
+        if abs(diff) <= max_step:
+            self._current_delay_s = target
+        else:
+            self._current_delay_s += max_step if diff > 0 else -max_step
+
+    def _make_silence(self) -> AudioFrame:
+        frame = AudioFrame(format=self._format, layout=self._layout, samples=self._samples)
+        for plane in frame.planes:
+            plane.update(bytes(plane.buffer_size))
+        frame.sample_rate = self._sample_rate
+        return frame
+
+    async def recv(self) -> AudioFrame:
+        if not self._started:
+            self._started = True
+            self._reader_task = asyncio.ensure_future(self._read_source())
+
+        # Steady output cadence (one frame per frame-duration)
+        frame_dur = self._samples / float(self._sample_rate)
+        now = time.monotonic()
+        if self._next_emit is None:
+            self._next_emit = now
+        wait = self._next_emit - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+        elif wait < -0.5:
+            self._next_emit = time.monotonic()  # resync after a stall
+        self._next_emit += frame_dur
+
+        self._ramp_delay()
+
+        # Release the oldest frame once it has aged past the current delay
+        out: Optional[AudioFrame] = None
+        now = time.monotonic()
+        while self._queue:
+            arrival, frame = self._queue[0]
+            age = now - arrival
+            if age < self._current_delay_s:
+                break  # not old enough yet → silence below
+            self._queue.popleft()
+            out = frame
+            # If frames are overdue (e.g. after a stall), keep draining to
+            # catch up instead of letting latency drift upward.
+            if age <= self._current_delay_s + 0.10:
+                break
+
+        if out is not None:
+            # Adopt source format for pacing and future silence frames
+            self._sample_rate = out.sample_rate or self._sample_rate
+            self._layout = out.layout.name
+            self._format = out.format.name
+            self._samples = out.samples
+        else:
+            out = self._make_silence()
+
+        # Re-stamp with a monotonic PTS (silence insertion breaks source PTS)
+        out.pts = self._pts
+        out.time_base = Fraction(1, self._sample_rate)
+        self._pts += out.samples
+
+        now = time.monotonic()
+        if now - self._last_log >= 10.0:
+            self._last_log = now
+            print(f"[AudioRelay] delay={self._current_delay_s * 1000:.0f}ms "
+                  f"target={self._target_delay_s() * 1000:.0f}ms "
+                  f"queued={len(self._queue)}")
+
+        return out
+
+    def stop(self):
+        if self._reader_task:
+            self._reader_task.cancel()
+        super().stop()
+
+
 class WebRTCManager:
     def __init__(self, swapper: FaceSwapper, lip_syncer: Optional[LipSyncer]):
         self.swapper = swapper
@@ -405,18 +576,35 @@ class WebRTCManager:
         self.pcs[session_id] = pc
 
         audio_buffer = AudioBuffer()
+        # Shared video-latency estimate (ms): written by VideoTransformTrack,
+        # read by DelayedAudioRelayTrack to keep relayed audio in sync.
+        latency_state = {"ms": 100.0}
 
         @pc.on("track")
         def on_track(track: MediaStreamTrack):
             if track.kind == "audio":
-                async def recv_audio():
-                    try:
-                        while True:
-                            frame = await track.recv()
-                            audio_buffer.append(frame)
-                    except Exception:
-                        pass
-                asyncio.ensure_future(recv_audio())
+                if ENABLE_AUDIO_RELAY:
+                    # A/V sync (Option A): relay mic audio back, delayed to
+                    # match video latency. Same PC as video → browser syncs
+                    # both tracks via RTCP sender reports.
+                    relay_audio = DelayedAudioRelayTrack(
+                        track,
+                        audio_buffer,
+                        latency_state,
+                        extra_delay_ms=AUDIO_RELAY_EXTRA_DELAY_MS,
+                    )
+                    pc.addTrack(relay_audio)
+                    print(f"[WebRTC:{session_id}] Audio relay enabled — "
+                          f"delayed to match video (+{AUDIO_RELAY_EXTRA_DELAY_MS}ms extra)")
+                else:
+                    async def recv_audio():
+                        try:
+                            while True:
+                                frame = await track.recv()
+                                audio_buffer.append(frame)
+                        except Exception:
+                            pass
+                    asyncio.ensure_future(recv_audio())
             elif track.kind == "video":
                 local_video = VideoTransformTrack(
                     self.relay.subscribe(track),
@@ -426,6 +614,7 @@ class WebRTCManager:
                     audio_buffer,
                     self.session_settings,
                     target_bitrate=client_bitrate,
+                    latency_state=latency_state,
                 )
                 pc.addTrack(local_video)
 
@@ -480,251 +669,5 @@ class WebRTCManager:
         }
 
 
-# ═══════════════════════════════════════════════════════════════
-# Approach 4: Agent-Based A/V Sync Pipeline Manager
-# ═══════════════════════════════════════════════════════════════
-# When ENABLE_AV_SYNC_PIPELINE=true, this replaces the original
-# WebRTCManager with the 7-agent synchronized pipeline.
-# Falls back to the original approach if the pipeline fails.
-# ═══════════════════════════════════════════════════════════════
 
-class SyncWebRTCManager:
-    """
-    WebRTC manager using the 7-agent A/V sync pipeline.
 
-    Architecture:
-      Client → WebRTC → Agent 1 (Ingest) → Agent 2 (FaceSwap) → Agent 4 (PTSAlign)
-                                ↓                                       ↑
-                         Agent 3 (AudioBuffer) ─────────────────────────┘
-                                                       ↓
-                                                Agent 5 (MuxEncode)
-                                                   ↓         ↓
-                                          SyncedVideo   SyncedAudio → WebRTC → Client
-
-    Falls back to the original VideoTransformTrack approach if the
-    pipeline fails to start or the circuit breaker trips.
-    """
-
-    def __init__(self, swapper: FaceSwapper, lip_syncer: Optional[LipSyncer]):
-        self.swapper = swapper
-        self.lip_syncer = lip_syncer
-        self.pcs: Dict[str, RTCPeerConnection] = {}
-        self.pipelines: Dict[str, 'SyncPipeline'] = {}
-        self.relay = MediaRelay()
-        self.session_settings: Dict[str, dict] = {}
-        # Keep a fallback manager for circuit-breaker scenarios
-        self._fallback_manager = WebRTCManager(swapper, lip_syncer)
-
-    async def handle_offer(self, session_id: str, sdp: str, type: str) -> RTCSessionDescription:
-        """Handle WebRTC offer using the agent-based sync pipeline."""
-        from agents.pipeline import SyncPipeline
-        from agents.models import PipelineConfig
-
-        # Close any existing connection
-        if session_id in self.pcs:
-            await self.cleanup_session(session_id)
-
-        # Parse bitrate hint from SDP
-        client_bitrate = _parse_sdp_bitrate(sdp)
-        if not client_bitrate:
-            client_bitrate = 6_000_000
-        print(f"[SyncWebRTC:{session_id}] Bitrate: {client_bitrate // 1000} Kbps")
-
-        pc = RTCPeerConnection()
-        self.pcs[session_id] = pc
-
-        # Create the sync pipeline
-        settings = self.session_settings.get(session_id, {})
-        enable_lipsync = settings.get("enable_lipsync", ENABLE_LIPSYNC)
-
-        config = PipelineConfig(
-            video_bitrate=client_bitrate,
-            target_fps=30,
-            audio_buffer_capacity_ms=float(AV_SYNC_AUDIO_BUFFER_MS),
-            max_audio_wait_ms=float(AV_SYNC_MAX_AUDIO_WAIT_MS),
-            drift_recalibrate_frames=AV_SYNC_DRIFT_RECAL_FRAMES,
-            avo_warning_ms=AV_SYNC_AVO_WARNING_MS,
-            avo_critical_ms=AV_SYNC_AVO_CRITICAL_MS,
-        )
-
-        pipeline = SyncPipeline(
-            session_id=session_id,
-            swapper=self.swapper,
-            lip_syncer=self.lip_syncer,
-            config=config,
-            target_bitrate=client_bitrate,
-            enable_lipsync=enable_lipsync,
-            session_settings=settings,
-        )
-        self.pipelines[session_id] = pipeline
-
-        # Collect tracks as they arrive
-        received_tracks = {"video": None, "audio": None}
-        pipeline_started = {"started": False}
-
-        @pc.on("track")
-        def on_track(track: MediaStreamTrack):
-            if track.kind == "audio":
-                received_tracks["audio"] = track
-                print(f"[SyncWebRTC:{session_id}] Audio track received")
-            elif track.kind == "video":
-                received_tracks["video"] = self.relay.subscribe(track)
-                print(f"[SyncWebRTC:{session_id}] Video track received")
-
-            # Once video arrives, wait briefly for audio then start pipeline
-            if received_tracks["video"] and not pipeline_started["started"]:
-                pipeline_started["started"] = True
-                asyncio.ensure_future(
-                    self._wait_and_start_pipeline(
-                        session_id, pc, received_tracks, client_bitrate
-                    )
-                )
-
-        @pc.on("connectionstatechange")
-        async def on_state_change():
-            state = pc.connectionState
-            print(f"[SyncWebRTC:{session_id}] Connection state: {state}")
-            if state in ["failed", "closed", "disconnected"]:
-                await self.cleanup_session(session_id)
-
-        offer = RTCSessionDescription(sdp=sdp, type=type)
-        await pc.setRemoteDescription(offer)
-        answer = await pc.createAnswer()
-        await pc.setLocalDescription(answer)
-        return pc.localDescription
-
-    async def _wait_and_start_pipeline(
-        self,
-        session_id: str,
-        pc: RTCPeerConnection,
-        tracks: dict,
-        client_bitrate: int,
-    ) -> None:
-        """Wait briefly for audio track, then start pipeline."""
-        # Audio track may arrive slightly after video — wait up to 500ms
-        for _ in range(10):
-            if tracks.get("audio"):
-                break
-            await asyncio.sleep(0.05)
-
-        if not tracks.get("audio"):
-            print(f"[SyncWebRTC:{session_id}] No audio track after 500ms — starting video-only")
-
-        await self._start_pipeline(session_id, pc, tracks, client_bitrate)
-
-    async def _start_pipeline(
-        self,
-        session_id: str,
-        pc: RTCPeerConnection,
-        tracks: dict,
-        client_bitrate: int,
-    ) -> None:
-        """Start the agent pipeline and add output tracks to the peer connection."""
-        pipeline = self.pipelines.get(session_id)
-        if not pipeline:
-            return
-
-        try:
-            # Set input tracks
-            pipeline.set_tracks(tracks.get("video"), tracks.get("audio"))
-
-            # Start the 7-agent pipeline
-            await pipeline.start()
-
-            # Add synced output tracks to the peer connection
-            pc.addTrack(pipeline.video_output_track)
-
-            # Add synced audio track (relays processed + aligned audio)
-            if tracks.get("audio"):
-                pc.addTrack(pipeline.audio_output_track)
-
-            # Set encoder bitrate
-            async def _set_bitrate():
-                for sender in pc.getSenders():
-                    if sender.track == pipeline.video_output_track:
-                        for _ in range(50):
-                            enc = getattr(sender, '_RTCRtpSender__encoder', None)
-                            if enc and hasattr(enc, 'target_bitrate'):
-                                enc.target_bitrate = client_bitrate
-                                print(f"[SyncWebRTC:{session_id}] Encoder bitrate → {client_bitrate // 1000} Kbps")
-                                return
-                            await asyncio.sleep(0.1)
-            asyncio.ensure_future(_set_bitrate())
-
-            print(f"[SyncWebRTC:{session_id}] ✅ Agent pipeline started successfully")
-
-        except Exception as exc:
-            print(f"[SyncWebRTC:{session_id}] ❌ Pipeline start failed: {exc}")
-            print(f"[SyncWebRTC:{session_id}] Falling back to legacy mode")
-            # Fallback to original approach
-            await self._fallback_to_legacy(session_id, pc, tracks, client_bitrate)
-
-    async def _fallback_to_legacy(
-        self,
-        session_id: str,
-        pc: RTCPeerConnection,
-        tracks: dict,
-        client_bitrate: int,
-    ) -> None:
-        """Fall back to the original VideoTransformTrack approach."""
-        audio_buf = AudioBuffer()
-
-        # Set up legacy audio reader
-        if tracks.get("audio"):
-            async def recv_audio():
-                try:
-                    while True:
-                        frame = await tracks["audio"].recv()
-                        audio_buf.append(frame)
-                except Exception:
-                    pass
-            asyncio.ensure_future(recv_audio())
-
-        # Set up legacy video track
-        if tracks.get("video"):
-            local_video = VideoTransformTrack(
-                tracks["video"],
-                self.swapper,
-                self.lip_syncer,
-                session_id,
-                audio_buf,
-                self.session_settings,
-                target_bitrate=client_bitrate,
-            )
-            pc.addTrack(local_video)
-
-    async def cleanup_session(self, session_id: str):
-        """Clean up pipeline and peer connection for a session."""
-        # Stop the agent pipeline
-        if session_id in self.pipelines:
-            try:
-                await self.pipelines[session_id].stop()
-            except Exception as exc:
-                print(f"[SyncWebRTC:{session_id}] Pipeline stop error: {exc}")
-            del self.pipelines[session_id]
-
-        # Close peer connection
-        if session_id in self.pcs:
-            try:
-                await self.pcs[session_id].close()
-            except Exception:
-                pass
-            del self.pcs[session_id]
-
-        self.session_settings.pop(session_id, None)
-
-        if self.lip_syncer:
-            self.lip_syncer.cleanup_session(session_id)
-
-    def set_session_settings(self, session_id: str, settings: dict):
-        self.session_settings[session_id] = {
-            **self.session_settings.get(session_id, {}),
-            **settings
-        }
-
-    def get_pipeline_metrics(self, session_id: str) -> Optional[dict]:
-        """Get sync pipeline metrics for a session."""
-        pipeline = self.pipelines.get(session_id)
-        if pipeline:
-            return pipeline.get_metrics()
-        return None
