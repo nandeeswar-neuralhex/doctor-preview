@@ -31,6 +31,9 @@ FACE_MASK_SCALE = float(os.getenv("FACE_MASK_SCALE", "1.1"))
 ENABLE_GFPGAN = os.getenv("ENABLE_GFPGAN", "true").lower() == "true"
 _GFPGAN_PATH_ENV = os.getenv("GFPGAN_MODEL_PATH", "")
 GFPGAN_MODEL_PATH = _GFPGAN_PATH_ENV or os.path.join(MODELS_DIR, "GFPGANv1.4.pth")
+# Blend weight of the GFPGAN-enhanced face vs raw swap (0=off, 1=full GFPGAN).
+# Partial blend keeps identity/temporal stability while adding texture detail.
+GFPGAN_BLEND = float(os.getenv("GFPGAN_BLEND", "0.5"))
 
 # Smoothing / tracking
 ENABLE_TEMPORAL_SMOOTHING = os.getenv("ENABLE_TEMPORAL_SMOOTHING", "true").lower() == "true"

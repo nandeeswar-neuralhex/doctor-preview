@@ -568,6 +568,24 @@ class FaceSwapper:
                 return frame
             bgr_fake, M = res  # bgr_fake: (128,128,3), M: (2,3) affine frame→128px
 
+            # ── GFPGAN enhancement on the aligned swapped face ──
+            # Runs on the 128×128 crop upscaled to 512 (has_aligned=True → a
+            # single network pass, no per-frame face detection). The result is
+            # blended at GFPGAN_BLEND to add texture/detail without the
+            # shimmer of a full-strength per-frame restoration.
+            if self.enhancer is not None and GFPGAN_BLEND > 0.01:
+                try:
+                    face512 = cv2.resize(bgr_fake, (512, 512), interpolation=cv2.INTER_LANCZOS4)
+                    _, restored, _ = self.enhancer.enhance(
+                        face512, has_aligned=True, only_center_face=True, paste_back=False
+                    )
+                    if restored:
+                        enhanced128 = cv2.resize(restored[0], (128, 128), interpolation=cv2.INTER_AREA)
+                        w_gf = min(1.0, GFPGAN_BLEND)
+                        bgr_fake = cv2.addWeighted(enhanced128, w_gf, bgr_fake, 1.0 - w_gf, 0)
+                except Exception:
+                    pass  # enhancement is best-effort — raw swap still shown
+
             h, w = frame.shape[:2]
 
             # ── Build face ROI (bounding box + padding) ──

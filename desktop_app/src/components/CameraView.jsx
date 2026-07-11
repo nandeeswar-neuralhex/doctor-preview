@@ -6,6 +6,11 @@ import useWorkerTimer from '../hooks/useWorkerTimer';
 import QualitySelector from './QualitySelector';
 import QUALITY_PRESETS, { DEFAULT_QUALITY } from '../qualityPresets';
 
+// Estimated latency of the relayed-audio path (server jitter buffer +
+// network + Opus playout). The adaptive sync delays audio by
+// (measured video latency − this) so voice lands with the lips.
+const WEBRTC_AUDIO_PATH_MS = 180;
+
 function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setIsStreaming }) {
     const originalVideoRef = useRef(null);
     const processedVideoRef = useRef(null);
@@ -32,8 +37,9 @@ function CameraView({ serverUrl, targetImage, allTargetImages, isStreaming, setI
     const [autoSyncAudio, setAutoSyncAudio] = useState(true);
     const [extraAudioDelayMs, setExtraAudioDelayMs] = useState(0);
     const audioDelayMs = autoSyncAudio ? latency + extraAudioDelayMs : extraAudioDelayMs;
+    const webrtcAutoDelayMs = autoSyncAudio ? Math.max(0, latency - WEBRTC_AUDIO_PATH_MS) : 0;
     const displayedAudioDelay = transportMode === 'webrtc'
-        ? `+${extraAudioDelayMs}ms extra`
+        ? `${autoSyncAudio ? `auto ${webrtcAutoDelayMs}+` : ''}${extraAudioDelayMs}ms`
         : `${autoSyncAudio ? `${latency}+${extraAudioDelayMs}=` : ''}${audioDelayMs}ms`;
     const [exposureAdjust, setExposureAdjust] = useState(0);
     const [diagnostics, setDiagnostics] = useState({
@@ -267,11 +273,21 @@ window.addEventListener('beforeunload', () => bc.close());
     }, []);
 
     useEffect(() => {
-        if (transportMode === 'webrtc' && remoteAudioDelayNodeRef.current) {
-            remoteAudioDelayNodeRef.current.delayTime.value = extraAudioDelayMs / 1000;
-            console.log(`[WebRTC] Remote audio extra delay updated to ${extraAudioDelayMs}ms`);
+        if (transportMode !== 'webrtc' || !remoteAudioDelayNodeRef.current) return;
+        // Adaptive A/V sync: follow the live measured video latency so lips
+        // and voice stay matched even when network latency fluctuates.
+        const autoMs = autoSyncAudio ? Math.max(0, latency - WEBRTC_AUDIO_PATH_MS) : 0;
+        const targetSec = Math.min(5.5, (autoMs + extraAudioDelayMs) / 1000);
+        const ctx = remoteAudioCtxRef.current;
+        const node = remoteAudioDelayNodeRef.current;
+        if (ctx && ctx.state === 'running') {
+            // Smooth exponential ramp (τ=1s) — inaudible, no clicks/pitch shift
+            node.delayTime.setTargetAtTime(targetSec, ctx.currentTime, 1.0);
+        } else {
+            node.delayTime.value = targetSec;
         }
-    }, [extraAudioDelayMs, transportMode]);
+        console.log(`[WebRTC] Remote audio delay → ${(targetSec * 1000).toFixed(0)}ms (auto=${autoMs}ms, extra=${extraAudioDelayMs}ms)`);
+    }, [latency, autoSyncAudio, extraAudioDelayMs, transportMode]);
 
     // Attach remote stream to video element once it renders, and route
     // audio to BlackHole. Two race conditions to handle:
@@ -332,7 +348,9 @@ window.addEventListener('beforeunload', () => bc.close());
                     const remoteDest = remoteAudioCtx.createMediaStreamDestination();
                     const remoteAudioEl = document.createElement('audio');
 
-                    remoteDelayNode.delayTime.value = extraAudioDelayMs / 1000;
+                    // Initial delay: adaptive value if latency already known
+                    const initAutoMs = autoSyncAudio ? Math.max(0, latency - WEBRTC_AUDIO_PATH_MS) : 0;
+                    remoteDelayNode.delayTime.value = Math.min(5.5, (initAutoMs + extraAudioDelayMs) / 1000);
                     remoteSource.connect(remoteDelayNode);
                     remoteDelayNode.connect(remoteDest);
 
