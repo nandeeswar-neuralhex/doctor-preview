@@ -396,30 +396,37 @@ class VideoTransformTrack(MediaStreamTrack):
 
 
 class DelayedAudioRelayTrack(MediaStreamTrack):
-    """Relays the client's mic audio back, delayed to match video latency.
+    """Relays the client's mic audio back as a smooth jitter-buffered stream.
 
-    A/V sync (Option A): because this track shares the peer connection with
-    the processed video track, the receiving browser aligns both via RTCP
-    sender reports. Delaying the audio by the measured face-swap latency
-    means the audio content leaving the server at time T corresponds to the
-    same capture moment as the video content leaving at time T — so the
-    client plays voice and mouth in sync, and OBS captures them already
-    synced (any delay OBS adds applies to both equally).
+    A/V sync (Option A): this track shares the peer connection with the
+    processed video track, so the receiving browser aligns both via RTCP
+    sender reports. The small jitter buffer (~2 frames) plus the video
+    pipeline's own ~30-60ms latency land well inside the ITU lip-sync
+    tolerance; residual offset is tuned with AUDIO_RELAY_EXTRA_DELAY_MS.
 
-    Design:
-    - A reader task queues incoming frames with arrival timestamps and
-      feeds the lipsync AudioBuffer.
-    - recv() emits one frame per ~20 ms at a steady wallclock cadence.
-    - A queued frame is only released once it has aged `current_delay`;
-      until then silence is emitted (only while the delay builds up).
-    - The delay follows the video pipeline's latency EMA, ramped at a
-      limited rate so words are never clipped by sudden jumps.
+    Design (classic VoIP jitter buffer — NO dynamic delay chasing):
+    - A reader task queues incoming frames and feeds the lipsync buffer.
+    - recv() emits one frame per frame-duration at a steady cadence.
+    - Frames are popped in order whenever the buffer is primed; silence is
+      emitted ONLY on true underrun (empty buffer), never interleaved
+      between available frames.
+    - After an underrun the buffer re-primes to target depth before
+      resuming (hysteresis prevents silence/audio flapping).
+    - Latency is bounded by dropping QUIET frames when the buffer grows
+      too deep (never cuts words), with a hard drop only past 500ms.
+
+    Previous design chased the video-latency EMA with per-frame age gating
+    — latency spikes thrashed the delay (33ms→1844ms→29ms) and jitter
+    interleaved silence mid-speech, destroying the audio. Do not revisit.
     """
 
     kind = "audio"
 
-    RAMP_MS_PER_SEC = 60.0    # max delay change rate (no word cutoff)
-    MAX_QUEUE_SECONDS = 5.0   # hard cap on buffered audio
+    BASE_DEPTH_FRAMES = 4        # ~80ms priming depth
+    MAX_DEPTH_FRAMES = 12        # adaptive growth cap (~240ms)
+    EXCESS_SOFT_FRAMES = 8       # >target+8 (~160ms): drop quiet head frames
+    EXCESS_HARD_FRAMES = 25      # >target+25 (~500ms): force-drop to target
+    QUIET_RMS = 300              # int16 RMS below this = droppable silence
 
     def __init__(
         self,
@@ -431,8 +438,7 @@ class DelayedAudioRelayTrack(MediaStreamTrack):
         super().__init__()
         self._source = source
         self._audio_buffer = audio_buffer
-        self._latency_state = latency_state
-        self._extra_delay_s = max(0, extra_delay_ms) / 1000.0
+        self._latency_state = latency_state  # logging only — no delay coupling
 
         self._queue: deque = deque()
         self._reader_task = None
@@ -454,9 +460,13 @@ class DelayedAudioRelayTrack(MediaStreamTrack):
         self._pts = 0
         self._next_emit: Optional[float] = None
 
-        # Ramped delay state
-        self._current_delay_s = 0.0
-        self._last_ramp_ts = time.monotonic()
+        # Jitter buffer state
+        frame_ms = 20.0
+        self._target_depth = self.BASE_DEPTH_FRAMES + int(max(0, extra_delay_ms) / frame_ms)
+        self._primed = False
+        self._underruns = 0
+        self._quiet_drops = 0
+        self._hard_drops = 0
         self._last_log = time.monotonic()
 
     async def _read_source(self):
@@ -465,28 +475,9 @@ class DelayedAudioRelayTrack(MediaStreamTrack):
             while True:
                 frame = await self._source.recv()
                 self._audio_buffer.append(frame)  # feed lipsync window
-                self._queue.append((time.monotonic(), frame))
-                max_frames = int(self.MAX_QUEUE_SECONDS * 50)  # ~20ms frames
-                while len(self._queue) > max_frames:
-                    self._queue.popleft()
+                self._queue.append(frame)
         except Exception:
             pass
-
-    def _target_delay_s(self) -> float:
-        return (self._latency_state.get("ms", 100.0) / 1000.0) + self._extra_delay_s
-
-    def _ramp_delay(self):
-        """Move current delay toward target at a bounded rate."""
-        now = time.monotonic()
-        dt = max(0.0, now - self._last_ramp_ts)
-        self._last_ramp_ts = now
-        target = self._target_delay_s()
-        max_step = (self.RAMP_MS_PER_SEC / 1000.0) * dt
-        diff = target - self._current_delay_s
-        if abs(diff) <= max_step:
-            self._current_delay_s = target
-        else:
-            self._current_delay_s += max_step if diff > 0 else -max_step
 
     def _make_silence(self) -> AudioFrame:
         frame = AudioFrame(format=self._format, layout=self._layout, samples=self._samples)
@@ -494,6 +485,32 @@ class DelayedAudioRelayTrack(MediaStreamTrack):
             plane.update(bytes(plane.buffer_size))
         frame.sample_rate = self._sample_rate
         return frame
+
+    @staticmethod
+    def _frame_rms(frame: AudioFrame) -> float:
+        try:
+            arr = frame.to_ndarray().astype(np.float32)
+            return float(np.sqrt((arr ** 2).mean()))
+        except Exception:
+            return 1e9  # treat unreadable frames as loud → never dropped
+
+    def _bound_latency(self):
+        """Keep buffer depth near target without ever cutting words."""
+        depth = len(self._queue)
+        if depth > self._target_depth + self.EXCESS_HARD_FRAMES:
+            # Way too deep (stall recovery) — force-drop to target
+            while len(self._queue) > self._target_depth:
+                self._queue.popleft()
+                self._hard_drops += 1
+        elif depth > self._target_depth + self.EXCESS_SOFT_FRAMES:
+            # Slightly deep — shed only quiet head frames (max 2 per tick)
+            for _ in range(2):
+                if (len(self._queue) > self._target_depth
+                        and self._frame_rms(self._queue[0]) < self.QUIET_RMS):
+                    self._queue.popleft()
+                    self._quiet_drops += 1
+                else:
+                    break
 
     async def recv(self) -> AudioFrame:
         try:
@@ -526,7 +543,7 @@ class DelayedAudioRelayTrack(MediaStreamTrack):
         # Lock the output format to the source's format BEFORE emitting
         # anything, so silence and relayed frames always match.
         if not self._template_locked and self._queue:
-            _, first = self._queue[0]
+            first = self._queue[0]
             self._sample_rate = first.sample_rate or self._sample_rate
             self._layout = first.layout.name
             self._format = first.format.name
@@ -535,22 +552,24 @@ class DelayedAudioRelayTrack(MediaStreamTrack):
             print(f"[AudioRelay] output format locked: "
                   f"{self._format}/{self._layout}/{self._sample_rate}Hz/{self._samples}spf")
 
-        self._ramp_delay()
+        self._bound_latency()
 
-        # Release the oldest frame once it has aged past the current delay
+        # Priming / underrun hysteresis: only play once target depth is
+        # buffered, so we never flap between silence and audio per-frame.
+        # Each underrun adaptively deepens the buffer (classic jitter
+        # buffer) so repeated network bursts stop causing gaps.
+        depth = len(self._queue)
+        if not self._primed:
+            if depth >= self._target_depth:
+                self._primed = True
+        elif depth == 0:
+            self._primed = False
+            self._underruns += 1
+            self._target_depth = min(self._target_depth + 2, self.MAX_DEPTH_FRAMES)
+
         out: Optional[AudioFrame] = None
-        now = time.monotonic()
-        while self._queue:
-            arrival, frame = self._queue[0]
-            age = now - arrival
-            if age < self._current_delay_s:
-                break  # not old enough yet → silence below
-            self._queue.popleft()
-            out = frame
-            # If frames are overdue (e.g. after a stall), keep draining to
-            # catch up instead of letting latency drift upward.
-            if age <= self._current_delay_s + 0.10:
-                break
+        if self._primed and self._queue:
+            out = self._queue.popleft()
 
         if out is not None:
             if not self._first_real_sent:
@@ -580,9 +599,10 @@ class DelayedAudioRelayTrack(MediaStreamTrack):
         now = time.monotonic()
         if now - self._last_log >= 10.0:
             self._last_log = now
-            print(f"[AudioRelay] delay={self._current_delay_s * 1000:.0f}ms "
-                  f"target={self._target_delay_s() * 1000:.0f}ms "
-                  f"queued={len(self._queue)}")
+            print(f"[AudioRelay] depth={len(self._queue)}/{self._target_depth} "
+                  f"underruns={self._underruns} quiet_drops={self._quiet_drops} "
+                  f"hard_drops={self._hard_drops} "
+                  f"video_latency={self._latency_state.get('ms', 0):.0f}ms")
 
         return out
 
