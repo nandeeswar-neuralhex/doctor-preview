@@ -438,11 +438,19 @@ class DelayedAudioRelayTrack(MediaStreamTrack):
         self._reader_task = None
         self._started = False
 
-        # Output format — updated from the first real frame received
+        # Output format template. CRITICAL: every frame this track emits
+        # (silence or relayed) MUST share one format — aiortc's OpusEncoder
+        # keeps a persistent AudioResampler that hard-crashes on any
+        # format/layout change, silently killing the audio sender.
+        # aiortc's Opus decoder always outputs s16/stereo/48kHz, so that is
+        # the default; it is re-locked from the first queued source frame
+        # before anything is emitted.
         self._sample_rate = 48000
-        self._layout = "mono"
+        self._layout = "stereo"
         self._format = "s16"
         self._samples = 960  # 20 ms @ 48 kHz
+        self._template_locked = False
+        self._first_real_sent = False
         self._pts = 0
         self._next_emit: Optional[float] = None
 
@@ -488,6 +496,17 @@ class DelayedAudioRelayTrack(MediaStreamTrack):
         return frame
 
     async def recv(self) -> AudioFrame:
+        try:
+            return await self._recv_impl()
+        except Exception:
+            # aiortc kills the sender silently on track errors — make sure
+            # any failure is visible in the logs before propagating.
+            import traceback
+            print("[AudioRelay] recv() FAILED — audio sender will stop:")
+            traceback.print_exc()
+            raise
+
+    async def _recv_impl(self) -> AudioFrame:
         if not self._started:
             self._started = True
             self._reader_task = asyncio.ensure_future(self._read_source())
@@ -503,6 +522,18 @@ class DelayedAudioRelayTrack(MediaStreamTrack):
         elif wait < -0.5:
             self._next_emit = time.monotonic()  # resync after a stall
         self._next_emit += frame_dur
+
+        # Lock the output format to the source's format BEFORE emitting
+        # anything, so silence and relayed frames always match.
+        if not self._template_locked and self._queue:
+            _, first = self._queue[0]
+            self._sample_rate = first.sample_rate or self._sample_rate
+            self._layout = first.layout.name
+            self._format = first.format.name
+            self._samples = first.samples
+            self._template_locked = True
+            print(f"[AudioRelay] output format locked: "
+                  f"{self._format}/{self._layout}/{self._sample_rate}Hz/{self._samples}spf")
 
         self._ramp_delay()
 
@@ -522,11 +553,22 @@ class DelayedAudioRelayTrack(MediaStreamTrack):
                 break
 
         if out is not None:
-            # Adopt source format for pacing and future silence frames
-            self._sample_rate = out.sample_rate or self._sample_rate
-            self._layout = out.layout.name
-            self._format = out.format.name
-            self._samples = out.samples
+            if not self._first_real_sent:
+                self._first_real_sent = True
+                print(f"[AudioRelay] first source frame relayed "
+                      f"({out.format.name}/{out.layout.name}/{out.sample_rate}Hz)")
+            # Guard: a mid-stream format change would crash the Opus
+            # encoder's resampler. Should never happen with a single
+            # decoder — warn and re-lock if it somehow does.
+            if (out.format.name != self._format
+                    or out.layout.name != self._layout
+                    or (out.sample_rate or self._sample_rate) != self._sample_rate):
+                print(f"[AudioRelay] WARNING: source format changed to "
+                      f"{out.format.name}/{out.layout.name}/{out.sample_rate}Hz")
+                self._sample_rate = out.sample_rate or self._sample_rate
+                self._layout = out.layout.name
+                self._format = out.format.name
+                self._samples = out.samples
         else:
             out = self._make_silence()
 
